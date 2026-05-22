@@ -38,16 +38,26 @@ Sending is ALWAYS a separate call. There is no auto-send. The split exists
 so the outbound recipient allowlist policy gate sits on one obvious tool
 (``draft_send``) and so failed sends leave the draft intact for review.
 
+**Minimum lifecycle — 2 calls:**
+
 ```
-1. draft_create(...)              → {"draft_id": "ABCD"}
-2. draft_update(draft_id, ...)    → {"draft_id": "EFGH"}   # id changes!
-3. draft_send(draft_id="EFGH")    → {"sent_message_id": ""}
+draft_create(...)              → {"draft_id": "ABCD"}
+draft_send(draft_id="ABCD")    → {"sent_message_id": ""}
+```
+
+**With optional refinement (e.g., agent revising before sending):**
+
+```
+draft_create(...)              → {"draft_id": "ABCD"}
+draft_update(draft_id="ABCD",  → {"draft_id": "EFGH"}   # id CHANGES
+             body="revised")
+draft_send(draft_id="EFGH")    → {"sent_message_id": ""}
 ```
 
 ``draft_update`` is implemented as delete-and-recreate; the returned id
 is a NEW id. Always use the returned id for the next call. Off-allowlist
-recipients are fine on saved drafts; they are only blocked at step 3,
-and a blocked ``draft_send`` is a pure no-op on Mail.app state.
+recipients are fine on saved drafts; they are only blocked at
+``draft_send``, and a blocked send is a pure no-op on Mail.app state.
 
 Internal Python functions ``create_draft``, ``update_draft``, ``delete_draft``
 remain in ``server.py`` (no ``@mcp.tool`` decorator) for tests + internal

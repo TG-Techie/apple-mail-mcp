@@ -2786,16 +2786,19 @@ def delete_draft(draft_id: str) -> dict[str, Any]:
 # Drafts lifecycle — public MCP surface
 # ──────────────────────────────────────────────────────────────────────────
 #
-# Correct create → send pattern (agents: follow this exactly):
+# Correct create → send pattern (agents: follow this exactly).
 #
-#   1. draft_create(...)                 # write the draft
-#        → {"success": True, "draft_id": "ABCD"}
+# Minimum lifecycle — 2 calls:
 #
-#   2. (optional) draft_update(draft_id="ABCD", body="...", ...)
-#        → {"success": True, "draft_id": "EFGH"}     # ID changes!
+#   draft_create(...)              → {"draft_id": "ABCD"}
+#   draft_send(draft_id="ABCD")    → {"sent_message_id": ""}
 #
-#   3. draft_send(draft_id="EFGH")        # actually dispatch
-#        → {"success": True, "sent_message_id": ""}
+# With optional refinement (revise the draft before sending):
+#
+#   draft_create(...)              → {"draft_id": "ABCD"}
+#   draft_update(draft_id="ABCD",  → {"draft_id": "EFGH"}   # id CHANGES
+#                body="revised")
+#   draft_send(draft_id="EFGH")    → {"sent_message_id": ""}
 #
 # Sending is ALWAYS a separate call. There is no auto-send. The split
 # exists so the policy gate (outbound recipient allowlist) sits at a
