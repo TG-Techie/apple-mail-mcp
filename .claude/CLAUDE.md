@@ -23,14 +23,36 @@ make coverage              # Coverage report
 
 **Running the server:** `uv run python -m apple_mail_mcp.server` or via Claude Desktop config.
 
-## API Surface (23 MCP tools)
+## API Surface (24 MCP tools)
 
 **Core:** list_mailboxes, search_messages, get_messages, update_message
-**Drafts lifecycle (#134):** create_draft, update_draft, delete_draft
+**Drafts lifecycle (v2 — verb-split):** draft_create, draft_update, draft_delete, draft_send
 **Mailbox CRUD:** create_mailbox, update_mailbox (rename + move via IMAP), delete_mailbox (IMAP-only)
 **Attachments & Management:** save_attachments, delete_messages
 **Discovery & Rules:** list_accounts, list_rules, get_thread, create_rule, update_rule, delete_rule
 **Templates:** list_templates, get_template, save_template, delete_template, render_template
+
+### Drafts v2 — correct create → send pattern
+
+Sending is ALWAYS a separate call. There is no auto-send. The split exists
+so the outbound recipient allowlist policy gate sits on one obvious tool
+(``draft_send``) and so failed sends leave the draft intact for review.
+
+```
+1. draft_create(...)              → {"draft_id": "ABCD"}
+2. draft_update(draft_id, ...)    → {"draft_id": "EFGH"}   # id changes!
+3. draft_send(draft_id="EFGH")    → {"sent_message_id": ""}
+```
+
+``draft_update`` is implemented as delete-and-recreate; the returned id
+is a NEW id. Always use the returned id for the next call. Off-allowlist
+recipients are fine on saved drafts; they are only blocked at step 3,
+and a blocked ``draft_send`` is a pure no-op on Mail.app state.
+
+Internal Python functions ``create_draft``, ``update_draft``, ``delete_draft``
+remain in ``server.py`` (no ``@mcp.tool`` decorator) for tests + internal
+use; do not call them from new code — go through the ``draft_*`` MCP
+surface.
 
 ## Core Principles
 

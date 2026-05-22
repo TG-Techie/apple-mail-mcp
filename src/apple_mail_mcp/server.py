@@ -2394,7 +2394,6 @@ def _merge_draft_recipients(
     )
 
 
-@mcp.tool()
 async def create_draft(
     reply_to: str | None = None,
     forward_of: str | None = None,
@@ -2411,7 +2410,14 @@ async def create_draft(
     send_now: bool = False,
     ctx: Context | None = None,
 ) -> dict[str, Any]:
-    """Create a draft (fresh, reply, or forward). Optionally send immediately.
+    """Internal: create a draft (fresh, reply, or forward), optionally send.
+
+    NOT an MCP tool. The MCP surface is ``draft_create`` (no send) and
+    ``draft_send`` (send an existing draft). This function remains the
+    underlying create-and-maybe-send implementation, callable from
+    Python and from the wrappers.
+
+    Original behavior preserved below.
 
     Mail.app's actual primitive is the draft — every outgoing message is
     a draft until sent. This tool lets callers create one, optionally
@@ -2571,7 +2577,6 @@ async def create_draft(
         return {"success": False, "error": str(e), "error_type": "unknown"}
 
 
-@mcp.tool()
 async def update_draft(
     draft_id: str,
     to: list[str] | None = None,
@@ -2738,9 +2743,10 @@ async def update_draft(
                 pass
 
 
-@mcp.tool()
 def delete_draft(draft_id: str) -> dict[str, Any]:
-    """Delete (move to Trash) an existing draft.
+    """Internal: delete (move to Trash) an existing draft.
+
+    NOT an MCP tool. The MCP surface is ``draft_delete``.
 
     Lifecycle endpoint for cancellation. Mail.app moves the message to
     the Deleted Messages mailbox; recovery is technically possible but
@@ -2774,6 +2780,290 @@ def delete_draft(draft_id: str) -> dict[str, Any]:
     except Exception as e:
         logger.exception(f"Unexpected error in delete_draft: {e}")
         return {"success": False, "error": str(e), "error_type": "unknown"}
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Drafts lifecycle — public MCP surface
+# ──────────────────────────────────────────────────────────────────────────
+#
+# Correct create → send pattern (agents: follow this exactly):
+#
+#   1. draft_create(...)                 # write the draft
+#        → {"success": True, "draft_id": "ABCD"}
+#
+#   2. (optional) draft_update(draft_id="ABCD", body="...", ...)
+#        → {"success": True, "draft_id": "EFGH"}     # ID changes!
+#
+#   3. draft_send(draft_id="EFGH")        # actually dispatch
+#        → {"success": True, "sent_message_id": ""}
+#
+# Sending is ALWAYS a separate call. There is no auto-send. The split
+# exists so the policy gate (outbound recipient allowlist) sits at a
+# single, obvious tool — draft_send — making it auditable and reviewable.
+#
+# Off-allowlist recipients are fine on saved drafts (steps 1–2). They are
+# only blocked at step 3. A blocked draft_send leaves the draft intact so
+# the human can review and either edit the recipients or send manually
+# from Mail.app.
+#
+# IMPORTANT: draft_update is implemented as delete-and-recreate, so the
+# returned draft_id is a NEW id. Always use the returned id for the next
+# step in the lifecycle. Treat the id you held before draft_update as
+# stale.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+@mcp.tool()
+async def draft_create(
+    reply_to: str | None = None,
+    forward_of: str | None = None,
+    to: list[str] = [],  # noqa: B006 — coerced to None below
+    cc: list[str] = [],  # noqa: B006 — coerced to None below
+    bcc: list[str] = [],  # noqa: B006 — coerced to None below
+    subject: str | None = None,
+    body: str = "",
+    attachment_paths: list[str] = [],  # noqa: B006 — coerced to None below
+    reply_all: bool = False,
+    template_name: str | None = None,
+    template_vars: dict[str, str] | None = None,
+    from_account: str | None = None,
+) -> dict[str, Any]:
+    """Create a draft (fresh, reply, or forward). DOES NOT SEND.
+
+    To actually send, call ``draft_send(draft_id)`` as a separate step
+    after reviewing/editing the draft. The split is intentional —
+    sending requires its own explicit action and is the only path where
+    the outbound allowlist policy is enforced.
+
+    Modes (driven by ``reply_to`` / ``forward_of``):
+      - Neither: fresh draft (``subject`` required).
+      - ``reply_to=<message_id>``: reply draft. Mail.app auto-derives
+        recipients and subject prefix unless overridden.
+      - ``forward_of=<message_id>``: forward draft. Recipients default
+        to empty (user must specify); subject prefixed with ``Fwd:``.
+
+    Args:
+        reply_to: Message id to reply to. Mutually exclusive with
+            ``forward_of``.
+        forward_of: Message id to forward. Mutually exclusive with
+            ``reply_to``.
+        to/cc/bcc: Recipient lists. For reply/forward, empty list keeps
+            Mail's auto-derived recipients; populated list replaces.
+        subject: Subject line. Required for fresh drafts; optional for
+            reply/forward (None keeps Mail's auto-derived prefix).
+        body: Body text. For reply/forward, replaces Mail's auto-quoted
+            content if non-empty.
+        attachment_paths: File paths to attach. Each must exist.
+        reply_all: For ``reply_to`` only — use Mail's reply-all logic.
+        template_name / template_vars: Optional template render.
+        from_account: Mail.app account name or UUID. None uses Mail's
+            default sender for the seed message.
+
+    Returns:
+        ``{"success": True, "draft_id": "<id>"}`` on success.
+
+    Example (full lifecycle):
+        >>> r = draft_create(to=["jonah@tg-techie.com"],
+        ...                  subject="hi", body="hello")
+        >>> r["draft_id"]
+        'ABCD'
+        >>> draft_send(draft_id="ABCD")
+        {"success": True, "sent_message_id": ""}
+    """
+    return await create_draft(
+        reply_to=reply_to,
+        forward_of=forward_of,
+        to=to,
+        cc=cc,
+        bcc=bcc,
+        subject=subject,
+        body=body,
+        attachment_paths=attachment_paths,
+        reply_all=reply_all,
+        template_name=template_name,
+        template_vars=template_vars,
+        from_account=from_account,
+        send_now=False,
+        ctx=None,
+    )
+
+
+@mcp.tool()
+async def draft_update(
+    draft_id: str,
+    to: list[str] | None = None,
+    cc: list[str] | None = None,
+    bcc: list[str] | None = None,
+    subject: str | None = None,
+    body: str | None = None,
+    attachment_paths: list[str] | None = None,
+    template_name: str | None = None,
+    template_vars: dict[str, str] | None = None,
+    from_account: str | None = None,
+) -> dict[str, Any]:
+    """Update an existing draft. DOES NOT SEND.
+
+    Patch semantics: only fields you pass change. ``None`` means "keep
+    existing"; empty list/string means "clear". To actually send, call
+    ``draft_send(draft_id)`` afterwards.
+
+    IMPORTANT: Mail.app forbids mutating saved drafts, so this is
+    implemented as delete-and-recreate. The returned ``draft_id`` is a
+    NEW id — use it for any subsequent ``draft_update`` or ``draft_send``
+    call. The id you passed in is stale after this call returns.
+
+    Args:
+        draft_id: Existing draft to update.
+        to/cc/bcc: Recipient overrides (None=keep, []=clear, list=replace).
+        subject: Subject override. None=keep.
+        body: Body override. None=keep; empty string=clear.
+        attachment_paths: Attachment override (None=keep, []=clear,
+            list=replace).
+        template_name / template_vars: Optional template render.
+        from_account: Sender override.
+
+    Returns:
+        ``{"success": True, "draft_id": "<NEW_ID>"}``. The id is new.
+
+    Example:
+        >>> r = draft_update(draft_id="ABCD", body="revised text")
+        >>> r["draft_id"]   # different from "ABCD"!
+        'EFGH'
+    """
+    return await update_draft(
+        draft_id=draft_id,
+        to=to,
+        cc=cc,
+        bcc=bcc,
+        subject=subject,
+        body=body,
+        attachment_paths=attachment_paths,
+        template_name=template_name,
+        template_vars=template_vars,
+        from_account=from_account,
+        send_now=False,
+        ctx=None,
+    )
+
+
+@mcp.tool()
+def draft_delete(draft_id: str) -> dict[str, Any]:
+    """Delete (move to Trash) an existing draft. No send, no recovery
+    expected — Mail.app moves the draft to Deleted Messages.
+
+    Args:
+        draft_id: Existing draft to delete.
+
+    Returns:
+        ``{"success": True}`` on a clean delete; error response if the
+        draft does not exist.
+    """
+    return delete_draft(draft_id)
+
+
+@mcp.tool()
+async def draft_send(
+    draft_id: str,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    """Send an existing draft. THIS IS THE ONLY SEND TOOL.
+
+    Hard policy gate: every recipient (to/cc/bcc) on the draft must
+    match the outbound allowlist (see outbound_allowlist.py). If any
+    recipient is off-list, the send is blocked and the draft is left
+    INTACT for human review — you can edit it via ``draft_update`` or
+    open Mail.app and send/discard manually.
+
+    Off-list recipients are detected BEFORE any destructive operation,
+    so a blocked ``draft_send`` is a pure no-op on Mail.app state.
+
+    Args:
+        draft_id: Id of the saved draft to send.
+        ctx: MCP elicitation context (optional). If provided and
+            recipients are allowlisted, the client may be asked to
+            confirm. Clients without elicitation support (e.g. Cowork)
+            can omit this — allowlisted sends proceed without prompting.
+
+    Returns:
+        On success: ``{"success": True, "sent_message_id": "",
+        "draft_id": ""}``. ``sent_message_id`` is intentionally empty;
+        recovering the just-sent message across IMAP sync is unreliable.
+
+        On policy block:
+        ``{"success": False, "error": "...", "error_type":
+        "outbound_disallowed"}`` — draft is unchanged.
+
+    Example:
+        >>> draft_send(draft_id="EFGH")
+        {"success": True, "sent_message_id": "", "draft_id": ""}
+    """
+    # PRE-VALIDATION: read the draft's recipients and check the policy
+    # BEFORE any destructive op. If off-list, the draft is left intact
+    # — distinct from the connector-layer gate which fires too late
+    # (after the delete in update_draft's delete-and-recreate flow).
+    try:
+        state = mail.get_draft_state(draft_id)
+    except MailDraftError as e:
+        return _draft_error_response(e)
+    except MailAppleScriptError as e:
+        logger.error(f"AppleScript error reading draft for draft_send: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+            "error_type": "applescript_error",
+        }
+
+    from .outbound_allowlist import disallowed_recipients
+
+    all_r = (
+        list(state.get("to") or [])
+        + list(state.get("cc") or [])
+        + list(state.get("bcc") or [])
+    )
+    if not all_r:
+        return {
+            "success": False,
+            "error": (
+                "draft_send: draft has no recipients. Add recipients via "
+                "draft_update before sending."
+            ),
+            "error_type": "validation_error",
+        }
+    bad = disallowed_recipients(all_r)
+    if bad:
+        logger.warning(
+            "draft_send pre-validation blocked draft %s — off-list "
+            "recipients: %s. Draft left intact.",
+            draft_id,
+            bad,
+        )
+        return {
+            "success": False,
+            "error": (
+                "send blocked — recipients not on outbound allowlist: "
+                + ", ".join(repr(b) for b in bad)
+                + ". Draft is unchanged; edit recipients via draft_update "
+                "or open Mail.app to handle manually."
+            ),
+            "error_type": "outbound_disallowed",
+        }
+
+    # Recipients passed pre-validation. Hand off to the existing
+    # delete-recreate-send path with no field overrides.
+    return await update_draft(
+        draft_id=draft_id,
+        to=None,
+        cc=None,
+        bcc=None,
+        subject=None,
+        body=None,
+        attachment_paths=None,
+        template_name=None,
+        template_vars=None,
+        from_account=None,
+        send_now=True,
+        ctx=ctx,
+    )
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
