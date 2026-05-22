@@ -23,6 +23,7 @@ from .exceptions import (
     MailMailboxNotEmptyError,
     MailMailboxNotFoundError,
     MailMessageNotFoundError,
+    MailOutboundDisallowedError,
     MailRuleNotFoundError,
     MailTemplateError,
     MailTemplateInvalidFormatError,
@@ -32,6 +33,7 @@ from .exceptions import (
     MailUnsupportedGmailSystemLabelError,
     MailUnsupportedRuleActionError,
 )
+from .outbound_allowlist import all_recipients_allowed
 from .imap_connector import ImapConnectionPool
 from .mail_connector import AppleMailConnector
 from .security import (
@@ -1267,7 +1269,7 @@ def get_thread(message_id: str) -> dict[str, Any]:
 def save_attachments(
     message_id: str,
     save_directory: str,
-    attachment_indices: list[int] | None = None,
+    attachment_indices: list[int] = [],  # noqa: B006 — coerced to None below
 ) -> dict[str, Any]:
     """
     Save attachments from a message to a directory.
@@ -1289,6 +1291,7 @@ def save_attachments(
     """
     from pathlib import Path
 
+    attachment_indices = attachment_indices or None
     try:
         rate_err = check_rate_limit("save_attachments", {"message_id": message_id})
         if rate_err:
@@ -2075,6 +2078,14 @@ def _draft_action_error(op: str, e: Exception) -> dict[str, Any] | None:
     fall through to a generic ``unknown`` mapping). Centralizing this
     keeps the per-tool exception handling small enough to stay under
     the cyclomatic-complexity threshold."""
+    if isinstance(e, MailOutboundDisallowedError):
+        # Policy gate — recipients off the outbound allowlist.
+        logger.warning(f"Outbound allowlist blocked {op}: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+            "error_type": "outbound_disallowed",
+        }
     if isinstance(e, MailMessageNotFoundError):
         return {"success": False, "error": str(e), "error_type": "message_not_found"}
     if isinstance(e, MailAccountNotFoundError):
@@ -2283,11 +2294,25 @@ async def _run_send_now_gates(
                 "error": error_msg,
                 "error_type": "validation_error",
             }
-    cancel_err = await _elicit_confirmation(
-        ctx, summary, operation, elicit_extra,
-    )
-    if cancel_err:
-        return cancel_err
+    # Skip elicitation when all recipients are on the centralized outbound
+    # allowlist (see outbound_allowlist.py). Lets clients without
+    # elicitation support (e.g. Cowork) auto-send to pre-trusted addresses.
+    # NOTE: this is only the UX bypass. The HARD policy gate runs at the
+    # connector layer (mail_connector.create_draft → assert_recipients_allowed_for_send),
+    # so even if a future tool bypasses this server-layer check, sends to
+    # off-list addresses are still blocked at AppleScript dispatch.
+    if all_recipients_allowed(recipients):
+        operation_logger.log_operation(
+            operation,
+            {**elicit_extra, "recipients": recipients},
+            "send_allowlisted",
+        )
+    else:
+        cancel_err = await _elicit_confirmation(
+            ctx, summary, operation, elicit_extra,
+        )
+        if cancel_err:
+            return cancel_err
     return None
 
 
@@ -2373,12 +2398,12 @@ def _merge_draft_recipients(
 async def create_draft(
     reply_to: str | None = None,
     forward_of: str | None = None,
-    to: list[str] | None = None,
-    cc: list[str] | None = None,
-    bcc: list[str] | None = None,
+    to: list[str] = [],  # noqa: B006 — coerced to None below
+    cc: list[str] = [],  # noqa: B006 — coerced to None below
+    bcc: list[str] = [],  # noqa: B006 — coerced to None below
     subject: str | None = None,
     body: str = "",
-    attachment_paths: list[str] | None = None,
+    attachment_paths: list[str] = [],  # noqa: B006 — coerced to None below
     reply_all: bool = False,
     template_name: str | None = None,
     template_vars: dict[str, str] | None = None,
@@ -2427,6 +2452,10 @@ async def create_draft(
         ``{"success": True, "draft_id": "<id>", "sent_message_id": ""}``
         when saved as draft. ``draft_id`` is empty when sent.
     """
+    to = to or None
+    cc = cc or None
+    bcc = bcc or None
+    attachment_paths = attachment_paths or None
     try:
         # ----------------------------------------------------------------
         # Param-shape validation

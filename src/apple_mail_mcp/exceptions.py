@@ -9,6 +9,18 @@ class MailError(Exception):
     pass
 
 
+class MailOutboundDisallowedError(MailError):
+    """Outbound send blocked: one or more recipients are not on the
+    USER_EXPLICIT_OUTBOUND_ALLOW_LIST (or augmenting env var).
+
+    Raised by ``outbound_allowlist.assert_recipients_allowed_for_send``
+    at the actual-send call site in ``mail_connector.create_draft`` —
+    the policy enforcement perimeter for outbound mail.
+    """
+
+    pass
+
+
 class MailAccountNotFoundError(MailError):
     """Account does not exist."""
 

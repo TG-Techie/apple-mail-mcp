@@ -34,6 +34,7 @@ from .exceptions import (
 )
 from .imap_connector import ImapConnectionPool, ImapConnector
 from .keychain import get_imap_password
+from .outbound_allowlist import assert_recipients_allowed_for_send
 from .utils import (
     applescript_account_clause,
     escape_applescript_string,
@@ -3603,6 +3604,17 @@ class AppleMailConnector:
             MailAppleScriptError: AppleScript failure.
         """
         self._validate_create_draft_args(seed, seed_id, to, subject)
+
+        # HARD POLICY GATE — the actual-send enforcement perimeter for the
+        # outbound recipient allowlist. Any code path that reaches this
+        # method with send_now=True (create_draft tool, update_draft
+        # delete-and-recreate, future direct callers) is checked here. If
+        # any recipient is off-list, MailOutboundDisallowedError is raised
+        # BEFORE any AppleScript is built or executed. See
+        # outbound_allowlist.py for the policy. DO NOT add a bypass
+        # without explicit human authorization.
+        if send_now:
+            assert_recipients_allowed_for_send(to, cc, bcc, seed=seed)
 
         # If the caller handed us an RFC 5322 Message-ID (the form read
         # tools emit on the IMAP path per #148), resolve to Mail's

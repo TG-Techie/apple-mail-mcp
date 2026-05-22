@@ -2683,8 +2683,15 @@ class TestCreateDraftTool:
         mock_mail: MagicMock,
         mock_logger: MagicMock,
         mock_ctx_accept: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        from apple_mail_mcp import server as server_mod
         from apple_mail_mcp.server import create_draft
+
+        # Force the server-layer bypass off so the elicit flow is exercised.
+        # Connector-layer policy gate still sees the conftest allowlist
+        # patterns (@example.com is whitelisted there) so the send completes.
+        monkeypatch.setattr(server_mod, "all_recipients_allowed", lambda r: False)
 
         mock_mail.create_draft.return_value = {
             "draft_id": "", "sent_message_id": ""
@@ -2705,8 +2712,12 @@ class TestCreateDraftTool:
         mock_mail: MagicMock,
         mock_logger: MagicMock,
         mock_ctx_decline: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        from apple_mail_mcp import server as server_mod
         from apple_mail_mcp.server import create_draft
+
+        monkeypatch.setattr(server_mod, "all_recipients_allowed", lambda r: False)
 
         result = await create_draft(
             to=["a@example.com"], subject="hi", body="x",
@@ -2722,12 +2733,16 @@ class TestCreateDraftTool:
         isolated_drafts: Any,
         mock_mail: MagicMock,
         mock_logger: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """#226 integration test: an indirect call site (through
         _run_send_now_gates) must surface the helper's
         confirmation_required error rather than completing the send
         when no ctx is supplied."""
+        from apple_mail_mcp import server as server_mod
         from apple_mail_mcp.server import create_draft
+
+        monkeypatch.setattr(server_mod, "all_recipients_allowed", lambda r: False)
 
         result = await create_draft(
             to=["a@example.com"], subject="hi", body="x",
@@ -2985,8 +3000,12 @@ class TestUpdateDraftTool:
         mock_mail: MagicMock,
         mock_logger: MagicMock,
         mock_ctx_accept: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        from apple_mail_mcp import server as server_mod
         from apple_mail_mcp.server import update_draft
+
+        monkeypatch.setattr(server_mod, "all_recipients_allowed", lambda r: False)
 
         mock_mail.get_draft_state.return_value = {
             "draft_id": "160991",
@@ -3502,8 +3521,12 @@ class TestDraftToolErrorPaths:
         mock_mail: MagicMock,
         mock_logger: MagicMock,
         mock_ctx_decline: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        from apple_mail_mcp import server as server_mod
         from apple_mail_mcp.server import update_draft
+
+        monkeypatch.setattr(server_mod, "all_recipients_allowed", lambda r: False)
 
         mock_mail.get_draft_state.return_value = {
             "draft_id": "160991", "to": ["a@example.com"],
