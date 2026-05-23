@@ -5037,11 +5037,11 @@ class TestCreateDraft:
         assert "set beforeIds to" in script
 
     @patch.object(AppleMailConnector, "_run_applescript")
-    def test_new_send_uses_eml_open_path(
+    def test_new_send_uses_mailto_path(
         self, mock_run: MagicMock, connector: AppleMailConnector
     ) -> None:
-        """seed="new" + send_now=True uses the .eml-open path to bypass
-        Mail.app's compose MIME encoding that wraps the body in
+        """seed="new" + send_now=True uses the mailto: URL path to bypass
+        Mail.app's AppleScript compose path that wraps the body in
         <blockquote type="cite"> (Apple Dev Forum 738842 / FB11734014)."""
         mock_run.return_value = "SENT"
         connector.create_draft(
@@ -5052,15 +5052,49 @@ class TestCreateDraft:
             send_now=True,
         )
         script = mock_run.call_args[0][0]
-        # Uses open POSIX file with a .emlx, not make new outgoing message.
-        assert "open (POSIX file" in script
-        assert ".emlx" in script
+        # Uses open location with a mailto: URL, not make new outgoing message.
+        assert "open location" in script
+        assert "mailto:" in script
         assert "send theMessage" in script
         assert "make new outgoing message" not in script
         # Count-based outgoing message discovery.
         assert "count of outgoing messages" in script
         # No draft snapshot — not saving a draft.
         assert "set beforeIds to" not in script
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_new_send_mailto_encodes_body(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        """mailto: URL contains percent-encoded subject and body."""
+        mock_run.return_value = "SENT"
+        connector.create_draft(
+            seed="new",
+            to=["a@example.com"],
+            subject="hello world",
+            body="line1\nline2",
+            send_now=True,
+        )
+        script = mock_run.call_args[0][0]
+        # Subject and body must be percent-encoded in the URL.
+        assert "hello%20world" in script
+        assert "line1%0Aline2" in script
+
+    def test_new_send_with_attachments_raises(
+        self, connector: AppleMailConnector
+    ) -> None:
+        """Attachments are not supported via the mailto: send path."""
+        from pathlib import Path
+
+        with pytest.raises(NotImplementedError, match="attachments"):
+            connector.create_draft(
+                seed="new",
+                to=["a@example.com"],
+                subject="hi",
+                body="x",
+                send_now=True,
+                attachment_paths=[Path("/tmp/file.pdf")],
+            )
 
     @patch.object(AppleMailConnector, "_run_applescript")
     def test_new_with_from_account_sets_display_name_sender(

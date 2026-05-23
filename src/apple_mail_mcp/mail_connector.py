@@ -7,6 +7,7 @@ import re
 import subprocess
 import tempfile
 import time
+import urllib.parse
 import warnings
 from collections.abc import Callable
 from email.encoders import encode_base64 as _email_encode_base64
@@ -3596,8 +3597,7 @@ class AppleMailConnector:
         from_account: str | None,
         attachment_paths: list[Path] | None,
     ) -> dict[str, str]:
-        """Send a brand-new message by writing a clean .emlx file and opening
-        it in Mail.app via AppleScript ``open``.
+        """Send a brand-new message via Mail.app's ``mailto:`` URL handler.
 
         Mail.app's AppleScript compose path (``make new outgoing message`` +
         ``set content``) wraps the body in ``<blockquote type="cite">`` with
@@ -3605,88 +3605,83 @@ class AppleMailConnector:
         renders a purple quoted-reply bar. Apple Developer Forum thread 738842
         / FB11734014.
 
-        Fix: build a clean RFC 2822 .emlx ourselves (no blockquote), open it
-        in Mail.app via ``open POSIX file``, and send the resulting outgoing
-        message. Mail.app handles SMTP; we own the MIME structure.
+        Fix: open a compose window via ``open location "mailto:..."`` inside
+        a ``tell application "Mail"`` block. Mail.app's mailto URL handler
+        uses an internal code path distinct from the AppleScript ``content``
+        property setter, so it does NOT inject the URLShare blockquote wrapper.
+        We detect the new outgoing message with a count-before/after pattern
+        and call ``send`` on it.
 
-        .emlx (Apple's internal format) is used instead of .eml because
-        ``X-Uniform-Type-Identifier: com.apple.mail-draft`` makes Mail.app
-        open the file as a compose window rather than a read-only viewer,
-        allowing ``send`` to be called on the result.
+        Attachments are not supported via this path (mailto: URLs carry no
+        binary payload). Callers that need attachments must use the regular
+        AppleScript compose path.
 
         Called only from ``create_draft`` when ``seed="new"`` and
         ``send_now=True``. The outbound allowlist gate has already run.
         """
-        # Resolve sender before building the .emlx so _resolve_account_to_sender
-        # (which calls _run_applescript) runs outside the send script.
+        if attachment_paths:
+            raise NotImplementedError(
+                "mailto-send path does not support attachments. "
+                "Use the standard draft_create / draft_send flow for messages "
+                "with attachments."
+            )
+
+        # Resolve sender before running the send script so that
+        # _resolve_account_to_sender (which calls _run_applescript) runs
+        # outside the critical-path send script.
         from_addr: str | None = None
         if from_account is not None:
             from_addr = self._resolve_account_to_sender(from_account)
 
-        # Build MIME message.
-        if attachment_paths:
-            msg: Any = _MIMEMultipart()
-            msg.attach(_MIMEText(body, "plain", "utf-8"))
-            for att_path in attachment_paths:
-                with open(att_path, "rb") as fh:
-                    part = _MIMEBase("application", "octet-stream")
-                    part.set_payload(fh.read())
-                _email_encode_base64(part)
-                part.add_header(
-                    "Content-Disposition", "attachment", filename=att_path.name
-                )
-                msg.attach(part)
-        else:
-            msg = _MIMEText(body, "plain", "utf-8")
-
-        msg["Subject"] = subject
-        msg["To"] = ", ".join(to)
+        # Build mailto: URL.  Percent-encode subject and body so arbitrary
+        # text (newlines, unicode, special characters) is transmitted cleanly.
+        # safe='@,' for the recipient list allows literal @ and , through.
+        to_str = ",".join(to)
+        params: list[tuple[str, str]] = []
+        if subject:
+            params.append(("subject", subject))
+        if body:
+            params.append(("body", body))
         if cc:
-            msg["Cc"] = ", ".join(cc)
+            params.append(("cc", ",".join(cc)))
         if bcc:
-            msg["Bcc"] = ", ".join(bcc)
+            params.append(("bcc", ",".join(bcc)))
+
+        query = "&".join(
+            f"{k}={urllib.parse.quote(v, safe='')}" for k, v in params
+        )
+        mailto_url = f"mailto:{urllib.parse.quote(to_str, safe='@,')}"
+        if query:
+            mailto_url += "?" + query
+
+        mailto_url_safe = escape_applescript_string(mailto_url)
+
+        # Build set-sender fragment if needed.
+        sender_block = ""
         if from_addr is not None:
-            msg["From"] = from_addr
-        # Draft UTI header — tells Mail.app to open this as a compose window
-        # rather than a read-only message viewer.
-        msg["X-Uniform-Type-Identifier"] = "com.apple.mail-draft"
+            from_addr_safe = escape_applescript_string(from_addr)
+            sender_block = f'\n                    set sender of theMessage to "{from_addr_safe}"'
 
-        emlx_bytes = self._build_emlx_bytes(msg.as_bytes())
-
-        with tempfile.NamedTemporaryFile(
-            suffix=".emlx",
-            delete=False,
-            prefix="apple_mail_mcp_",
-        ) as tf:
-            eml_path = Path(tf.name)
-            tf.write(emlx_bytes)
-
-        try:
-            eml_path_safe = escape_applescript_string(str(eml_path))
-            # Use a count-before/after pattern so the send works even if
-            # ``open`` returns missing value instead of a direct reference.
-            script = f"""
-            tell application "Mail"
-                set cntBefore to count of outgoing messages
-                open (POSIX file "{eml_path_safe}")
-                delay 1
-                if (count of outgoing messages) > cntBefore then
-                    set theMessage to last outgoing message
-                    send theMessage
-                    return "SENT"
-                else
-                    return "NO_NEW_OUTGOING"
-                end if
-            end tell
-            """
-            result = self._run_applescript(script).strip()
-            if result == "SENT":
-                return {"draft_id": "", "sent_message_id": ""}
-            raise MailAppleScriptError(
-                f"emlx-send: {result!r} — .emlx did not open as a compose window"
-            )
-        finally:
-            eml_path.unlink(missing_ok=True)
+        script = f"""
+        tell application "Mail"
+            set cntBefore to count of outgoing messages
+            open location "{mailto_url_safe}"
+            delay 1
+            if (count of outgoing messages) > cntBefore then
+                set theMessage to last outgoing message{sender_block}
+                send theMessage
+                return "SENT"
+            else
+                return "NO_NEW_OUTGOING"
+            end if
+        end tell
+        """
+        result = self._run_applescript(script).strip()
+        if result == "SENT":
+            return {"draft_id": "", "sent_message_id": ""}
+        raise MailAppleScriptError(
+            f"mailto-send: {result!r} — mailto: URL did not open a compose window"
+        )
 
     def create_draft(
         self,
