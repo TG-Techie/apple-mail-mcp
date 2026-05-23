@@ -5,9 +5,14 @@ AppleScript-based connector for Apple Mail.
 import logging
 import re
 import subprocess
+import tempfile
 import time
 import warnings
 from collections.abc import Callable
+from email.encoders import encode_base64 as _email_encode_base64
+from email.mime.base import MIMEBase as _MIMEBase
+from email.mime.multipart import MIMEMultipart as _MIMEMultipart
+from email.mime.text import MIMEText as _MIMEText
 from datetime import date as _date
 from datetime import timedelta as _timedelta
 from pathlib import Path
@@ -3559,6 +3564,89 @@ class AppleMailConnector:
             set theMessage to {verb} origMsg opening window false
         """
 
+    def _send_new_via_eml(
+        self,
+        *,
+        to: list[str],
+        cc: list[str] | None,
+        bcc: list[str] | None,
+        subject: str,
+        body: str,
+        from_account: str | None,
+        attachment_paths: list[Path] | None,
+    ) -> dict[str, str]:
+        """Send a brand-new message by building a clean RFC 2822 .eml file
+        and opening it in Mail.app via AppleScript ``open``.
+
+        Bypasses Mail.app's AppleScript compose path, which wraps the body
+        in ``<blockquote type="cite">`` in the wire MIME encoding, causing
+        iOS Mail to render the purple quoted-reply bar. Apple Developer Forum
+        thread 738842 / FB11734014.
+
+        Called only from ``create_draft`` when ``seed="new"`` and
+        ``send_now=True``. The outbound allowlist gate has already run.
+        """
+        # Resolve sender before building the .eml so _resolve_account_to_sender
+        # (which calls _run_applescript) runs outside the send script.
+        from_addr: str | None = None
+        if from_account is not None:
+            from_addr = self._resolve_account_to_sender(from_account)
+
+        # Build MIME message.
+        if attachment_paths:
+            msg: Any = _MIMEMultipart()
+            msg.attach(_MIMEText(body, "plain", "utf-8"))
+            for att_path in attachment_paths:
+                with open(att_path, "rb") as fh:
+                    part = _MIMEBase("application", "octet-stream")
+                    part.set_payload(fh.read())
+                _email_encode_base64(part)
+                part.add_header(
+                    "Content-Disposition", "attachment", filename=att_path.name
+                )
+                msg.attach(part)
+        else:
+            msg = _MIMEText(body, "plain", "utf-8")
+
+        msg["Subject"] = subject
+        msg["To"] = ", ".join(to)
+        if cc:
+            msg["Cc"] = ", ".join(cc)
+        if bcc:
+            # BCC: included so Mail.app knows the recipients; stripped by the
+            # sending MTA before delivery.
+            msg["Bcc"] = ", ".join(bcc)
+        if from_addr is not None:
+            msg["From"] = from_addr
+
+        # Write to a temp file; Mail.app opens it as an outgoing message.
+        with tempfile.NamedTemporaryFile(
+            suffix=".eml",
+            delete=False,
+            prefix="apple_mail_mcp_",
+        ) as tf:
+            eml_path = Path(tf.name)
+            tf.write(msg.as_bytes())
+
+        try:
+            eml_path_safe = escape_applescript_string(str(eml_path))
+            script = f"""
+            tell application "Mail"
+                set theMessage to open (POSIX file "{eml_path_safe}")
+                delay 1
+                send theMessage
+                return "SENT"
+            end tell
+            """
+            result = self._run_applescript(script).strip()
+            if result != "SENT":
+                raise MailAppleScriptError(
+                    f"eml-send: unexpected result {result!r}"
+                )
+            return {"draft_id": "", "sent_message_id": ""}
+        finally:
+            eml_path.unlink(missing_ok=True)
+
     def create_draft(
         self,
         *,
@@ -3623,6 +3711,20 @@ class AppleMailConnector:
         # without explicit human authorization.
         if send_now:
             assert_recipients_allowed_for_send(to, cc, bcc, seed=seed)
+
+        # For brand-new messages sent immediately, bypass Mail.app's compose
+        # MIME encoding path, which wraps the body in <blockquote type="cite">
+        # causing iOS Mail to render a purple bar. See _send_new_via_eml.
+        if seed == "new" and send_now:
+            return self._send_new_via_eml(
+                to=to or [],
+                cc=cc,
+                bcc=bcc,
+                subject=subject or "",
+                body=body,
+                from_account=from_account,
+                attachment_paths=attachment_paths,
+            )
 
         # If the caller handed us an RFC 5322 Message-ID (the form read
         # tools emit on the IMAP path per #148), resolve to Mail's

@@ -5037,9 +5037,12 @@ class TestCreateDraft:
         assert "set beforeIds to" in script
 
     @patch.object(AppleMailConnector, "_run_applescript")
-    def test_new_send_uses_send_block(
+    def test_new_send_uses_eml_open_path(
         self, mock_run: MagicMock, connector: AppleMailConnector
     ) -> None:
+        """seed="new" + send_now=True uses the .eml-open path to bypass
+        Mail.app's compose MIME encoding that wraps the body in
+        <blockquote type="cite"> (Apple Dev Forum 738842 / FB11734014)."""
         mock_run.return_value = "SENT"
         connector.create_draft(
             seed="new",
@@ -5049,8 +5052,11 @@ class TestCreateDraft:
             send_now=True,
         )
         script = mock_run.call_args[0][0]
-        assert "tell theMessage to send" in script
-        # No diff snapshot when sending.
+        # Uses open POSIX file, not make new outgoing message.
+        assert "open (POSIX file" in script
+        assert "send theMessage" in script
+        assert "make new outgoing message" not in script
+        # No draft snapshot — not saving a draft.
         assert "set beforeIds to" not in script
 
     @patch.object(AppleMailConnector, "_run_applescript")
