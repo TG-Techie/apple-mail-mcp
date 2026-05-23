@@ -3526,16 +3526,9 @@ class AppleMailConnector:
         ``_maybe_resolve_rfc_seed_id`` first (#205). (#193)
         """
         if seed == "new":
-            # visible:true at creation routes content through Mail's real
-            # rich-text composer rather than the buggy invisible-message
-            # body-injection path that adds a leading newline and triggers
-            # iOS Mail's "this is a quote" rendering (purple bar). The
-            # script then sets visible:false again before save/send so no
-            # composer window flashes onscreen. See Apple Developer Forum
-            # thread 738842 / FB11734014.
             return (
                 f'set theMessage to make new outgoing message with properties '
-                f'{{subject:"{subject_safe}", content:"{body_safe}", visible:true}}'
+                f'{{subject:"{subject_safe}", content:"{body_safe}", visible:false}}'
             )
         if seed == "reply":
             verb = "reply to all" if reply_all else "reply"
@@ -3764,12 +3757,6 @@ class AppleMailConnector:
             {cc_block}
             {bcc_block}
             {attachment_block}
-
-            -- TEMP (debug): hide-before-terminal disabled so we can
-            -- visually confirm whether visible:true at creation is the
-            -- piece that fixes iOS blockquote rendering. Re-enable once
-            -- the rendering hypothesis is verified.
-            -- set visible of theMessage to false
 
             {terminal_block}
         end tell
