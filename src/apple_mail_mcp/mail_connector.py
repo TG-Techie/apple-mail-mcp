@@ -3514,7 +3514,6 @@ class AppleMailConnector:
         seed_id_safe: str | None,
         reply_all: bool,
         subject_safe: str | None,
-        body_safe: str,
     ) -> str:
         """Per-seed AppleScript fragment that produces ``theMessage``.
 
@@ -3524,11 +3523,20 @@ class AppleMailConnector:
         ``seed_id_safe`` is expected to be Mail's internal id —
         callers route RFC 5322 ids through
         ``_maybe_resolve_rfc_seed_id`` first (#205). (#193)
+
+        Body is intentionally NOT included in the ``make new outgoing
+        message with properties`` dict for the ``"new"`` seed.
+        Mail.app injects a stray leading newline when ``content:`` is
+        part of the creation properties for an invisible message; that
+        newline triggers iOS Mail's blockquote rendering (purple bar).
+        Body is set via a separate ``set content of theMessage`` call in
+        the caller's body_block instead. Apple Developer Forum thread
+        738842 / FB11734014.
         """
         if seed == "new":
             return (
                 f'set theMessage to make new outgoing message with properties '
-                f'{{subject:"{subject_safe}", content:"{body_safe}", visible:false}}'
+                f'{{subject:"{subject_safe}", visible:false}}'
             )
         if seed == "reply":
             verb = "reply to all" if reply_all else "reply"
@@ -3683,15 +3691,18 @@ class AppleMailConnector:
         #       body (loses inline quote but preserves threading headers).
         #     * empty body      -> leave Mail's auto-content alone (the
         #       quoted-reply default the user gets in Mail.app).
-        if seed == "new":
-            body_block = ""
-        elif body:
+        # For "new", body_block always sets content (body may be empty string;
+        # that's intentional — we never want content: in the creation
+        # properties, see _build_creation_block docstring).
+        # For reply/forward: non-empty body overrides Mail's auto-quoted
+        # content; empty body leaves the auto-quote intact.
+        if seed == "new" or body:
             body_block = f'set content of theMessage to "{body_safe}"'
         else:
             body_block = ""
 
         creation_block = self._build_creation_block(
-            seed, seed_id_safe, reply_all, subject_safe, body_safe,
+            seed, seed_id_safe, reply_all, subject_safe,
         )
 
         # Terminal block: save (with id-bridging diff) or send.
