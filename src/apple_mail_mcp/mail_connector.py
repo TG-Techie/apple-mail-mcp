@@ -3564,6 +3564,27 @@ class AppleMailConnector:
             set theMessage to {verb} origMsg opening window false
         """
 
+    @staticmethod
+    def _build_emlx_bytes(
+        mime_bytes: bytes,
+    ) -> bytes:
+        """Wrap raw MIME bytes in Apple Mail's .emlx container format.
+
+        .emlx layout:
+            {byte_count}      \\n   ← decimal length of mime_bytes, space-padded
+            {mime_bytes}
+            \\n
+            {minimal Apple plist}
+        """
+        plist = (
+            b'<?xml version="1.0" encoding="UTF-8"?>\n'
+            b'<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"'
+            b' "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+            b'<plist version="1.0">\n<dict>\n</dict>\n</plist>\n'
+        )
+        header = f"{len(mime_bytes)}      \n".encode()
+        return header + mime_bytes + b"\n" + plist
+
     def _send_new_via_eml(
         self,
         *,
@@ -3575,18 +3596,28 @@ class AppleMailConnector:
         from_account: str | None,
         attachment_paths: list[Path] | None,
     ) -> dict[str, str]:
-        """Send a brand-new message by building a clean RFC 2822 .eml file
-        and opening it in Mail.app via AppleScript ``open``.
+        """Send a brand-new message by writing a clean .emlx file and opening
+        it in Mail.app via AppleScript ``open``.
 
-        Bypasses Mail.app's AppleScript compose path, which wraps the body
-        in ``<blockquote type="cite">`` in the wire MIME encoding, causing
-        iOS Mail to render the purple quoted-reply bar. Apple Developer Forum
-        thread 738842 / FB11734014.
+        Mail.app's AppleScript compose path (``make new outgoing message`` +
+        ``set content``) wraps the body in ``<blockquote type="cite">`` with
+        invisible CSS. macOS Mail hides the bar; iOS Mail ignores the CSS and
+        renders a purple quoted-reply bar. Apple Developer Forum thread 738842
+        / FB11734014.
+
+        Fix: build a clean RFC 2822 .emlx ourselves (no blockquote), open it
+        in Mail.app via ``open POSIX file``, and send the resulting outgoing
+        message. Mail.app handles SMTP; we own the MIME structure.
+
+        .emlx (Apple's internal format) is used instead of .eml because
+        ``X-Uniform-Type-Identifier: com.apple.mail-draft`` makes Mail.app
+        open the file as a compose window rather than a read-only viewer,
+        allowing ``send`` to be called on the result.
 
         Called only from ``create_draft`` when ``seed="new"`` and
         ``send_now=True``. The outbound allowlist gate has already run.
         """
-        # Resolve sender before building the .eml so _resolve_account_to_sender
+        # Resolve sender before building the .emlx so _resolve_account_to_sender
         # (which calls _run_applescript) runs outside the send script.
         from_addr: str | None = None
         if from_account is not None:
@@ -3613,37 +3644,47 @@ class AppleMailConnector:
         if cc:
             msg["Cc"] = ", ".join(cc)
         if bcc:
-            # BCC: included so Mail.app knows the recipients; stripped by the
-            # sending MTA before delivery.
             msg["Bcc"] = ", ".join(bcc)
         if from_addr is not None:
             msg["From"] = from_addr
+        # Draft UTI header — tells Mail.app to open this as a compose window
+        # rather than a read-only message viewer.
+        msg["X-Uniform-Type-Identifier"] = "com.apple.mail-draft"
 
-        # Write to a temp file; Mail.app opens it as an outgoing message.
+        emlx_bytes = self._build_emlx_bytes(msg.as_bytes())
+
         with tempfile.NamedTemporaryFile(
-            suffix=".eml",
+            suffix=".emlx",
             delete=False,
             prefix="apple_mail_mcp_",
         ) as tf:
             eml_path = Path(tf.name)
-            tf.write(msg.as_bytes())
+            tf.write(emlx_bytes)
 
         try:
             eml_path_safe = escape_applescript_string(str(eml_path))
+            # Use a count-before/after pattern so the send works even if
+            # ``open`` returns missing value instead of a direct reference.
             script = f"""
             tell application "Mail"
-                set theMessage to open (POSIX file "{eml_path_safe}")
+                set cntBefore to count of outgoing messages
+                open (POSIX file "{eml_path_safe}")
                 delay 1
-                send theMessage
-                return "SENT"
+                if (count of outgoing messages) > cntBefore then
+                    set theMessage to last outgoing message
+                    send theMessage
+                    return "SENT"
+                else
+                    return "NO_NEW_OUTGOING"
+                end if
             end tell
             """
             result = self._run_applescript(script).strip()
-            if result != "SENT":
-                raise MailAppleScriptError(
-                    f"eml-send: unexpected result {result!r}"
-                )
-            return {"draft_id": "", "sent_message_id": ""}
+            if result == "SENT":
+                return {"draft_id": "", "sent_message_id": ""}
+            raise MailAppleScriptError(
+                f"emlx-send: {result!r} — .emlx did not open as a compose window"
+            )
         finally:
             eml_path.unlink(missing_ok=True)
 

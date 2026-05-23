@@ -5052,10 +5052,13 @@ class TestCreateDraft:
             send_now=True,
         )
         script = mock_run.call_args[0][0]
-        # Uses open POSIX file, not make new outgoing message.
+        # Uses open POSIX file with a .emlx, not make new outgoing message.
         assert "open (POSIX file" in script
+        assert ".emlx" in script
         assert "send theMessage" in script
         assert "make new outgoing message" not in script
+        # Count-based outgoing message discovery.
+        assert "count of outgoing messages" in script
         # No draft snapshot — not saving a draft.
         assert "set beforeIds to" not in script
 
