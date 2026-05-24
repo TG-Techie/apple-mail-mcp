@@ -3681,27 +3681,35 @@ class AppleMailConnector:
             end if
             -- Step 2: close and save as draft (MIME stays clean).
             close targetWin saving yes
-            delay 1
+            delay 3
         end tell
 
-        -- Step 3: find the saved draft (search all accounts) and open it.
+        -- Step 3: find the saved draft (poll up to 15s for iCloud IMAP sync).
+        set targetMsg to missing value
+        repeat 15 times
+            tell application "Mail"
+                repeat with acct in accounts
+                    try
+                        set dm to mailbox "Drafts" of acct
+                        repeat with m in messages of dm
+                            if subject of m is "{win_subject_safe}" then
+                                set targetMsg to m
+                                exit repeat
+                            end if
+                        end repeat
+                    end try
+                    if targetMsg is not missing value then exit repeat
+                end repeat
+            end tell
+            if targetMsg is not missing value then exit repeat
+            delay 1
+        end repeat
+
+        if targetMsg is missing value then
+            return "DRAFT_NOT_FOUND"
+        end if
+
         tell application "Mail"
-            set targetMsg to missing value
-            repeat with acct in accounts
-                try
-                    set dm to mailbox "Drafts" of acct
-                    repeat with m in messages of dm
-                        if subject of m is "{win_subject_safe}" then
-                            set targetMsg to m
-                            exit repeat
-                        end if
-                    end repeat
-                end try
-                if targetMsg is not missing value then exit repeat
-            end repeat
-            if targetMsg is missing value then
-                return "DRAFT_NOT_FOUND"
-            end if
             open targetMsg
             activate
             delay 1
