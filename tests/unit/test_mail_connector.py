@@ -6040,3 +6040,128 @@ class TestDeleteMailbox:
         mock_cfg.assert_not_called()
         mock_pw.assert_not_called()
         mock_imap_cls.assert_not_called()
+
+
+class TestSendHtmlEmail:
+    """Tests for AppleMailConnector._send_html_email."""
+
+    @pytest.fixture
+    def connector(self) -> AppleMailConnector:
+        return AppleMailConnector(timeout=30)
+
+    def test_html_send_uses_clipboard_path(
+        self, connector: AppleMailConnector
+    ) -> None:
+        """Happy path: mock _run_applescript returning SENT. Verify the
+        generated script contains the clipboard-injection landmarks and
+        does NOT contain draft-save primitives."""
+        captured: list[str] = []
+
+        def fake_run(script: str) -> str:
+            captured.append(script)
+            return "SENT"
+
+        connector._run_applescript = fake_run  # type: ignore[method-assign]
+        result = connector._send_html_email(
+            to=["test@example.com"],
+            cc=None,
+            bcc=None,
+            subject="Hello",
+            body="<p>Hi</p>",
+            from_account=None,
+        )
+        assert result == {"draft_id": "", "sent_message_id": ""}
+        assert len(captured) == 1
+        script = captured[0]
+        # Clipboard-inject landmarks
+        assert "public.html" in script
+        assert "Make Rich Text" in script
+        assert "AXWebArea" in script
+        assert "click sendBtn" in script
+        # Must NOT use the draft-save path
+        assert "close" not in script
+        assert "saving yes" not in script
+
+    def test_html_send_no_body_area_raises(
+        self, connector: AppleMailConnector
+    ) -> None:
+        """NO_BODY_AREA result → MailAppleScriptError."""
+        connector._run_applescript = lambda _: "NO_BODY_AREA"  # type: ignore[method-assign]
+        with pytest.raises(MailAppleScriptError, match="NO_BODY_AREA"):
+            connector._send_html_email(
+                to=["test@example.com"],
+                cc=None,
+                bcc=None,
+                subject="Hi",
+                body="<p>x</p>",
+                from_account=None,
+            )
+
+    def test_html_send_with_attachments_raises(
+        self, connector: AppleMailConnector
+    ) -> None:
+        """Passing attachment_paths raises NotImplementedError immediately,
+        before any AppleScript is called."""
+        from pathlib import Path
+        called: list[bool] = []
+        connector._run_applescript = lambda _: (called.append(True), "SENT")[1]  # type: ignore[method-assign]
+        with pytest.raises(NotImplementedError):
+            connector._send_html_email(
+                to=["test@example.com"],
+                cc=None,
+                bcc=None,
+                subject="Hi",
+                body="<p>x</p>",
+                from_account=None,
+                attachment_paths=[Path("/tmp/file.pdf")],
+            )
+        assert not called, "_run_applescript must not be called when attachments provided"
+
+    def test_html_send_encodes_subject(
+        self, connector: AppleMailConnector
+    ) -> None:
+        """Subject with special characters is URL-encoded in the mailto: URL."""
+        captured: list[str] = []
+
+        def fake_run(script: str) -> str:
+            captured.append(script)
+            return "SENT"
+
+        connector._run_applescript = fake_run  # type: ignore[method-assign]
+        connector._send_html_email(
+            to=["test@example.com"],
+            cc=None,
+            bcc=None,
+            subject="Hello World & <Test>",
+            body="<p>body</p>",
+            from_account=None,
+        )
+        script = captured[0]
+        # URL-encoded subject should appear; raw ampersand should not be
+        # in the mailto: URL portion
+        assert "Hello%20World" in script or "Hello+World" in script or "%26" in script
+
+    def test_html_send_escapes_body(
+        self, connector: AppleMailConnector
+    ) -> None:
+        """Body with AppleScript-special characters (quotes, backslashes) is
+        escaped before interpolation so the script remains valid."""
+        captured: list[str] = []
+
+        def fake_run(script: str) -> str:
+            captured.append(script)
+            return "SENT"
+
+        connector._run_applescript = fake_run  # type: ignore[method-assign]
+        connector._send_html_email(
+            to=["test@example.com"],
+            cc=None,
+            bcc=None,
+            subject="Test",
+            body='<p>He said "hello" and back\\slash</p>',
+            from_account=None,
+        )
+        script = captured[0]
+        # Verify escaped forms appear; raw unescaped double-quote
+        # inside the AppleScript string would break the interpolation
+        assert '\\"' in script or "\\\\back" in script

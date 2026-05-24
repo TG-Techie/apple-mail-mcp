@@ -249,3 +249,55 @@ class TestDraftSend:
         result = await draft_send(draft_id="GONE")
         assert result["success"] is False
         mock_mail.delete_draft.assert_not_called()
+
+
+class TestDraftSendHtml:
+    """Tests for the draft_send_html MCP tool."""
+
+    @pytest.mark.asyncio
+    async def test_draft_send_html_calls_connector(
+        self,
+        isolated_drafts: None,
+        mock_mail: MagicMock,
+    ) -> None:
+        """Happy path: allowlisted recipient → _send_html_email is called."""
+        from apple_mail_mcp.server import draft_send_html
+
+        mock_mail._send_html_email.return_value = {
+            "draft_id": "", "sent_message_id": ""
+        }
+        result = await draft_send_html(
+            to=["jonah@tg-techie.com"],
+            subject="Test HTML",
+            body="<p>Hello</p>",
+        )
+        assert result["success"] is True
+        assert result["draft_id"] == ""
+        assert result["sent_message_id"] == ""
+        mock_mail._send_html_email.assert_called_once()
+        call_kwargs = mock_mail._send_html_email.call_args.kwargs
+        assert call_kwargs["to"] == ["jonah@tg-techie.com"]
+        assert call_kwargs["subject"] == "Test HTML"
+        assert call_kwargs["body"] == "<p>Hello</p>"
+
+    @pytest.mark.asyncio
+    async def test_draft_send_html_blocks_off_allowlist(
+        self,
+        isolated_drafts: None,
+        mock_mail: MagicMock,
+        monkeypatch: Any,
+    ) -> None:
+        """Off-list recipient → outbound_disallowed error, connector not called."""
+        monkeypatch.delenv(
+            "APPLE_MAIL_MCP_SEND_ELICITATION_ALLOWLIST", raising=False
+        )
+        from apple_mail_mcp.server import draft_send_html
+
+        result = await draft_send_html(
+            to=["random@other.com"],
+            subject="Blocked",
+            body="<p>x</p>",
+        )
+        assert result["success"] is False
+        assert result["error_type"] == "outbound_disallowed"
+        mock_mail._send_html_email.assert_not_called()

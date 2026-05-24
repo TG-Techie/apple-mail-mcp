@@ -3069,6 +3069,113 @@ async def draft_send(
     )
 
 
+@mcp.tool()
+async def draft_send_html(
+    to: list[str],
+    subject: str,
+    body: str,
+    cc: list[str] = [],  # noqa: B006 — coerced below
+    bcc: list[str] = [],  # noqa: B006 — coerced below
+    from_account: str | None = None,
+    ctx: Context | None = None,
+) -> dict:
+    """Send an HTML email directly. Does not save a draft first.
+
+    Body must be an HTML string. The email is composed via clipboard injection
+    into Mail.app's rich-text compose window and sent immediately.
+
+    Outbound allowlist policy applies — all recipients must be on the allowlist.
+
+    Args:
+        to: List of recipient email addresses.
+        subject: Email subject line.
+        body: HTML string for the email body.
+        cc: Optional CC recipients.
+        bcc: Optional BCC recipients.
+        from_account: Mail.app account name or UUID. None uses Mail's default.
+
+    Returns:
+        ``{"success": True, "draft_id": "", "sent_message_id": ""}`` on success.
+    """
+    cc_list = cc or []
+    bcc_list = bcc or []
+
+    all_recipients = list(to) + list(cc_list) + list(bcc_list)
+
+    # Hard allowlist policy gate — same as draft_send.
+    from .outbound_allowlist import disallowed_recipients
+    bad = disallowed_recipients(all_recipients)
+    if bad:
+        logger.warning(
+            "draft_send_html blocked — off-list recipients: %s", bad
+        )
+        return {
+            "success": False,
+            "error": (
+                "send blocked — recipients not on outbound allowlist: "
+                + ", ".join(repr(b) for b in bad)
+            ),
+            "error_type": "outbound_disallowed",
+        }
+
+    if not all_recipients:
+        return {
+            "success": False,
+            "error": "draft_send_html: no recipients specified",
+            "error_type": "validation_error",
+        }
+
+    # Elicitation / rate-limit gate (same pattern as other send tools).
+    from .outbound_allowlist import assert_recipients_allowed_for_send
+    try:
+        assert_recipients_allowed_for_send(to, cc_list or None, bcc_list or None)
+    except Exception as e:
+        handled = _draft_action_error("draft_send_html", e)
+        if handled is not None:
+            return handled
+        return {"success": False, "error": str(e), "error_type": "unknown"}
+
+    summary = _build_draft_send_summary(
+        "new", to, cc_list or None, bcc_list or None, subject, body
+    )
+    gate_err = await _run_send_now_gates(
+        operation="draft_send_html",
+        ctx=ctx,
+        recipients=all_recipients,
+        rate_params={"subject": subject, "to": to},
+        summary=summary,
+        elicit_extra={"subject": subject, "to": to},
+    )
+    if gate_err:
+        return gate_err
+
+    try:
+        result = mail._send_html_email(
+            to=to,
+            cc=cc_list or None,
+            bcc=bcc_list or None,
+            subject=subject,
+            body=body,
+            from_account=from_account,
+        )
+        operation_logger.log_operation(
+            "draft_send_html",
+            {"to": to, "subject": subject},
+            "success",
+        )
+        return {
+            "success": True,
+            "draft_id": result.get("draft_id", ""),
+            "sent_message_id": result.get("sent_message_id", ""),
+        }
+    except Exception as e:
+        handled = _draft_action_error("draft_send_html", e)
+        if handled is not None:
+            return handled
+        logger.exception(f"Unexpected error in draft_send_html: {e}")
+        return {"success": False, "error": str(e), "error_type": "unknown"}
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="apple-mail-mcp",

@@ -3747,6 +3747,153 @@ class AppleMailConnector:
             f"mailto-send: {result!r}"
         )
 
+    def _send_html_email(
+        self,
+        *,
+        to: list[str],
+        cc: list[str] | None,
+        bcc: list[str] | None,
+        subject: str,
+        body: str,  # HTML string
+        from_account: str | None,  # noqa: ARG002 — see TODO below
+        attachment_paths: list[Path] | None = None,
+    ) -> dict[str, str]:
+        """Send an HTML email directly via clipboard injection.
+
+        Translates the clipboard-inject AppleScript pattern into a Python
+        method call. Does NOT save a draft first — composes via mailto:,
+        injects HTML via the system clipboard into the compose window's
+        body WebArea, and clicks Send directly.
+
+        Limitations
+        -----------
+        * Attachments not supported.
+        * ``from_account`` is currently ignored; Mail uses its default sender.
+          TODO: add System Events From-popup manipulation for multi-account
+          support.
+
+        Args:
+            to: List of recipient email addresses.
+            cc: Optional CC recipient list.
+            bcc: Optional BCC recipient list.
+            subject: Email subject line.
+            body: HTML string for the email body.
+            from_account: Currently ignored.
+            attachment_paths: Must be None or empty (raises NotImplementedError).
+
+        Returns:
+            ``{"draft_id": "", "sent_message_id": ""}`` on success.
+
+        Raises:
+            NotImplementedError: If attachment_paths is non-empty.
+            MailAppleScriptError: If the compose window's body area is not
+                found (NO_BODY_AREA) or any other non-SENT result.
+        """
+        if attachment_paths:
+            raise NotImplementedError(
+                "HTML-send path does not support attachments. "
+                "Use the standard draft_create / draft_send flow for messages "
+                "with attachments."
+            )
+
+        # Build mailto: URL with URL-encoded subject and recipients.
+        # subject is URL-encoded for the mailto: URL; body is passed as
+        # an AppleScript string literal (clipboard injection), not in the URL.
+        to_str = urllib.parse.quote(",".join(to), safe="@,")
+        encoded_subject = urllib.parse.quote(subject, safe="")
+        mailto_url = f"mailto:{to_str}?subject={encoded_subject}"
+
+        mailto_url_safe = escape_applescript_string(mailto_url)
+
+        # Escape all user-supplied strings for AppleScript interpolation.
+        body_safe = escape_applescript_string(sanitize_input(body))
+
+        script = f"""
+use framework "AppKit"
+use framework "Foundation"
+use scripting additions
+
+set theHTML to "{body_safe}"
+set mailtoURL to "{mailto_url_safe}"
+
+-- 1. Save clipboard
+set pb to current application's NSPasteboard's generalPasteboard()
+set savedTypes to (pb's types()) as list
+set savedPairs to {{}}
+repeat with t in savedTypes
+    set theData to (pb's dataForType:(t as text))
+    if theData is not missing value then
+        set end of savedPairs to {{pbType:(t as text), pbData:theData}}
+    end if
+end repeat
+
+-- 2. Write HTML to clipboard
+set htmlNSString to current application's NSString's stringWithString:theHTML
+set htmlData to htmlNSString's dataUsingEncoding:(current application's NSUTF8StringEncoding)
+pb's clearContents()
+pb's setData:htmlData forType:"public.html"
+
+-- 3. Open compose window
+tell application "Mail"
+    open location mailtoURL
+    delay 2
+    activate
+end tell
+
+-- 4. Rich text, find body WebArea, paste, click Send
+tell application "System Events"
+    tell application process "Mail"
+        set w to window 1
+        try
+            click menu item "Make Rich Text" of menu "Format" of menu bar 1
+            delay 0.3
+        end try
+        -- Find body WebArea: top-level groups -> group[1] -> scroll area[1] -> AXWebArea
+        set bodyArea to missing value
+        repeat with g in groups of w
+            try
+                set sa to scroll area 1 of group 1 of g
+                set waList to (UI elements of sa whose role is "AXWebArea")
+                if (count of waList) > 0 then
+                    set bodyArea to item 1 of waList
+                    exit repeat
+                end if
+            end try
+        end repeat
+        if bodyArea is missing value then
+            -- Restore clipboard and abort
+            pb's clearContents()
+            repeat with pair in savedPairs
+                pb's setData:(pbData of pair) forType:(pbType of pair)
+            end repeat
+            return "NO_BODY_AREA"
+        end if
+        click bodyArea
+        delay 0.2
+        keystroke "v" using command down
+        delay 0.5
+        -- Click Send directly
+        set sendBtn to first button of (first toolbar of w) whose description is "Send"
+        click sendBtn
+    end tell
+end tell
+
+-- 5. Restore clipboard
+pb's clearContents()
+repeat with pair in savedPairs
+    pb's setData:(pbData of pair) forType:(pbType of pair)
+end repeat
+
+return "SENT"
+        """
+
+        result = self._run_applescript(script).strip()
+        if result == "SENT":
+            return {"draft_id": "", "sent_message_id": ""}
+        raise MailAppleScriptError(
+            f"html-send: {result!r}"
+        )
+
     def create_draft(
         self,
         *,

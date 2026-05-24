@@ -226,6 +226,7 @@ class TestCheckRateLimit:
             "update_message", "create_mailbox", "update_mailbox",
             "delete_mailbox", "delete_messages",
             "create_draft", "update_draft", "delete_draft",
+            "draft_send_html",
             "delete_rule", "create_rule", "update_rule",
             "list_templates", "get_template", "save_template",
             "delete_template", "render_template",
