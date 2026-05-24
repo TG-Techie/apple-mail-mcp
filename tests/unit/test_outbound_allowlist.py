@@ -1,18 +1,20 @@
 """Tests for the centralized outbound recipient allowlist (the policy
 enforcement perimeter for outbound mail).
 
-NOTE: the autouse `_allowlist_test_domains` fixture in conftest.py adds
-RFC 2606 test-domain patterns to APPLE_MAIL_MCP_SEND_ELICITATION_ALLOWLIST
-for every test. These tests use ``monkeypatch.delenv`` where they need to
-exercise the hardcoded-defaults-only path.
+NOTE: the autouse `_allowlist_test_domains` fixture in conftest.py writes
+a comms.yaml with RFC 2606 test-domain patterns and sets
+APPLE_MAIL_MCP_COMMS_CONFIG for every test. Tests that need the
+hardcoded-defaults-only path override COMMS_CONFIG_ENV to a nonexistent
+path so _load_comms_yaml_patterns() returns [].
 """
+
+from pathlib import Path
 
 import pytest
 
 from apple_mail_mcp.exceptions import MailOutboundDisallowedError
 from apple_mail_mcp.outbound_allowlist import (
     COMMS_CONFIG_ENV,
-    SEND_ELICITATION_ALLOWLIST_ENV,
     USER_EXPLICIT_OUTBOUND_ALLOW_LIST,
     all_recipients_allowed,
     allowlist_patterns,
@@ -20,6 +22,8 @@ from apple_mail_mcp.outbound_allowlist import (
     disallowed_recipients,
     extract_email,
 )
+
+_NO_YAML = "/nonexistent/comms.yaml"
 
 
 class TestExtractEmail:
@@ -46,25 +50,7 @@ class TestAllowlistPatterns:
     def test_hardcoded_default_present(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.delenv(SEND_ELICITATION_ALLOWLIST_ENV, raising=False)
-        patterns = allowlist_patterns()
-        assert "*@tg-techie.com" in patterns
-
-    def test_env_var_additive(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv(
-            SEND_ELICITATION_ALLOWLIST_ENV, "extra@here.com,*@allowed.io"
-        )
-        patterns = allowlist_patterns()
-        assert "*@tg-techie.com" in patterns  # hardcoded default still present
-        assert "extra@here.com" in patterns
-        assert "*@allowed.io" in patterns
-
-    def test_env_var_cannot_remove_hardcoded(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Even if the env var is set to a single odd pattern, the
-        hardcoded default still appears."""
-        monkeypatch.setenv(SEND_ELICITATION_ALLOWLIST_ENV, "nothing@here")
+        monkeypatch.setenv(COMMS_CONFIG_ENV, _NO_YAML)
         patterns = allowlist_patterns()
         assert "*@tg-techie.com" in patterns
 
@@ -77,57 +63,52 @@ class TestCommsYamlPatterns:
     """Tests for APPLE_MAIL_MCP_COMMS_CONFIG YAML integration."""
 
     def test_yaml_patterns_merged(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: pytest.TempPathFactory
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """Patterns from comms.yaml are merged into allowlist_patterns()."""
         cfg = tmp_path / "comms.yaml"
-        cfg.write_text("email_outbound:\n  - extra@example.com\n  - '*@allowed.test'\n")
+        cfg.write_text("email_outbound:\n  - extra@custom.com\n  - '*@allowed.test'\n")
         monkeypatch.setenv(COMMS_CONFIG_ENV, str(cfg))
-        monkeypatch.delenv(SEND_ELICITATION_ALLOWLIST_ENV, raising=False)
         patterns = allowlist_patterns()
         assert "*@tg-techie.com" in patterns  # hardcoded still present
-        assert "extra@example.com" in patterns
+        assert "extra@custom.com" in patterns
         assert "*@allowed.test" in patterns
 
     def test_missing_file_falls_back_to_hardcoded(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: pytest.TempPathFactory
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Missing comms.yaml: no error, hardcoded list still works."""
-        monkeypatch.setenv(COMMS_CONFIG_ENV, str(tmp_path / "nonexistent.yaml"))
-        monkeypatch.delenv(SEND_ELICITATION_ALLOWLIST_ENV, raising=False)
+        monkeypatch.setenv(COMMS_CONFIG_ENV, _NO_YAML)
         patterns = allowlist_patterns()
         assert "*@tg-techie.com" in patterns
 
     def test_invalid_yaml_falls_back_to_hardcoded(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: pytest.TempPathFactory
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """Unparseable YAML: log warning, hardcoded list still works."""
         cfg = tmp_path / "comms.yaml"
         cfg.write_text("{{not: valid: yaml:::\n")
         monkeypatch.setenv(COMMS_CONFIG_ENV, str(cfg))
-        monkeypatch.delenv(SEND_ELICITATION_ALLOWLIST_ENV, raising=False)
         patterns = allowlist_patterns()
         assert "*@tg-techie.com" in patterns
 
     def test_wrong_type_falls_back_to_hardcoded(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: pytest.TempPathFactory
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """email_outbound not a list: log warning, hardcoded list still works."""
         cfg = tmp_path / "comms.yaml"
         cfg.write_text("email_outbound: not-a-list\n")
         monkeypatch.setenv(COMMS_CONFIG_ENV, str(cfg))
-        monkeypatch.delenv(SEND_ELICITATION_ALLOWLIST_ENV, raising=False)
         patterns = allowlist_patterns()
         assert "*@tg-techie.com" in patterns
 
     def test_env_var_overrides_default_path(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: pytest.TempPathFactory
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """APPLE_MAIL_MCP_COMMS_CONFIG overrides the default ~/iCloud path."""
         cfg = tmp_path / "custom_comms.yaml"
         cfg.write_text("email_outbound:\n  - custom@override.test\n")
         monkeypatch.setenv(COMMS_CONFIG_ENV, str(cfg))
-        monkeypatch.delenv(SEND_ELICITATION_ALLOWLIST_ENV, raising=False)
         patterns = allowlist_patterns()
         assert "custom@override.test" in patterns
 
@@ -136,7 +117,7 @@ class TestAllRecipientsAllowed:
     def test_all_on_hardcoded_list(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.delenv(SEND_ELICITATION_ALLOWLIST_ENV, raising=False)
+        monkeypatch.setenv(COMMS_CONFIG_ENV, _NO_YAML)
         monkeypatch.delenv("MAIL_TEST_MODE", raising=False)
         assert all_recipients_allowed(
             ["jonah@tg-techie.com", "Other <other@tg-techie.com>"]
@@ -145,7 +126,7 @@ class TestAllRecipientsAllowed:
     def test_mixed_list_blocked(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.delenv(SEND_ELICITATION_ALLOWLIST_ENV, raising=False)
+        monkeypatch.setenv(COMMS_CONFIG_ENV, _NO_YAML)
         monkeypatch.delenv("MAIL_TEST_MODE", raising=False)
         assert not all_recipients_allowed(
             ["jonah@tg-techie.com", "outsider@other.com"]
@@ -154,20 +135,20 @@ class TestAllRecipientsAllowed:
     def test_empty_list_blocked(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.delenv(SEND_ELICITATION_ALLOWLIST_ENV, raising=False)
+        monkeypatch.setenv(COMMS_CONFIG_ENV, _NO_YAML)
         assert not all_recipients_allowed([])
 
     def test_display_name_format_works(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.delenv(SEND_ELICITATION_ALLOWLIST_ENV, raising=False)
+        monkeypatch.setenv(COMMS_CONFIG_ENV, _NO_YAML)
         monkeypatch.delenv("MAIL_TEST_MODE", raising=False)
         assert all_recipients_allowed(["Jonah Y-M <jonah@tg-techie.com>"])
 
     def test_test_mode_allows_reserved_domains(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.delenv(SEND_ELICITATION_ALLOWLIST_ENV, raising=False)
+        monkeypatch.setenv(COMMS_CONFIG_ENV, _NO_YAML)
         monkeypatch.setenv("MAIL_TEST_MODE", "true")
         assert all_recipients_allowed(["test@example.com"])
         assert all_recipients_allowed(["foo@something.test"])
@@ -175,7 +156,7 @@ class TestAllRecipientsAllowed:
     def test_test_mode_off_blocks_reserved_domains(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.delenv(SEND_ELICITATION_ALLOWLIST_ENV, raising=False)
+        monkeypatch.setenv(COMMS_CONFIG_ENV, _NO_YAML)
         monkeypatch.delenv("MAIL_TEST_MODE", raising=False)
         assert not all_recipients_allowed(["test@example.com"])
 
@@ -184,7 +165,7 @@ class TestDisallowedRecipients:
     def test_returns_only_off_list(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.delenv(SEND_ELICITATION_ALLOWLIST_ENV, raising=False)
+        monkeypatch.setenv(COMMS_CONFIG_ENV, _NO_YAML)
         monkeypatch.delenv("MAIL_TEST_MODE", raising=False)
         bad = disallowed_recipients(
             [
@@ -200,9 +181,8 @@ class TestAssertRecipientsAllowedForSend:
     def test_passes_when_all_allowlisted(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.delenv(SEND_ELICITATION_ALLOWLIST_ENV, raising=False)
+        monkeypatch.setenv(COMMS_CONFIG_ENV, _NO_YAML)
         monkeypatch.delenv("MAIL_TEST_MODE", raising=False)
-        # Should not raise.
         assert_recipients_allowed_for_send(
             to=["jonah@tg-techie.com"], cc=None, bcc=None
         )
@@ -210,7 +190,7 @@ class TestAssertRecipientsAllowedForSend:
     def test_raises_on_off_list_recipient(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.delenv(SEND_ELICITATION_ALLOWLIST_ENV, raising=False)
+        monkeypatch.setenv(COMMS_CONFIG_ENV, _NO_YAML)
         monkeypatch.delenv("MAIL_TEST_MODE", raising=False)
         with pytest.raises(MailOutboundDisallowedError) as exc:
             assert_recipients_allowed_for_send(
@@ -223,7 +203,7 @@ class TestAssertRecipientsAllowedForSend:
     def test_raises_when_cc_or_bcc_has_offlist(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.delenv(SEND_ELICITATION_ALLOWLIST_ENV, raising=False)
+        monkeypatch.setenv(COMMS_CONFIG_ENV, _NO_YAML)
         monkeypatch.delenv("MAIL_TEST_MODE", raising=False)
         with pytest.raises(MailOutboundDisallowedError):
             assert_recipients_allowed_for_send(
@@ -268,9 +248,8 @@ class TestAssertRecipientsAllowedForSend:
     def test_test_mode_allows_reserved_test_domain(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.delenv(SEND_ELICITATION_ALLOWLIST_ENV, raising=False)
+        monkeypatch.setenv(COMMS_CONFIG_ENV, _NO_YAML)
         monkeypatch.setenv("MAIL_TEST_MODE", "true")
-        # Should not raise — @example.com is reserved.
         assert_recipients_allowed_for_send(
             to=["test@example.com"], cc=None, bcc=None
         )
@@ -278,9 +257,8 @@ class TestAssertRecipientsAllowedForSend:
     def test_display_name_format_extracted_for_match(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.delenv(SEND_ELICITATION_ALLOWLIST_ENV, raising=False)
+        monkeypatch.setenv(COMMS_CONFIG_ENV, _NO_YAML)
         monkeypatch.delenv("MAIL_TEST_MODE", raising=False)
-        # Should not raise — extraction finds the on-list address.
         assert_recipients_allowed_for_send(
             to=["Jonah Y-M <jonah@tg-techie.com>"], cc=None, bcc=None
         )
@@ -290,7 +268,7 @@ class TestAssertRecipientsAllowedForSend:
     ) -> None:
         """A display-name string that LOOKS like an on-list pattern but
         actually wraps an off-list address must still be blocked."""
-        monkeypatch.delenv(SEND_ELICITATION_ALLOWLIST_ENV, raising=False)
+        monkeypatch.setenv(COMMS_CONFIG_ENV, _NO_YAML)
         monkeypatch.delenv("MAIL_TEST_MODE", raising=False)
         with pytest.raises(MailOutboundDisallowedError):
             assert_recipients_allowed_for_send(

@@ -21,10 +21,12 @@ before executing.
 ║ default. ONLY the human repo owner may add, remove, or alter         ║
 ║ entries. Agents (including the agent that authored this file) MUST   ║
 ║ NOT modify USER_EXPLICIT_OUTBOUND_ALLOW_LIST without explicit        ║
-║ per-change user authorization quoted in the conversation. The same   ║
-║ rule applies to the env-var augmentation path:                       ║
-║ APPLE_MAIL_MCP_SEND_ELICITATION_ALLOWLIST — agents may not set/unset ║
-║ it on the user's behalf without authorization.                       ║
+║ per-change user authorization quoted in the conversation.            ║
+║                                                                      ║
+║ Additional patterns come from the comms config YAML (key:            ║
+║ email_outbound). Path is controlled by APPLE_MAIL_MCP_COMMS_CONFIG   ║
+║ (default: ~/iCloud/AgentAccessConfig/comms.yaml). Only Jonah edits   ║
+║ that file; the agent has read-only access.                           ║
 ║                                                                      ║
 ║ Test-mode override (MAIL_TEST_MODE=true) lets RFC 2606 reserved test ║
 ║ domains (@example.com, .test, .invalid, .localhost) through so the   ║
@@ -54,9 +56,6 @@ _log = logging.getLogger(__name__)
 USER_EXPLICIT_OUTBOUND_ALLOW_LIST: tuple[str, ...] = (
     "*@tg-techie.com",
 )
-
-# Env var that ADDS patterns to the hardcoded list. Cannot remove from it.
-SEND_ELICITATION_ALLOWLIST_ENV = "APPLE_MAIL_MCP_SEND_ELICITATION_ALLOWLIST"
 
 # Env var pointing to the comms config YAML (key: email_outbound).
 # Defaults to ~/iCloud/AgentAccessConfig/comms.yaml.
@@ -120,19 +119,16 @@ def _load_comms_yaml_patterns() -> list[str]:
 
 
 def allowlist_patterns() -> list[str]:
-    """Merged allowlist at call time (three sources, additive only):
+    """Merged allowlist at call time (two sources, additive only):
 
     1. ``USER_EXPLICIT_OUTBOUND_ALLOW_LIST`` — hardcoded, owner-only.
     2. ``APPLE_MAIL_MCP_COMMS_CONFIG`` YAML → ``email_outbound`` list.
-    3. ``APPLE_MAIL_MCP_SEND_ELICITATION_ALLOWLIST`` env var (CSV).
 
-    Sources 2 and 3 ADD patterns; neither can remove hardcoded entries.
-    Resolved at call time so file/env edits take effect on the next send.
+    Source 2 ADDs patterns; it cannot remove hardcoded entries.
+    Resolved at call time so file edits take effect on the next send.
     """
     patterns = [p.lower() for p in USER_EXPLICIT_OUTBOUND_ALLOW_LIST]
     patterns.extend(_load_comms_yaml_patterns())
-    raw = os.environ.get(SEND_ELICITATION_ALLOWLIST_ENV, "")
-    patterns.extend(p.strip().lower() for p in raw.split(",") if p.strip())
     return patterns
 
 
