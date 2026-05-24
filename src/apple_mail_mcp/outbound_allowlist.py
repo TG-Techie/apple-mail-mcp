@@ -36,11 +36,17 @@ before executing.
 from __future__ import annotations
 
 import fnmatch
+import logging
 import os
 import re
+from pathlib import Path
 from typing import Iterable
 
+import yaml
+
 from .exceptions import MailOutboundDisallowedError
+
+_log = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────────────────────────────────
 # POLICY VALUE — see policy block above before touching.
@@ -51,6 +57,14 @@ USER_EXPLICIT_OUTBOUND_ALLOW_LIST: tuple[str, ...] = (
 
 # Env var that ADDS patterns to the hardcoded list. Cannot remove from it.
 SEND_ELICITATION_ALLOWLIST_ENV = "APPLE_MAIL_MCP_SEND_ELICITATION_ALLOWLIST"
+
+# Env var pointing to the comms config YAML (key: email_outbound).
+# Defaults to ~/iCloud/AgentAccessConfig/comms.yaml.
+# File is read at call time so Jonah's edits take effect on the next send.
+# On missing/unreadable/invalid file: log a warning and skip (hardcoded
+# list still applies).
+COMMS_CONFIG_ENV = "APPLE_MAIL_MCP_COMMS_CONFIG"
+_COMMS_CONFIG_DEFAULT = "~/iCloud/AgentAccessConfig/comms.yaml"
 
 _EMAIL_EXTRACT_RE = re.compile(r"<([^>]+)>")
 
@@ -75,12 +89,48 @@ def extract_email(recipient: str) -> str:
     return recipient.strip().lower()
 
 
+def _load_comms_yaml_patterns() -> list[str]:
+    """Read ``email_outbound`` patterns from the comms config YAML.
+
+    Path: ``APPLE_MAIL_MCP_COMMS_CONFIG`` env var, defaulting to
+    ``~/iCloud/AgentAccessConfig/comms.yaml``.
+
+    Returns an empty list (never raises) on any I/O or parse error so
+    the hardcoded allowlist still functions when the file is absent.
+    """
+    raw_path = os.environ.get(COMMS_CONFIG_ENV, _COMMS_CONFIG_DEFAULT)
+    config_path = Path(raw_path).expanduser()
+    try:
+        with config_path.open() as fh:
+            data = yaml.safe_load(fh)
+        if not isinstance(data, dict):
+            _log.warning("comms config %s: expected a YAML mapping, got %r", config_path, type(data))
+            return []
+        entries = data.get("email_outbound", [])
+        if not isinstance(entries, list):
+            _log.warning("comms config %s: email_outbound must be a list", config_path)
+            return []
+        return [str(e).strip().lower() for e in entries if e]
+    except FileNotFoundError:
+        _log.debug("comms config not found at %s — skipping", config_path)
+        return []
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("comms config %s unreadable/invalid: %s", config_path, exc)
+        return []
+
+
 def allowlist_patterns() -> list[str]:
-    """Hardcoded defaults + env-var additions. Env var ADDS only — it
-    cannot remove from the hardcoded defaults. Resolved at call time so
-    env changes between calls are honored.
+    """Merged allowlist at call time (three sources, additive only):
+
+    1. ``USER_EXPLICIT_OUTBOUND_ALLOW_LIST`` — hardcoded, owner-only.
+    2. ``APPLE_MAIL_MCP_COMMS_CONFIG`` YAML → ``email_outbound`` list.
+    3. ``APPLE_MAIL_MCP_SEND_ELICITATION_ALLOWLIST`` env var (CSV).
+
+    Sources 2 and 3 ADD patterns; neither can remove hardcoded entries.
+    Resolved at call time so file/env edits take effect on the next send.
     """
     patterns = [p.lower() for p in USER_EXPLICIT_OUTBOUND_ALLOW_LIST]
+    patterns.extend(_load_comms_yaml_patterns())
     raw = os.environ.get(SEND_ELICITATION_ALLOWLIST_ENV, "")
     patterns.extend(p.strip().lower() for p in raw.split(",") if p.strip())
     return patterns

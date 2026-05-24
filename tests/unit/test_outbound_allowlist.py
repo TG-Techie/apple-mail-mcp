@@ -11,6 +11,7 @@ import pytest
 
 from apple_mail_mcp.exceptions import MailOutboundDisallowedError
 from apple_mail_mcp.outbound_allowlist import (
+    COMMS_CONFIG_ENV,
     SEND_ELICITATION_ALLOWLIST_ENV,
     USER_EXPLICIT_OUTBOUND_ALLOW_LIST,
     all_recipients_allowed,
@@ -70,6 +71,65 @@ class TestAllowlistPatterns:
     def test_uses_hardcoded_constant(self) -> None:
         """The exposed constant is the source of truth."""
         assert USER_EXPLICIT_OUTBOUND_ALLOW_LIST == ("*@tg-techie.com",)
+
+
+class TestCommsYamlPatterns:
+    """Tests for APPLE_MAIL_MCP_COMMS_CONFIG YAML integration."""
+
+    def test_yaml_patterns_merged(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: pytest.TempPathFactory
+    ) -> None:
+        """Patterns from comms.yaml are merged into allowlist_patterns()."""
+        cfg = tmp_path / "comms.yaml"
+        cfg.write_text("email_outbound:\n  - extra@example.com\n  - '*@allowed.test'\n")
+        monkeypatch.setenv(COMMS_CONFIG_ENV, str(cfg))
+        monkeypatch.delenv(SEND_ELICITATION_ALLOWLIST_ENV, raising=False)
+        patterns = allowlist_patterns()
+        assert "*@tg-techie.com" in patterns  # hardcoded still present
+        assert "extra@example.com" in patterns
+        assert "*@allowed.test" in patterns
+
+    def test_missing_file_falls_back_to_hardcoded(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: pytest.TempPathFactory
+    ) -> None:
+        """Missing comms.yaml: no error, hardcoded list still works."""
+        monkeypatch.setenv(COMMS_CONFIG_ENV, str(tmp_path / "nonexistent.yaml"))
+        monkeypatch.delenv(SEND_ELICITATION_ALLOWLIST_ENV, raising=False)
+        patterns = allowlist_patterns()
+        assert "*@tg-techie.com" in patterns
+
+    def test_invalid_yaml_falls_back_to_hardcoded(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: pytest.TempPathFactory
+    ) -> None:
+        """Unparseable YAML: log warning, hardcoded list still works."""
+        cfg = tmp_path / "comms.yaml"
+        cfg.write_text("{{not: valid: yaml:::\n")
+        monkeypatch.setenv(COMMS_CONFIG_ENV, str(cfg))
+        monkeypatch.delenv(SEND_ELICITATION_ALLOWLIST_ENV, raising=False)
+        patterns = allowlist_patterns()
+        assert "*@tg-techie.com" in patterns
+
+    def test_wrong_type_falls_back_to_hardcoded(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: pytest.TempPathFactory
+    ) -> None:
+        """email_outbound not a list: log warning, hardcoded list still works."""
+        cfg = tmp_path / "comms.yaml"
+        cfg.write_text("email_outbound: not-a-list\n")
+        monkeypatch.setenv(COMMS_CONFIG_ENV, str(cfg))
+        monkeypatch.delenv(SEND_ELICITATION_ALLOWLIST_ENV, raising=False)
+        patterns = allowlist_patterns()
+        assert "*@tg-techie.com" in patterns
+
+    def test_env_var_overrides_default_path(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: pytest.TempPathFactory
+    ) -> None:
+        """APPLE_MAIL_MCP_COMMS_CONFIG overrides the default ~/iCloud path."""
+        cfg = tmp_path / "custom_comms.yaml"
+        cfg.write_text("email_outbound:\n  - custom@override.test\n")
+        monkeypatch.setenv(COMMS_CONFIG_ENV, str(cfg))
+        monkeypatch.delenv(SEND_ELICITATION_ALLOWLIST_ENV, raising=False)
+        patterns = allowlist_patterns()
+        assert "custom@override.test" in patterns
 
 
 class TestAllRecipientsAllowed:

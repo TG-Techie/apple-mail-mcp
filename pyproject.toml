@@ -28,6 +28,7 @@ classifiers = [
 dependencies = [
     "fastmcp>=3.2.4",
     "imapclient>=3.0.0",
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
@@ -129,4 +130,8 @@ strict_equality = true
 
 [[tool.mypy.overrides]]
 module = ["imapclient", "imapclient.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["yaml"]
 ignore_missing_imports = true
