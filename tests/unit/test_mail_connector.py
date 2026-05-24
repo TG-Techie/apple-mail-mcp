@@ -5040,9 +5040,13 @@ class TestCreateDraft:
     def test_new_send_uses_mailto_path(
         self, mock_run: MagicMock, connector: AppleMailConnector
     ) -> None:
-        """seed="new" + send_now=True uses the mailto: URL path to bypass
+        """seed="new" + send_now=True uses the 4-step mailto: path to bypass
         Mail.app's AppleScript compose path that wraps the body in
-        <blockquote type="cite"> (Apple Dev Forum 738842 / FB11734014)."""
+        <blockquote type="cite"> (Apple Dev Forum 738842 / FB11734014).
+
+        Steps: open location → close saving yes → open draft → System Events
+        click Send toolbar button.
+        """
         mock_run.return_value = "SENT"
         connector.create_draft(
             seed="new",
@@ -5052,14 +5056,21 @@ class TestCreateDraft:
             send_now=True,
         )
         script = mock_run.call_args[0][0]
-        # Uses open location with a mailto: URL, not make new outgoing message.
+        # Step 1: open compose window via mailto: URL handler.
         assert "open location" in script
         assert "mailto:" in script
-        assert "send theMessage" in script
+        # Step 2: close and save as draft.
+        assert "close targetWin saving yes" in script
+        # Step 3: find draft across all accounts and reopen.
+        assert 'mailbox "Drafts" of acct' in script
+        assert "open targetMsg" in script
+        # Step 4: System Events click Send button.
+        assert 'description is "Send"' in script
+        assert "click sendBtn" in script
+        # Never uses the blockquote-injecting AppleScript compose path.
         assert "make new outgoing message" not in script
-        # Count-based outgoing message discovery.
-        assert "count of outgoing messages" in script
-        # No draft snapshot — not saving a draft.
+        assert "set content of" not in script
+        # No draft snapshot — not saving a draft via the old path.
         assert "set beforeIds to" not in script
 
     @patch.object(AppleMailConnector, "_run_applescript")
@@ -5079,6 +5090,40 @@ class TestCreateDraft:
         # Subject and body must be percent-encoded in the URL.
         assert "hello%20world" in script
         assert "line1%0Aline2" in script
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_new_send_no_compose_window_raises(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        """NO_COMPOSE_WINDOW sentinel raises MailAppleScriptError."""
+        from apple_mail_mcp.exceptions import MailAppleScriptError
+
+        mock_run.return_value = "NO_COMPOSE_WINDOW"
+        with pytest.raises(MailAppleScriptError, match="mailto-send"):
+            connector.create_draft(
+                seed="new",
+                to=["a@example.com"],
+                subject="hi",
+                body="x",
+                send_now=True,
+            )
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_new_send_draft_not_found_raises(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        """DRAFT_NOT_FOUND sentinel raises MailAppleScriptError."""
+        from apple_mail_mcp.exceptions import MailAppleScriptError
+
+        mock_run.return_value = "DRAFT_NOT_FOUND"
+        with pytest.raises(MailAppleScriptError, match="mailto-send"):
+            connector.create_draft(
+                seed="new",
+                to=["a@example.com"],
+                subject="hi",
+                body="x",
+                send_now=True,
+            )
 
     def test_new_send_with_attachments_raises(
         self, connector: AppleMailConnector

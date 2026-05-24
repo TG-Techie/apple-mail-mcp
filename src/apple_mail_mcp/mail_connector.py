@@ -3594,30 +3594,41 @@ class AppleMailConnector:
         bcc: list[str] | None,
         subject: str,
         body: str,
-        from_account: str | None,
+        from_account: str | None,  # noqa: ARG002 — see TODO below
         attachment_paths: list[Path] | None,
     ) -> dict[str, str]:
-        """Send a brand-new message via Mail.app's ``mailto:`` URL handler.
+        """Send a brand-new message via Mail.app's mailto: URL handler.
 
         Mail.app's AppleScript compose path (``make new outgoing message`` +
-        ``set content``) wraps the body in ``<blockquote type="cite">`` with
-        invisible CSS. macOS Mail hides the bar; iOS Mail ignores the CSS and
-        renders a purple quoted-reply bar. Apple Developer Forum thread 738842
-        / FB11734014.
+        ``set content``) always wraps the body in an
+        ``Apple-Mail-URLShareWrapperClass`` div / ``<blockquote type="cite">``
+        with invisible CSS.  macOS Mail hides the bar; iOS Mail ignores the
+        CSS and renders a purple quoted-reply bar.  Apple Developer Forum
+        thread 738842 / FB11734014.
 
-        Fix: open a compose window via ``open location "mailto:..."`` inside
-        a ``tell application "Mail"`` block. Mail.app's mailto URL handler
-        uses an internal code path distinct from the AppleScript ``content``
-        property setter, so it does NOT inject the URLShare blockquote wrapper.
-        We detect the new outgoing message with a count-before/after pattern
-        and call ``send`` on it.
+        Fix — four steps, no ``content`` property setter involved:
 
-        Attachments are not supported via this path (mailto: URLs carry no
-        binary payload). Callers that need attachments must use the regular
-        AppleScript compose path.
+        1. ``open location "mailto:..."`` inside a Mail tell block opens a
+           clean compose window (Mail's URL handler path, not the AppleScript
+           compose path).
+        2. ``close window saving yes`` saves the draft to Mail's Drafts folder
+           with clean MIME — no URLShare blockquote injected.
+        3. ``open message`` (re-opens the saved draft as a compose window).
+        4. System Events clicks the "Send" toolbar button to dispatch the
+           message.  Mail sends the stored MIME as-is.
+
+        Verified 2026-05-23: forwarded copy arrived with clean plain-text body
+        (no ``>`` quoting) and rendered without the purple bar on iOS Mail.
+
+        Limitations
+        -----------
+        * Attachments not supported — mailto: carries no binary payload.
+        * ``from_account`` is currently ignored; Mail uses its default sender.
+          TODO: add System Events From-popup manipulation for multi-account
+          support.
 
         Called only from ``create_draft`` when ``seed="new"`` and
-        ``send_now=True``. The outbound allowlist gate has already run.
+        ``send_now=True``.  The outbound allowlist gate has already run.
         """
         if attachment_paths:
             raise NotImplementedError(
@@ -3626,16 +3637,9 @@ class AppleMailConnector:
                 "with attachments."
             )
 
-        # Resolve sender before running the send script so that
-        # _resolve_account_to_sender (which calls _run_applescript) runs
-        # outside the critical-path send script.
-        from_addr: str | None = None
-        if from_account is not None:
-            from_addr = self._resolve_account_to_sender(from_account)
-
-        # Build mailto: URL.  Percent-encode subject and body so arbitrary
-        # text (newlines, unicode, special characters) is transmitted cleanly.
-        # safe='@,' for the recipient list allows literal @ and , through.
+        # Build mailto: URL.  Percent-encode every field so arbitrary text
+        # (newlines, unicode, special characters) survives URL transport.
+        # safe='@,' for the recipient list keeps literal @ and , unencoded.
         to_str = ",".join(to)
         params: list[tuple[str, str]] = []
         if subject:
@@ -3656,31 +3660,83 @@ class AppleMailConnector:
 
         mailto_url_safe = escape_applescript_string(mailto_url)
 
-        # Build set-sender fragment if needed.
-        sender_block = ""
-        if from_addr is not None:
-            from_addr_safe = escape_applescript_string(from_addr)
-            sender_block = f'\n                    set sender of theMessage to "{from_addr_safe}"'
+        # When subject is empty Mail names the compose window "New Message".
+        win_subject = subject if subject else "New Message"
+        win_subject_safe = escape_applescript_string(win_subject)
 
         script = f"""
+        -- Step 1: open compose window via mailto: URL handler (no content setter).
         tell application "Mail"
-            set cntBefore to count of outgoing messages
             open location "{mailto_url_safe}"
-            delay 1
-            if (count of outgoing messages) > cntBefore then
-                set theMessage to last outgoing message{sender_block}
-                send theMessage
-                return "SENT"
-            else
-                return "NO_NEW_OUTGOING"
+            delay 2
+            set targetWin to missing value
+            repeat with w in windows
+                if name of w is "{win_subject_safe}" then
+                    set targetWin to w
+                    exit repeat
+                end if
+            end repeat
+            if targetWin is missing value then
+                return "NO_COMPOSE_WINDOW"
             end if
+            -- Step 2: close and save as draft (MIME stays clean).
+            close targetWin saving yes
+            delay 1
         end tell
+
+        -- Step 3: find the saved draft (search all accounts) and open it.
+        tell application "Mail"
+            set targetMsg to missing value
+            repeat with acct in accounts
+                try
+                    set dm to mailbox "Drafts" of acct
+                    repeat with m in messages of dm
+                        if subject of m is "{win_subject_safe}" then
+                            set targetMsg to m
+                            exit repeat
+                        end if
+                    end repeat
+                end try
+                if targetMsg is not missing value then exit repeat
+            end repeat
+            if targetMsg is missing value then
+                return "DRAFT_NOT_FOUND"
+            end if
+            open targetMsg
+            activate
+            delay 1
+            repeat with w in windows
+                if name of w is "{win_subject_safe}" then
+                    set index of w to 1
+                    exit repeat
+                end if
+            end repeat
+        end tell
+
+        delay 0.3
+
+        -- Step 4: click Send toolbar button via System Events.
+        tell application "System Events"
+            tell application process "Mail"
+                set w to window 1
+                -- Dismiss any blocking "Save as draft?" sheet first.
+                try
+                    click button "Cancel" of (first sheet of w)
+                    delay 0.3
+                end try
+                set tb to first toolbar of w
+                set sendBtn to first button of tb whose description is "Send"
+                click sendBtn
+            end tell
+        end tell
+
+        return "SENT"
         """
         result = self._run_applescript(script).strip()
         if result == "SENT":
             return {"draft_id": "", "sent_message_id": ""}
         raise MailAppleScriptError(
-            f"mailto-send: {result!r} — mailto: URL did not open a compose window"
+            f"mailto-send: {result!r}"
         )
 
     def create_draft(
