@@ -3070,7 +3070,7 @@ async def draft_send(
 
 
 @mcp.tool()
-async def draft_send_html(
+async def email_send_html(
     to: list[str],
     subject: str,
     body: str,
@@ -3107,7 +3107,7 @@ async def draft_send_html(
     bad = disallowed_recipients(all_recipients)
     if bad:
         logger.warning(
-            "draft_send_html blocked — off-list recipients: %s", bad
+            "email_send_html blocked — off-list recipients: %s", bad
         )
         return {
             "success": False,
@@ -3121,7 +3121,7 @@ async def draft_send_html(
     if not all_recipients:
         return {
             "success": False,
-            "error": "draft_send_html: no recipients specified",
+            "error": "email_send_html: no recipients specified",
             "error_type": "validation_error",
         }
 
@@ -3130,7 +3130,7 @@ async def draft_send_html(
     try:
         assert_recipients_allowed_for_send(to, cc_list or None, bcc_list or None)
     except Exception as e:
-        handled = _draft_action_error("draft_send_html", e)
+        handled = _draft_action_error("email_send_html", e)
         if handled is not None:
             return handled
         return {"success": False, "error": str(e), "error_type": "unknown"}
@@ -3139,7 +3139,7 @@ async def draft_send_html(
         "new", to, cc_list or None, bcc_list or None, subject, body
     )
     gate_err = await _run_send_now_gates(
-        operation="draft_send_html",
+        operation="email_send_html",
         ctx=ctx,
         recipients=all_recipients,
         rate_params={"subject": subject, "to": to},
@@ -3159,7 +3159,7 @@ async def draft_send_html(
             from_account=from_account,
         )
         operation_logger.log_operation(
-            "draft_send_html",
+            "email_send_html",
             {"to": to, "subject": subject},
             "success",
         )
@@ -3169,10 +3169,10 @@ async def draft_send_html(
             "sent_message_id": result.get("sent_message_id", ""),
         }
     except Exception as e:
-        handled = _draft_action_error("draft_send_html", e)
+        handled = _draft_action_error("email_send_html", e)
         if handled is not None:
             return handled
-        logger.exception(f"Unexpected error in draft_send_html: {e}")
+        logger.exception(f"Unexpected error in email_send_html: {e}")
         return {"success": False, "error": str(e), "error_type": "unknown"}
 
 

@@ -252,21 +252,21 @@ class TestDraftSend:
 
 
 class TestDraftSendHtml:
-    """Tests for the draft_send_html MCP tool."""
+    """Tests for the email_send_html MCP tool."""
 
     @pytest.mark.asyncio
-    async def test_draft_send_html_calls_connector(
+    async def test_email_send_html_calls_connector(
         self,
         isolated_drafts: None,
         mock_mail: MagicMock,
     ) -> None:
         """Happy path: allowlisted recipient → _send_html_email is called."""
-        from apple_mail_mcp.server import draft_send_html
+        from apple_mail_mcp.server import email_send_html
 
         mock_mail._send_html_email.return_value = {
             "draft_id": "", "sent_message_id": ""
         }
-        result = await draft_send_html(
+        result = await email_send_html(
             to=["jonah@tg-techie.com"],
             subject="Test HTML",
             body="<p>Hello</p>",
@@ -281,7 +281,7 @@ class TestDraftSendHtml:
         assert call_kwargs["body"] == "<p>Hello</p>"
 
     @pytest.mark.asyncio
-    async def test_draft_send_html_blocks_off_allowlist(
+    async def test_email_send_html_blocks_off_allowlist(
         self,
         isolated_drafts: None,
         mock_mail: MagicMock,
@@ -291,9 +291,9 @@ class TestDraftSendHtml:
         monkeypatch.delenv(
             "APPLE_MAIL_MCP_SEND_ELICITATION_ALLOWLIST", raising=False
         )
-        from apple_mail_mcp.server import draft_send_html
+        from apple_mail_mcp.server import email_send_html
 
-        result = await draft_send_html(
+        result = await email_send_html(
             to=["random@other.com"],
             subject="Blocked",
             body="<p>x</p>",

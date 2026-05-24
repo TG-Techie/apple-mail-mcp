@@ -142,7 +142,7 @@ OPERATION_TIERS: dict[str, str] = {
     "create_draft": "sends",
     "update_draft": "sends",
     "delete_draft": "expensive_ops",
-    "draft_send_html": "sends",
+    "email_send_html": "sends",
     # Email templates (#30) — local file I/O only, never touches Mail.app.
     "list_templates": "cheap_reads",
     "get_template": "cheap_reads",
