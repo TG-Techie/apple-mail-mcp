@@ -24,7 +24,8 @@ before executing.
 ║ per-change user authorization quoted in the conversation.            ║
 ║                                                                      ║
 ║ Additional patterns come from the comms config YAML (key:            ║
-║ email_outbound). Path is controlled by APPLE_MAIL_MCP_COMMS_CONFIG   ║
+║ email.allowed_outbound). Path is controlled by                       ║
+║ APPLE_MAIL_MCP_COMMS_CONFIG                                          ║
 ║ (default: ~/iCloud/AgentAccessConfig/comms.yaml). Only Jonah edits   ║
 ║ that file; the agent has read-only access.                           ║
 ║                                                                      ║
@@ -57,7 +58,7 @@ USER_EXPLICIT_OUTBOUND_ALLOW_LIST: tuple[str, ...] = (
     "*@tg-techie.com",
 )
 
-# Env var pointing to the comms config YAML (key: email_outbound).
+# Env var pointing to the comms config YAML (key: email.allowed_outbound).
 # Defaults to ~/iCloud/AgentAccessConfig/comms.yaml.
 # File is read at call time so Jonah's edits take effect on the next send.
 # On missing/unreadable/invalid file: log a warning and skip (hardcoded
@@ -89,10 +90,18 @@ def extract_email(recipient: str) -> str:
 
 
 def _load_comms_yaml_patterns() -> list[str]:
-    """Read ``email_outbound`` patterns from the comms config YAML.
+    """Read ``email.allowed_outbound`` patterns from the comms config YAML.
 
     Path: ``APPLE_MAIL_MCP_COMMS_CONFIG`` env var, defaulting to
     ``~/iCloud/AgentAccessConfig/comms.yaml``.
+
+    Expected schema (owner-authored; the ``email`` section is one of
+    several top-level sections, e.g. ``imessage``)::
+
+        email:
+          allowed_outbound:
+            - '*@tg-techie.com'
+            - 'partner@example.com'
 
     Returns an empty list (never raises) on any I/O or parse error so
     the hardcoded allowlist still functions when the file is absent.
@@ -105,9 +114,13 @@ def _load_comms_yaml_patterns() -> list[str]:
         if not isinstance(data, dict):
             _log.warning("comms config %s: expected a YAML mapping, got %r", config_path, type(data))
             return []
-        entries = data.get("email_outbound", [])
+        email_section = data.get("email", {})
+        if not isinstance(email_section, dict):
+            _log.warning("comms config %s: email section must be a mapping", config_path)
+            return []
+        entries = email_section.get("allowed_outbound", [])
         if not isinstance(entries, list):
-            _log.warning("comms config %s: email_outbound must be a list", config_path)
+            _log.warning("comms config %s: email.allowed_outbound must be a list", config_path)
             return []
         return [str(e).strip().lower() for e in entries if e]
     except FileNotFoundError:
@@ -122,7 +135,7 @@ def allowlist_patterns() -> list[str]:
     """Merged allowlist at call time (two sources, additive only):
 
     1. ``USER_EXPLICIT_OUTBOUND_ALLOW_LIST`` — hardcoded, owner-only.
-    2. ``APPLE_MAIL_MCP_COMMS_CONFIG`` YAML → ``email_outbound`` list.
+    2. ``APPLE_MAIL_MCP_COMMS_CONFIG`` YAML → ``email.allowed_outbound`` list.
 
     Source 2 ADDs patterns; it cannot remove hardcoded entries.
     Resolved at call time so file edits take effect on the next send.

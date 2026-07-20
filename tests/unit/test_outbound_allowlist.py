@@ -67,7 +67,12 @@ class TestCommsYamlPatterns:
     ) -> None:
         """Patterns from comms.yaml are merged into allowlist_patterns()."""
         cfg = tmp_path / "comms.yaml"
-        cfg.write_text("email_outbound:\n  - extra@custom.com\n  - '*@allowed.test'\n")
+        cfg.write_text(
+            "email:\n"
+            "  allowed_outbound:\n"
+            "    - extra@custom.com\n"
+            "    - '*@allowed.test'\n"
+        )
         monkeypatch.setenv(COMMS_CONFIG_ENV, str(cfg))
         patterns = allowlist_patterns()
         assert "*@tg-techie.com" in patterns  # hardcoded still present
@@ -95,19 +100,50 @@ class TestCommsYamlPatterns:
     def test_wrong_type_falls_back_to_hardcoded(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """email_outbound not a list: log warning, hardcoded list still works."""
+        """email.allowed_outbound not a list: log warning, hardcoded list still works."""
         cfg = tmp_path / "comms.yaml"
-        cfg.write_text("email_outbound: not-a-list\n")
+        cfg.write_text("email:\n  allowed_outbound: not-a-list\n")
         monkeypatch.setenv(COMMS_CONFIG_ENV, str(cfg))
         patterns = allowlist_patterns()
         assert "*@tg-techie.com" in patterns
+
+    def test_email_section_wrong_type_falls_back_to_hardcoded(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """email section not a mapping: log warning, hardcoded list still works."""
+        cfg = tmp_path / "comms.yaml"
+        cfg.write_text("email: just-a-string\n")
+        monkeypatch.setenv(COMMS_CONFIG_ENV, str(cfg))
+        patterns = allowlist_patterns()
+        assert "*@tg-techie.com" in patterns
+
+    def test_ignores_other_sections(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Sibling sections (e.g. imessage) don't leak into the email allowlist."""
+        cfg = tmp_path / "comms.yaml"
+        cfg.write_text(
+            "email:\n"
+            "  allowed_outbound:\n"
+            "    - 'ok@custom.test'\n"
+            "  known_incoming:\n"
+            "    - 'someone@incoming.test'\n"
+            "imessage:\n"
+            "  allowed_outbound:\n"
+            "    - 'handle-not-an-email'\n"
+        )
+        monkeypatch.setenv(COMMS_CONFIG_ENV, str(cfg))
+        patterns = allowlist_patterns()
+        assert "ok@custom.test" in patterns
+        assert "someone@incoming.test" not in patterns
+        assert "handle-not-an-email" not in patterns
 
     def test_env_var_overrides_default_path(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """APPLE_MAIL_MCP_COMMS_CONFIG overrides the default ~/iCloud path."""
         cfg = tmp_path / "custom_comms.yaml"
-        cfg.write_text("email_outbound:\n  - custom@override.test\n")
+        cfg.write_text("email:\n  allowed_outbound:\n    - custom@override.test\n")
         monkeypatch.setenv(COMMS_CONFIG_ENV, str(cfg))
         patterns = allowlist_patterns()
         assert "custom@override.test" in patterns
