@@ -8,10 +8,11 @@ An MCP server that provides programmatic access to Apple Mail, enabling AI assis
 
 > ⚠️ **Pre-1.0 — expect breaking changes.** The MCP tool surface (tool names, parameters, return shapes) is still evolving as the project matures. Pin to a specific version (for example, `apple-mail-mcp==0.8.1`) and review the [CHANGELOG](CHANGELOG.md) before upgrading.
 
-## Tools (23)
+## Tools (25)
 
 **Core:** list_mailboxes, search_messages, get_messages, update_message
-**Drafts lifecycle:** create_draft, update_draft, delete_draft
+**Drafts lifecycle (v2 — verb-split):** draft_create, draft_update, draft_delete, draft_send
+**Sending:** email_send_html
 **Mailbox CRUD:** create_mailbox, update_mailbox, delete_mailbox
 **Attachments & Management:** save_attachments, delete_messages
 **Discovery & Rules:** list_accounts, list_rules, get_thread, create_rule, update_rule, delete_rule
