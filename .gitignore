@@ -62,3 +62,4 @@ dmypy.json
 docs/_build/
 site/
 scratch/
+agent-scratch/

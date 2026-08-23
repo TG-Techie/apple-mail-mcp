@@ -991,6 +991,62 @@ longer treats trashed drafts as editable.
 
 ---
 
+### email_send_html
+
+Send an HTML email directly — no draft is saved first. The body is
+composed via clipboard injection into Mail.app's rich-text compose window
+and sent immediately, with **mechanical dispatch verification**: a success
+result means the compose window closed AND a copy exists in the Sent
+mailbox (see `docs/reference/UI_GROUNDING_MAIL_SEND.md`).
+
+Two modes:
+
+- **Fresh mail** (default): `to` and `subject` required.
+- **Reply into a thread**: pass `reply_to=<message id>` (Mail internal or
+  RFC 5322 id — use the thread's LATEST message, e.g. from `get_thread`).
+  Mail carries the threading headers (`In-Reply-To`/`References`);
+  `subject` defaults to the derived `Re: …`; recipients default to Mail's
+  derived reply set. The HTML is pasted ABOVE the auto-quoted original.
+
+**Reply-all:** there is no `reply_all` flag. Fetch the thread participants
+(`get_thread`/`get_messages`) and pass them explicitly via `to`/`cc`.
+Every recipient — derived or explicit — is validated against the outbound
+allowlist with no exceptions; one off-list participant blocks the entire
+send (the compose window is discarded; nothing partial is sent).
+
+**Parameters:**
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `to` | array | Fresh mode | `[]` | Recipients. In reply mode, explicit values REPLACE Mail's derived set. |
+| `subject` | string | Fresh mode | `""` | Subject. Reply mode derives `Re: …` when omitted. |
+| `body` | string | Yes | - | HTML string for the email body. |
+| `cc` | array | No | `[]` | CC recipients (replace derived CC when replying). |
+| `bcc` | array | No | `[]` | BCC recipients. |
+| `from_account` | string | No | null | Mail.app account name or UUID. Null uses Mail's default sender. |
+| `reply_to` | string | No | null | Message id to reply to; enables reply mode. |
+
+**Returns:**
+
+```json
+{"success": true, "draft_id": "", "sent_message_id": ""}
+```
+
+**Error Codes:**
+
+- `outbound_disallowed`: one or more recipients off the allowlist —
+  nothing was sent; in reply mode the compose window was discarded.
+- `validation_error`: missing `to`/`subject` in fresh mode.
+- `applescript_error`: a mechanical read-back failed
+  (`SEND_DISABLED`, `SHEET:…`, `POSTCONDITION_TIMEOUT:…`,
+  `NO_COMPOSE_WINDOW:…`, `NO_BODY_AREA`) — the error carries the actual
+  UI state; the message was NOT sent.
+
+**Limitations:** no attachments (use the draft lifecycle); en-US Mail UI
+labels; sends require Mail.app UI automation permission.
+
+---
+
 ## Tool Combinations
 
 ### Example Workflows
