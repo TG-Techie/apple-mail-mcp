@@ -6,21 +6,40 @@ set -euo pipefail
 THRESHOLD=20
 SRC_DIR="src/apple_mail_mcp"
 
-if ! command -v radon &> /dev/null; then
-    if command -v uv &> /dev/null; then
-        echo "Installing radon..."
-        uv pip install radon -q
+# Resolve how to invoke radon. It is a dev dependency of the uv project,
+# so it usually lives in the venv and is NOT on PATH — calling bare
+# `radon` then dies with "command not found". Historically that error was
+# swallowed by a `|| true` below and surfaced as a JSON parse traceback,
+# so the whole gate silently reported nothing while real CC violations
+# accumulated. Resolve it explicitly and fail loudly if we cannot.
+if command -v radon &> /dev/null; then
+    RADON=(radon)
+elif command -v uv &> /dev/null && uv run radon --version &> /dev/null; then
+    RADON=(uv run radon)
+elif command -v uv &> /dev/null; then
+    echo "Installing radon..."
+    uv pip install radon -q
+    if uv run radon --version &> /dev/null; then
+        RADON=(uv run radon)
     else
-        echo "Error: radon not found. Install with: pip install radon"
+        echo "Error: radon still not runnable after 'uv pip install radon'." >&2
         exit 1
     fi
+else
+    echo "Error: radon not found and uv unavailable. Install with: pip install radon" >&2
+    exit 1
 fi
 
 echo "Checking cyclomatic complexity (threshold: CC <= $THRESHOLD)..."
 echo ""
 
-# Get complexity report
-REPORT=$(radon cc "$SRC_DIR" -n C -s 2>&1) || true
+# Get complexity report. Do NOT swallow a radon failure here: an empty
+# report must mean "nothing at rank C or worse", never "radon blew up".
+if ! REPORT=$("${RADON[@]}" cc "$SRC_DIR" -n C -s 2>&1); then
+    echo "Error: radon failed while generating the complexity report:" >&2
+    echo "$REPORT" >&2
+    exit 1
+fi
 
 if [ -z "$REPORT" ]; then
     echo "All functions have complexity <= B (acceptable)."
@@ -36,7 +55,13 @@ echo ""
 # every function in the dangerous range. Until #174, this was -n F (CC
 # ≥ 41), meaning anything from CC 21 to 40 silently passed the
 # `> THRESHOLD` check below.
-FAILURES=$(radon cc "$SRC_DIR" -n D -j 2>&1 | python3 -c "
+if ! RADON_JSON=$("${RADON[@]}" cc "$SRC_DIR" -n D -j 2>&1); then
+    echo "Error: radon failed while generating the JSON report:" >&2
+    echo "$RADON_JSON" >&2
+    exit 1
+fi
+
+FAILURES=$(printf '%s' "$RADON_JSON" | python3 -c "
 import json, sys
 
 THRESHOLD = $THRESHOLD
@@ -51,7 +76,13 @@ THRESHOLD = $THRESHOLD
 # justifying the structural reason in the PR.
 ALLOWLIST: dict[tuple[str, str], int] = {}
 
-data = json.load(sys.stdin)
+raw = sys.stdin.read()
+try:
+    data = json.loads(raw)
+except json.JSONDecodeError:
+    print('Error: could not parse radon JSON output. Raw output was:')
+    print(raw[:2000])
+    sys.exit(1)
 new_violations = []
 regressions = []
 for filepath, functions in data.items():

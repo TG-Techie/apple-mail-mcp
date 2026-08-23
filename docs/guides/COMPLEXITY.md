@@ -49,7 +49,17 @@ The functions below sit above CC 10 intentionally. When touching them, prefer ad
 | [`mail_connector.py`](../../src/apple_mail_mcp/mail_connector.py) | `_collect_thread_applescript` | 11 | AppleScript-side BFS fallback when IMAP thread tiers don't apply. |
 | [`imap_connector.py`](../../src/apple_mail_mcp/imap_connector.py) | `ImapConnector.get_message` | 11 | `headers_only` vs full-body fetch, search-by-bracketed-msgid path, error mapping. |
 
-Accepted because: each is a sequence of orthogonal gates or optional-parameter branches, not tangled logic. They read top-to-bottom and each branch has a clear exit. The complexity allowlist is currently empty — no function exceeds CC 20.
+Accepted because: each is a sequence of orthogonal gates or optional-parameter branches, not tangled logic. They read top-to-bottom and each branch has a clear exit.
+
+> **Gate outage (found 2026-08-23).** The sentence that used to sit here —
+> "the complexity allowlist is currently empty, no function exceeds CC 20" —
+> was false. `scripts/check_complexity.sh` invoked bare `radon`, which is a
+> uv dev dependency and not on `PATH`; the resulting "command not found"
+> was swallowed by a `|| true` and resurfaced as a JSON parse traceback, so
+> the gate never actually evaluated anything. The script now resolves radon
+> via `uv run` and fails loudly if it cannot. The allowlist is still empty
+> **by choice** — the violations the outage hid are tracked as real work,
+> not waved through with allowlist entries.
 
 ## Adding a new documented exception
 
