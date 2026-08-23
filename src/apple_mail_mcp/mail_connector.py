@@ -2,7 +2,9 @@
 AppleScript-based connector for Apple Mail.
 """
 
+import fcntl
 import logging
+import os
 import re
 import subprocess
 import tempfile
@@ -17,7 +19,7 @@ from email.mime.text import MIMEText as _MIMEText
 from datetime import date as _date
 from datetime import timedelta as _timedelta
 from pathlib import Path
-from typing import Any, cast
+from typing import IO, Any, cast
 
 from imapclient.exceptions import IMAPClientError, LoginError
 
@@ -34,6 +36,7 @@ from .exceptions import (
     MailMailboxNotEmptyError,
     MailMailboxNotFoundError,
     MailMessageNotFoundError,
+    MailOutboundDisallowedError,
     MailRuleNotFoundError,
     MailUnsupportedGmailSystemLabelError,
     MailUnsupportedRuleActionError,
@@ -248,6 +251,7 @@ class AppleMailConnector:
         timeout: int = 60,
         *,
         imap_pool: ImapConnectionPool | None = None,
+        lock_timeout: float = 30.0,
     ) -> None:
         """
         Initialize the Mail connector.
@@ -260,8 +264,14 @@ class AppleMailConnector:
                 across calls, amortizing the ~400 ms TCP+TLS+LOGIN
                 overhead per call. Default None (per-call lifecycle —
                 the v0.5.0 behavior). See issue #75.
+            lock_timeout: Seconds to wait for the cross-process Mail
+                automation lock before failing with a clear busy error.
+                Multiple agent sessions run their own server instance;
+                unserialized concurrent AppleScript collides into
+                AppleEvent timeouts (-1712) / invalid connections (-609).
         """
         self.timeout = timeout
+        self.lock_timeout = lock_timeout
         self._imap_pool = imap_pool
         # Accounts for which we've already logged a WARNING about IMAP failure.
         # Subsequent failures for the same account are demoted to DEBUG per
@@ -378,6 +388,7 @@ class AppleMailConnector:
             MailMailboxNotFoundError: If mailbox not found
             MailMessageNotFoundError: If message not found
         """
+        lock_fh = self._acquire_mail_lock()
         try:
             logger.debug(f"Executing AppleScript: {script[:200]}...")
 
@@ -420,6 +431,48 @@ class AppleMailConnector:
                             MailMessageNotFoundError, MailAppleScriptError)):
                 raise
             raise MailAppleScriptError(f"Unexpected error: {str(e)}") from e
+        finally:
+            try:
+                fcntl.flock(lock_fh, fcntl.LOCK_UN)
+            finally:
+                lock_fh.close()
+
+    def _acquire_mail_lock(self) -> IO[str]:
+        """Acquire the cross-process Mail automation lock (2026-07-23).
+
+        Every agent session spawns its own MCP server process; without
+        serialization, concurrent AppleScript against Mail.app collides
+        into AppleEvent timeouts (-1712) and invalid connections (-609)
+        that surface as inscrutable failures for the OTHER agent. A
+        file lock under ``APPLE_MAIL_MCP_HOME`` (default
+        ``~/.apple_mail_mcp``) queues callers instead; a caller that
+        cannot acquire it within ``lock_timeout`` gets a clear "busy"
+        error naming the condition — before any osascript runs.
+        """
+        home_override = os.environ.get("APPLE_MAIL_MCP_HOME")
+        lock_dir = (
+            Path(home_override).expanduser()
+            if home_override
+            else Path.home() / ".apple_mail_mcp"
+        )
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        fh = open(lock_dir / "mail_automation.lock", "w")  # noqa: SIM115 — held past scope, released in _run_applescript's finally
+        deadline = time.monotonic() + self.lock_timeout
+        while True:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fh
+            except OSError:
+                if time.monotonic() >= deadline:
+                    fh.close()
+                    raise MailAppleScriptError(
+                        f"Mail automation busy: another process held the "
+                        f"Mail lock for over {self.lock_timeout:.0f}s "
+                        f"({lock_dir / 'mail_automation.lock'}). Retry "
+                        f"shortly; concurrent Mail automation is "
+                        f"serialized to prevent AppleEvent collisions."
+                    ) from None
+                time.sleep(0.25)
 
     def list_accounts(self) -> list[dict[str, Any]]:
         """List all mail accounts.
@@ -1156,23 +1209,35 @@ class AppleMailConnector:
                 f"sub-second IMAP body search."
             )
 
+        _search_args = (
+            account, mailbox, sender_contains, subject_contains,
+            read_status, is_flagged, date_from, date_to,
+            has_attachment, limit, include_attachments, body_contains,
+            text_contains,
+        )
         start = time.perf_counter()
         try:
-            return self._search_messages_applescript(
-                account,
-                mailbox,
-                sender_contains,
-                subject_contains,
-                read_status,
-                is_flagged,
-                date_from,
-                date_to,
-                has_attachment,
-                limit,
-                include_attachments,
-                body_contains,
-                text_contains,
-            )
+            try:
+                return self._search_messages_applescript(
+                    *_search_args, on_warning=on_warning
+                )
+            except MailAppleScriptError as exc:
+                # Mail.app busy / handler temporarily unavailable; retry once.
+                # With the new per-message try/on-error guards inside the
+                # AppleScript, -10000 should now only escape on whole-
+                # script failures (e.g. Mail.app crashed mid-call); the
+                # retry is a residual safety net.
+                if "(-10000)" in str(exc):
+                    logger.warning(
+                        "AppleScript search got -10000 on account=%r; "
+                        "retrying once after 1s delay.",
+                        account,
+                    )
+                    time.sleep(1.0)
+                    return self._search_messages_applescript(
+                        *_search_args, on_warning=on_warning
+                    )
+                raise
         finally:
             elapsed = time.perf_counter() - start
             if elapsed > _SLOW_SEARCH_THRESHOLD_SEC:
@@ -1199,6 +1264,7 @@ class AppleMailConnector:
         include_attachments: bool = False,
         body_contains: str | None = None,
         text_contains: str | None = None,
+        on_warning: Callable[[str], None] | None = None,
     ) -> list[dict[str, Any]]:
         """AppleScript path for search_messages (the universal baseline).
 
@@ -1347,13 +1413,40 @@ class AppleMailConnector:
         # except for ordering (was oldest-first).
         effective_limit = str(limit) if limit else "999999999"
 
+        # Per-message filter checks AND attachment iteration are now
+        # wrapped in inner try/on-error blocks. Before this patch, a
+        # single inline-image -10000 message anywhere in the
+        # `messages of mailboxRef` set aborted the whole tell block
+        # and propagated as a loud MailAppleScriptError (-10000) —
+        # the failure mode the iCloud reproducer hit. Now, a per-msg
+        # failure is recorded into ``warnList`` and the loop continues:
+        #
+        #   - Filter-check failure → message excluded, warning emitted.
+        #     This matches the existing semantics for messages that
+        #     fail the predicate, with no silent drop because the
+        #     warning surfaces in the response.
+        #   - Attachment-iteration failure (only when
+        #     ``include_attachments`` is set) → message INCLUDED with
+        #     ``attachments=[]`` and a warning. Mirrors the contract
+        #     of ``_get_message_applescript`` + the shared
+        #     ``_enumerate_attachments_for_message`` helper.
+        #
+        # The script result becomes a record {messages, warnings}; the
+        # Python side unpacks both and forwards warnings via
+        # ``on_warning`` so the public ``search_messages`` lifts them
+        # into the response ``warnings`` field. NO SILENT ERRORS.
         if include_attachments:
             attachments_clause = '''
                     set attList to {}
-                    repeat with att in mail attachments of msg
-                        set attRecord to {|name|:(name of att), |mime_type|:(MIME type of att), |size|:(file size of att), |downloaded|:(downloaded of att)}
-                        set end of attList to attRecord
-                    end repeat'''
+                    try
+                        repeat with att in mail attachments of msg
+                            set attRecord to {|name|:(name of att), |mime_type|:(MIME type of att), |size|:(file size of att), |downloaded|:(downloaded of att)}
+                            set end of attList to attRecord
+                        end repeat
+                    on error errMsg number errNum
+                        set attList to {}
+                        set end of warnList to ("attachment enumeration failed for message " & (id of msg as text) & ": " & errMsg & " (error " & errNum & ")")
+                    end try'''
             attachments_field = ", |attachments|:attList"
         else:
             attachments_clause = ""
@@ -1367,24 +1460,51 @@ class AppleMailConnector:
             set total to count of msgs
 
             set resultData to {{}}
+            set warnList to {{}}
             set matchCount to 0
             repeat with i from total to 1 by -1
                 if matchCount >= {effective_limit} then exit repeat
                 set msg to item i of msgs
                 set includeThis to true
-                {filter_block}
+                try
+                    {filter_block}
+                on error errMsg number errNum
+                    set includeThis to false
+                    try
+                        set end of warnList to ("filter check failed for message " & (id of msg as text) & ": " & errMsg & " (error " & errNum & ")")
+                    on error
+                        set end of warnList to ("filter check failed for message at index " & i & ": " & errMsg & " (error " & errNum & ")")
+                    end try
+                end try
                 if includeThis then{attachments_clause}
                     set msgRecord to {{|id|:(id of msg as text), |rfc_message_id|:(message id of msg), |subject|:(subject of msg), |sender|:(sender of msg), |date_received|:(date received of msg as text), |read_status|:(read status of msg), |flagged|:(flagged status of msg){attachments_field}}}
                     set end of resultData to msgRecord
                     set matchCount to matchCount + 1
                 end if
             end repeat
+            set resultData to {{|messages|:resultData, |warnings|:warnList}}
         end tell
         '''
 
         script = _wrap_as_json_script(tell_body, timeout=self.timeout)
         result = self._run_applescript(script)
-        return cast(list[dict[str, Any]], parse_applescript_json(result))
+        parsed = parse_applescript_json(result)
+        # Result shape: {messages: [...], warnings: [...]}. Older
+        # in-flight callers that previously expected a bare list are
+        # served by the same wrapper — there are none in-tree, but
+        # the dict form is the new contract.
+        if isinstance(parsed, dict):
+            messages = cast(
+                list[dict[str, Any]], parsed.get("messages") or []
+            )
+            warns = cast(list[str], parsed.get("warnings") or [])
+            if on_warning is not None:
+                for w in warns:
+                    on_warning(w)
+            return messages
+        # Defensive fallback for any pre-existing test fixtures that
+        # might emit the bare-list form.
+        return cast(list[dict[str, Any]], parsed)
 
     def get_message(
         self,
@@ -1432,7 +1552,9 @@ class AppleMailConnector:
         Raises:
             MailMessageNotFoundError: Message not found via either path.
         """
-        if (
+        # Numeric ids are Mail.app internal ids — IMAP only understands RFC
+        # 5322 Message-IDs, so route numeric ids straight to AppleScript.
+        if not message_id.strip().isdigit() and (
             account is not None
             and mailbox is not None
             and not self._imap_breaker_open(account)
@@ -1482,6 +1604,94 @@ class AppleMailConnector:
             include_attachments=include_attachments,
         )
 
+    def _enumerate_attachments_for_message(
+        self, message_id: str
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        """Single owner of Mail.app attachment enumeration + -10000 guard.
+
+        Locates the message by id (numeric Mail.app id or RFC 5322
+        Message-ID), then walks ``mail attachments of msg`` inside a
+        try/on-error block. Inline-image multipart layouts (e.g.
+        Greenhouse "Security code" mails) make that walk raise
+        ``errAEEventNotHandled`` (-10000); the guard catches it and
+        degrades to ``([], [warning_string])`` so a found message is
+        never silently turned into "not found".
+
+        Every site that enumerates Mail.app attachments calls this
+        helper. The previous policy of duplicating the inline try
+        block at each callsite caused the same bug to recur and meant
+        any future enumerator had to remember the guard — moving the
+        guard into one function makes it impossible to forget.
+
+        Args:
+            message_id: Mail.app internal numeric id, or RFC 5322
+                Message-ID (with or without angle brackets).
+
+        Returns:
+            ``(attachments, warnings)`` where ``attachments`` is a
+            list of dicts (``name``, ``mime_type``, ``size``,
+            ``downloaded``) and ``warnings`` is a list of strings
+            describing enumeration failures. ``warnings`` is empty on
+            the success path.
+
+        Raises:
+            MailMessageNotFoundError: id resolves to no message.
+            MailAppleScriptError: any other AppleScript failure.
+        """
+        message_id_safe = escape_applescript_string(sanitize_input(message_id))
+        if message_id.strip().isdigit():
+            id_where = f'whose id is "{message_id_safe}"'
+        else:
+            raw_bracketed = (
+                message_id if message_id.startswith('<') else f'<{message_id}>'
+            )
+            bracketed_safe = escape_applescript_string(
+                sanitize_input(raw_bracketed)
+            )
+            id_where = f'whose message id is "{bracketed_safe}"'
+
+        tell_body = f'''
+        tell application "Mail"
+            set foundMsg to missing value
+            repeat with acc in accounts
+                repeat with mb in mailboxes of acc
+                    try
+                        set foundMsg to first message of mb {id_where}
+                        exit repeat
+                    end try
+                end repeat
+                if foundMsg is not missing value then exit repeat
+            end repeat
+
+            if foundMsg is missing value then
+                error "Can't get message: not found"
+            end if
+
+            set attList to {{}}
+            set attWarnings to {{}}
+            try
+                repeat with att in mail attachments of foundMsg
+                    set attRecord to {{|name|:(name of att), |mime_type|:(MIME type of att), |size|:(file size of att), |downloaded|:(downloaded of att)}}
+                    set end of attList to attRecord
+                end repeat
+            on error errMsg number errNum
+                set attList to {{}}
+                set end of attWarnings to ("attachment enumeration failed for message " & (id of foundMsg as text) & ": " & errMsg & " (error " & errNum & ")")
+            end try
+
+            set resultData to {{|attachments|:attList, |warnings|:attWarnings}}
+        end tell
+        '''
+
+        script = _wrap_as_json_script(tell_body, timeout=self.timeout)
+        result = self._run_applescript(script)
+        parsed = cast(dict[str, Any], parse_applescript_json(result))
+        attachments = cast(
+            list[dict[str, Any]], parsed.get("attachments") or []
+        )
+        warnings = cast(list[str], parsed.get("warnings") or [])
+        return attachments, warnings
+
     def _get_message_applescript(
         self,
         message_id: str,
@@ -1493,8 +1703,23 @@ class AppleMailConnector:
         Slow on accounts with many mailboxes (see issue #72). Callers
         with a known account+mailbox should provide them to take the
         IMAP path instead.
+
+        When ``include_attachments`` is True, attachment enumeration is
+        delegated to :meth:`_enumerate_attachments_for_message` — the
+        single owner of the inline-image -10000 guard. That adds one
+        extra ``osascript`` round-trip per call (~100-300ms); the cost
+        is the price of having one source of truth for the guard.
         """
         message_id_safe = escape_applescript_string(sanitize_input(message_id))
+
+        # Numeric ids use Mail.app's internal `id` (integer).
+        # RFC 5322 ids use the `message id` (string) property with angle brackets.
+        if message_id.strip().isdigit():
+            id_where = f'whose id is "{message_id_safe}"'
+        else:
+            raw_bracketed = message_id if message_id.startswith('<') else f'<{message_id}>'
+            bracketed_safe = escape_applescript_string(sanitize_input(raw_bracketed))
+            id_where = f'whose message id is "{bracketed_safe}"'
 
         content_clause = (
             'set msgContent to content of msg'
@@ -1502,29 +1727,15 @@ class AppleMailConnector:
             else 'set msgContent to ""'
         )
 
-        if include_attachments:
-            attachments_clause = '''
-                        set attList to {}
-                        repeat with att in mail attachments of msg
-                            set attRecord to {|name|:(name of att), |mime_type|:(MIME type of att), |size|:(file size of att), |downloaded|:(downloaded of att)}
-                            set end of attList to attRecord
-                        end repeat
-'''
-            attachments_field = ", |attachments|:attList"
-        else:
-            attachments_clause = ""
-            attachments_field = ""
-
         tell_body = f'''
         tell application "Mail"
             set resultData to missing value
             repeat with acc in accounts
                 repeat with mb in mailboxes of acc
                     try
-                        set msg to first message of mb whose id is "{message_id_safe}"
+                        set msg to first message of mb {id_where}
                         {content_clause}
-{attachments_clause}
-                        set resultData to {{|id|:(id of msg as text), |rfc_message_id|:(message id of msg), |subject|:(subject of msg), |sender|:(sender of msg), |date_received|:(date received of msg as text), |read_status|:(read status of msg), |flagged|:(flagged status of msg), |content|:msgContent{attachments_field}}}
+                        set resultData to {{|id|:(id of msg as text), |rfc_message_id|:(message id of msg), |subject|:(subject of msg), |sender|:(sender of msg), |date_received|:(date received of msg as text), |read_status|:(read status of msg), |flagged|:(flagged status of msg), |content|:msgContent}}
                         exit repeat
                     end try
                 end repeat
@@ -1539,7 +1750,16 @@ class AppleMailConnector:
 
         script = _wrap_as_json_script(tell_body, timeout=self.timeout)
         result = self._run_applescript(script)
-        return cast(dict[str, Any], parse_applescript_json(result))
+        msg = cast(dict[str, Any], parse_applescript_json(result))
+
+        if include_attachments:
+            attachments, warnings = self._enumerate_attachments_for_message(
+                message_id
+            )
+            msg["attachments"] = attachments
+            msg["warnings"] = warnings
+
+        return msg
 
     def auto_template_vars(self, message_id: str | None) -> dict[str, str]:
         """Build the auto-fill variable dict for render_template.
@@ -1669,7 +1889,9 @@ class AppleMailConnector:
         Raises:
             MailMessageNotFoundError: Message not found via either path.
         """
-        if (
+        # Numeric ids are Mail.app internal ids — bypass IMAP (same reasoning
+        # as get_message).
+        if not message_id.strip().isdigit() and (
             account is not None
             and mailbox is not None
             and not self._imap_breaker_open(account)
@@ -1709,44 +1931,24 @@ class AppleMailConnector:
     def _get_attachments_applescript(
         self, message_id: str
     ) -> list[dict[str, Any]]:
-        """AppleScript fallback for get_attachments — iterates account ×
-        mailbox to locate the message, then enumerates attachments via
-        Mail.app's model layer. Slow on accounts with many mailboxes;
-        also subject to known silent-failure cases (see issue #73).
-        Callers with a known account+mailbox should provide them to take
-        the IMAP path instead.
+        """AppleScript fallback for get_attachments — delegates to the
+        shared :meth:`_enumerate_attachments_for_message` helper, which
+        owns the inline-image -10000 guard.
+
+        The public ``get_attachments`` return type is a flat
+        ``list[dict]``. Warnings produced by the helper would otherwise
+        disappear here, so they are logged at ``WARNING`` level — the
+        operation log keeps the audit trail (NO SILENT ERRORS).
+        Callers that need warnings in-band (e.g. ``get_messages``) go
+        through ``_get_message_applescript``, which forwards the
+        helper's warnings into the message dict.
         """
-        message_id_safe = escape_applescript_string(sanitize_input(message_id))
-
-        tell_body = f'''
-        tell application "Mail"
-            set resultData to missing value
-            repeat with acc in accounts
-                repeat with mb in mailboxes of acc
-                    try
-                        set msg to first message of mb whose id is "{message_id_safe}"
-                        set attList to mail attachments of msg
-
-                        set resultData to {{}}
-                        repeat with att in attList
-                            set attRecord to {{|name|:(name of att), |mime_type|:(MIME type of att), |size|:(file size of att), |downloaded|:(downloaded of att)}}
-                            set end of resultData to attRecord
-                        end repeat
-                        exit repeat
-                    end try
-                end repeat
-                if resultData is not missing value then exit repeat
-            end repeat
-
-            if resultData is missing value then
-                error "Can't get message: not found"
-            end if
-        end tell
-        '''
-
-        script = _wrap_as_json_script(tell_body, timeout=self.timeout)
-        result = self._run_applescript(script)
-        return cast(list[dict[str, Any]], parse_applescript_json(result))
+        attachments, warnings = self._enumerate_attachments_for_message(
+            message_id
+        )
+        for w in warnings:
+            logger.warning("get_attachments: %s", w)
+        return attachments
 
     def get_thread(self, message_id: str) -> list[dict[str, Any]]:
         """Return all messages in the thread containing ``message_id``.
@@ -2419,22 +2621,42 @@ class AppleMailConnector:
         message_id: str,
         save_directory: Path,
         attachment_indices: list[int] | None = None,
-    ) -> int:
+    ) -> tuple[int, list[str]]:
         """
         Save attachments from a message to a directory.
 
+        Two-pass implementation. Pass 1 delegates metadata enumeration
+        to :meth:`_enumerate_attachments_for_message` — the single
+        owner of the inline-image -10000 guard. If the helper returns
+        a non-empty warnings list (i.e. enumeration was degraded by
+        Mail.app), the call returns ``(0, warnings)`` immediately;
+        nothing can be saved because we have no references. Pass 2
+        runs a separate AppleScript that re-locates the message and
+        saves the requested attachments by 1-based index, using the
+        helper's count to bound ``attachment_indices``.
+
         Args:
-            message_id: Message ID
-            save_directory: Directory to save attachments to
-            attachment_indices: Indices of attachments to save (None = all)
+            message_id: Mail.app internal numeric id, or RFC 5322
+                Message-ID (with or without angle brackets).
+            save_directory: Directory to save attachments to.
+            attachment_indices: 0-based indices of attachments to
+                save. ``None`` saves all. Out-of-range indices are
+                silently dropped (matches list-slicing semantics).
 
         Returns:
-            Number of attachments saved
+            ``(saved_count, warnings)``.
+
+            ``saved_count`` is the number of files written.
+
+            ``warnings`` is a list of strings describing degradation
+            (empty on the success path). When non-empty,
+            ``saved_count`` will be 0 — the enumeration could not
+            give us references to save.
 
         Raises:
-            FileNotFoundError: If save directory doesn't exist
-            ValueError: If path validation fails
-            MailMessageNotFoundError: If message doesn't exist
+            FileNotFoundError: save_directory doesn't exist.
+            ValueError: save_directory path validation failed.
+            MailMessageNotFoundError: id resolves to no message.
         """
         # Validate save directory
         if not save_directory.exists():
@@ -2452,46 +2674,77 @@ class AppleMailConnector:
         except (RuntimeError, OSError) as e:
             raise ValueError(f"Invalid save directory: {e}") from e
 
+        # Pass 1: helper owns the -10000 guard. Bail with warnings if
+        # enumeration was degraded — nothing to save without references.
+        attachments, warnings = self._enumerate_attachments_for_message(
+            message_id
+        )
+        if warnings:
+            return 0, warnings
+        if not attachments:
+            return 0, []
+
+        # Resolve which indices to save. Filter to the actual range so
+        # the second AppleScript never references items past the end.
+        n = len(attachments)
+        if attachment_indices is None:
+            selected_zero_based = list(range(n))
+        else:
+            selected_zero_based = [
+                i for i in attachment_indices if 0 <= i < n
+            ]
+        if not selected_zero_based:
+            return 0, []
+
+        # Pass 2: save by 1-based index in a fresh AppleScript. The
+        # helper already proved `mail attachments of msg` doesn't
+        # raise here, so this second pass is the safe code path.
         message_id_safe = escape_applescript_string(sanitize_input(message_id))
         dir_safe = escape_applescript_string(str(save_directory))
 
-        # Build index filter if specified
-        if attachment_indices is not None:
-            # Convert to 1-based indexing for AppleScript
-            indices_str = ", ".join(str(i + 1) for i in attachment_indices)
-            index_filter = f"items {{{indices_str}}} of"
+        if message_id.strip().isdigit():
+            id_where = f'whose id is "{message_id_safe}"'
         else:
-            index_filter = ""
+            raw_bracketed = message_id if message_id.startswith('<') else f'<{message_id}>'
+            bracketed_safe = escape_applescript_string(sanitize_input(raw_bracketed))
+            id_where = f'whose message id is "{bracketed_safe}"'
+
+        indices_str = ", ".join(str(i + 1) for i in selected_zero_based)
 
         script = f"""
         tell application "Mail"
-            -- Search all accounts for message
+            set foundMsg to missing value
             repeat with acc in accounts
                 repeat with mb in mailboxes of acc
                     try
-                        set msg to first message of mb whose id is "{message_id_safe}"
-                        set attList to {index_filter} mail attachments of msg
-                        set saveCount to 0
-
-                        repeat with att in attList
-                            try
-                                set attName to name of att
-                                save att in ("{dir_safe}/" & attName)
-                                set saveCount to saveCount + 1
-                            end try
-                        end repeat
-
-                        return saveCount
+                        set foundMsg to first message of mb {id_where}
+                        exit repeat
                     end try
                 end repeat
+                if foundMsg is not missing value then exit repeat
             end repeat
 
-            error "Message not found"
+            if foundMsg is missing value then
+                error "Can't get message: not found"
+            end if
+
+            set attRefs to items {{{indices_str}}} of mail attachments of foundMsg
+            set saveCount to 0
+            repeat with att in attRefs
+                try
+                    set attName to name of att
+                    save att in ("{dir_safe}/" & attName)
+                    set saveCount to saveCount + 1
+                end try
+            end repeat
+
+            return saveCount
         end tell
         """
 
         result = self._run_applescript(script)
-        return int(result) if result.isdigit() else 0
+        saved = int(result) if result.isdigit() else 0
+        return saved, []
 
     def move_messages(
         self,
@@ -3173,35 +3426,27 @@ class AppleMailConnector:
         Raises:
             MailAppleScriptError: If AppleScript execution fails
         """
-        # Single AppleScript pass: enumerate `selection`, build a list of records,
-        # and let _wrap_as_json_script emit the NSJSONSerialization epilogue.
-        # This is one osascript call regardless of how many messages are
-        # selected — N round-trips would cost 100-300ms each.
+        # First pass: one osascript call enumerates `selection` and
+        # builds records WITHOUT attachments — body + headers only.
+        # Attachment enumeration is then delegated per-message to
+        # :meth:`_enumerate_attachments_for_message`, the single owner
+        # of the inline-image -10000 guard. That trades the previous
+        # one-shot AppleScript for one extra round-trip per selected
+        # message; selections are typically 1-3, so the cost stays
+        # bounded, and the guard now lives in one place.
         content_clause = (
             "set msgContent to content of msg"
             if include_content
             else 'set msgContent to ""'
         )
 
-        if include_attachments:
-            attachments_clause = '''
-                set attList to {}
-                repeat with att in mail attachments of msg
-                    set attRecord to {|name|:(name of att), |mime_type|:(MIME type of att), |size|:(file size of att), |downloaded|:(downloaded of att)}
-                    set end of attList to attRecord
-                end repeat'''
-            attachments_field = ", |attachments|:attList"
-        else:
-            attachments_clause = ""
-            attachments_field = ""
-
         tell_body = f"""
         tell application "Mail"
             set resultData to {{}}
             set sel to selection
             repeat with msg in sel
-                {content_clause}{attachments_clause}
-                set msgRecord to {{|id|:(id of msg as text), |subject|:(subject of msg), |sender|:(sender of msg), |date_received|:(date received of msg as text), |read_status|:(read status of msg), |flagged|:(flagged status of msg), |content|:msgContent{attachments_field}}}
+                {content_clause}
+                set msgRecord to {{|id|:(id of msg as text), |subject|:(subject of msg), |sender|:(sender of msg), |date_received|:(date received of msg as text), |read_status|:(read status of msg), |flagged|:(flagged status of msg), |content|:msgContent}}
                 set end of resultData to msgRecord
             end repeat
         end tell
@@ -3209,7 +3454,30 @@ class AppleMailConnector:
 
         script = _wrap_as_json_script(tell_body, timeout=self.timeout)
         result = self._run_applescript(script)
-        return cast(list[dict[str, Any]], parse_applescript_json(result))
+        messages = cast(list[dict[str, Any]], parse_applescript_json(result))
+
+        if include_attachments:
+            for m in messages:
+                msg_id = cast(str, m.get("id", ""))
+                try:
+                    attachments, warnings = (
+                        self._enumerate_attachments_for_message(msg_id)
+                    )
+                except MailMessageNotFoundError:
+                    # The id came directly from `selection` so a "not
+                    # found" here means Mail.app lost the reference
+                    # between the two AppleScript calls (e.g. user
+                    # deleted or moved the message in the gap). Surface
+                    # as a warning rather than dropping the row.
+                    attachments = []
+                    warnings = [
+                        "attachment enumeration could not relocate "
+                        f"selected message {msg_id}"
+                    ]
+                m["attachments"] = attachments
+                m["warnings"] = warnings
+
+        return messages
 
     def delete_draft(self, draft_id: str) -> bool:
         """Move a draft to Trash (lifecycle endpoint for cancellation).
@@ -3586,6 +3854,153 @@ class AppleMailConnector:
         header = f"{len(mime_bytes)}      \n".encode()
         return header + mime_bytes + b"\n" + plist
 
+    @staticmethod
+    def _as_verified_send_block() -> str:
+        """AppleScript fragment: verified Send click with mechanical
+        read-back (Phase 0 of PLAN-html-reply-send, grounded in
+        docs/reference/UI_GROUNDING_MAIL_SEND.md).
+
+        Caller must set two AppleScript variables beforehand:
+          - ``composeName``    — the compose window's exact AX name
+          - ``composeSubject`` — the message subject ("" skips the
+            sent-copy check; Mail names subjectless windows
+            "New Message", which never matches a subject search)
+
+        The fragment sets ``sendOutcome`` to one of:
+          "SENT" | "WINDOW_NOT_FOUND:…" | "NO_SEND_BUTTON:…" |
+          "SEND_DISABLED:…" | "SHEET:…" | "POSTCONDITION_TIMEOUT:…"
+        It never returns early, so callers can run cleanup (e.g. clipboard
+        restore) before returning ``sendOutcome``.
+
+        Why each check exists (all observed live, 2026-07-20):
+          - window resolved BY NAME — ``window 1`` may be the viewer;
+          - ``enabled`` gate — clicking a disabled Send button is a silent
+            no-op (the vanished-send mechanism);
+          - sheet surfacing — a mid-send sheet means NOT dispatched; its
+            static texts go into the outcome instead of a blind Cancel;
+          - sent-copy poll — window-gone alone does not prove dispatch.
+        """
+        return """
+        set sendOutcome to missing value
+        set sendClicked to false
+        set readyState to ""
+        -- Precondition with bounded wait: after a reopen, Mail populates
+        -- recipients asynchronously and Send stays disabled until then —
+        -- clicking early is a silent no-op (the vanished-send mechanism).
+        repeat 10 times
+            set readyState to ""
+            tell application "System Events"
+                tell application process "Mail"
+                    if not (exists window composeName) then
+                        set readyState to "WINDOW_NOT_FOUND:" & ((name of windows) as text)
+                    else
+                        set tbBtns to (buttons of (first toolbar of window composeName) whose description is "Send")
+                        if (count of tbBtns) is 0 then
+                            set readyState to "NO_SEND_BUTTON:" & composeName
+                        else
+                            set sendBtn to item 1 of tbBtns
+                            if not (enabled of sendBtn) then
+                                set readyState to "SEND_DISABLED"
+                            else
+                                click sendBtn
+                                set sendClicked to true
+                            end if
+                        end if
+                    end if
+                end tell
+            end tell
+            if sendClicked then exit repeat
+            delay 1
+        end repeat
+        if not sendClicked then
+            if readyState is "SEND_DISABLED" then
+                set sendOutcome to "SEND_DISABLED:Send never became enabled within 10s on " & composeName & " (recipients missing or not yet populated)"
+            else
+                set sendOutcome to readyState
+            end if
+        end if
+        if sendOutcome is missing value then
+            set dispatched to false
+            repeat 15 times
+                delay 1
+                set winOpen to false
+                set sheetInfo to ""
+                tell application "System Events"
+                    tell application process "Mail"
+                        if exists window composeName then
+                            set winOpen to true
+                            if exists (first sheet of window composeName) then
+                                try
+                                    -- NB: "st" is a reserved AppleScript token; do not shorten this name.
+                                    repeat with sheetTextEl in static texts of (first sheet of window composeName)
+                                        set sheetInfo to sheetInfo & (value of sheetTextEl) & " | "
+                                    end repeat
+                                end try
+                                set sheetInfo to "SHEET:" & sheetInfo
+                            end if
+                        end if
+                    end tell
+                end tell
+                if sheetInfo is not "" then
+                    set sendOutcome to sheetInfo
+                    exit repeat
+                end if
+                if not winOpen then
+                    if composeSubject is "" then
+                        set dispatched to true
+                    else
+                        tell application "Mail"
+                            if (count of (messages of sent mailbox whose subject is composeSubject)) > 0 then set dispatched to true
+                        end tell
+                    end if
+                end if
+                if dispatched then exit repeat
+            end repeat
+            if sendOutcome is missing value then
+                if dispatched then
+                    set sendOutcome to "SENT"
+                else
+                    set sendOutcome to "POSTCONDITION_TIMEOUT:window-gone/sent-copy not both confirmed within 15s for " & composeName
+                end if
+            end if
+        end if
+        """
+
+    @staticmethod
+    def _as_discard_compose_block(win_name_var: str) -> str:
+        """AppleScript fragment: discard a compose window with read-back.
+
+        ``win_name_var`` is the AppleScript variable holding the window
+        name. Both Mail-dictionary discards (``close … saving no``,
+        ``delete outgoing message``) fail silently (observed live) — the
+        only working route is the close button + the "Save this message as
+        a draft?" sheet. The Don't Save button's real name carries a curly
+        apostrophe (U+2019); a straight quote never matches. Sets
+        ``discardOutcome`` to "DISCARDED" or "DISCARD_FAILED:<name>".
+        """
+        return f"""
+        set discardOutcome to "DISCARDED"
+        tell application "System Events"
+            tell application process "Mail"
+                if exists window {win_name_var} then
+                    -- Close button by subrole — `button 1` is "add contacts"
+                    -- on compose windows (observed live 2026-07-20).
+                    click (first button of window {win_name_var} whose subrole is "AXCloseButton")
+                    delay 0.8
+                    if exists window {win_name_var} then
+                        if exists (first sheet of window {win_name_var}) then
+                            click button "Don’t Save" of first sheet of window {win_name_var}
+                            delay 0.8
+                        end if
+                    end if
+                    if exists window {win_name_var} then
+                        set discardOutcome to "DISCARD_FAILED:" & {win_name_var}
+                    end if
+                end if
+            end tell
+        end tell
+        """
+
     def _send_new_via_eml(
         self,
         *,
@@ -3606,19 +4021,24 @@ class AppleMailConnector:
         CSS and renders a purple quoted-reply bar.  Apple Developer Forum
         thread 738842 / FB11734014.
 
-        Fix — four steps, no ``content`` property setter involved:
+        Fix — no ``content`` property setter involved:
 
-        1. ``open location "mailto:..."`` inside a Mail tell block opens a
-           clean compose window (Mail's URL handler path, not the AppleScript
-           compose path).
-        2. ``close window saving yes`` saves the draft to Mail's Drafts folder
-           with clean MIME — no URLShare blockquote injected.
-        3. ``open message`` (re-opens the saved draft as a compose window).
-        4. System Events clicks the "Send" toolbar button to dispatch the
-           message.  Mail sends the stored MIME as-is.
+        1. ``open location "mailto:..."`` opens a clean compose window
+           (Mail's URL handler populates recipients/subject/body — the
+           URLShare blockquote never appears).
+        2. Verified Send directly from that window: bounded wait for the
+           Send button to be enabled, click, then poll window-gone +
+           sent-copy postconditions (``_as_verified_send_block``).
 
-        Verified 2026-05-23: forwarded copy arrived with clean plain-text body
-        (no ``>`` quoting) and rendered without the purple bar on iOS Mail.
+        History: this path originally closed the compose window
+        ``saving yes`` and reopened the draft before clicking Send. Live
+        exploration (2026-07-20, docs/reference/UI_GROUNDING_MAIL_SEND.md)
+        showed the close FAILS SILENTLY (like every Mail-dictionary close),
+        leaving a half-state window whose Send button never re-enables —
+        the mechanism behind a send that reported SENT but dispatched
+        nothing. The earlier claim "verified 2026-05-23 … no purple bar on
+        iOS" covered the close/reopen variant; the direct-send output needs
+        a one-time iOS visual re-check.
 
         Limitations
         -----------
@@ -3663,88 +4083,530 @@ class AppleMailConnector:
         # When subject is empty Mail names the compose window "New Message".
         win_subject = subject if subject else "New Message"
         win_subject_safe = escape_applescript_string(win_subject)
+        # Empty subject: the sent-copy postcondition can't match ("New
+        # Message" is a window name, not the subject) — the verified-send
+        # block then relies on window-gone alone.
+        subject_for_sent_safe = escape_applescript_string(subject or "")
+        verified_send_block = self._as_verified_send_block()
 
         script = f"""
-        -- Step 1: open compose window via mailto: URL handler (no content setter).
+        set composeName to "{win_subject_safe}"
+        set composeSubject to "{subject_for_sent_safe}"
+
+        -- Step 1: open compose window via mailto: URL handler (no content
+        -- setter — the URL handler populates recipients/subject/body, so
+        -- the Apple-Mail-URLShareWrapperClass blockquote never appears).
         tell application "Mail"
             open location "{mailto_url_safe}"
-            delay 2
-            set targetWin to missing value
-            repeat with w in windows
-                if name of w is "{win_subject_safe}" then
-                    set targetWin to w
-                    exit repeat
-                end if
-            end repeat
-            if targetWin is missing value then
-                return "NO_COMPOSE_WINDOW"
-            end if
-            -- Step 2: close and save as draft (MIME stays clean).
-            close targetWin saving yes
-            delay 3
+            activate
         end tell
 
-        -- Step 3: find the saved draft (poll up to 15s for iCloud IMAP sync).
-        set targetMsg to missing value
-        repeat 15 times
-            tell application "Mail"
-                repeat with acct in accounts
-                    try
-                        set dm to mailbox "Drafts" of acct
-                        repeat with m in messages of dm
-                            if subject of m is "{win_subject_safe}" then
-                                set targetMsg to m
-                                exit repeat
-                            end if
-                        end repeat
-                    end try
-                    if targetMsg is not missing value then exit repeat
-                end repeat
+        -- Step 2: resolve the compose window BY NAME with a bounded poll
+        -- (the URL handler opens it asynchronously; fixed delays race).
+        set composeReady to false
+        repeat 10 times
+            delay 0.5
+            tell application "System Events"
+                tell application process "Mail"
+                    if exists window composeName then set composeReady to true
+                end tell
             end tell
-            if targetMsg is not missing value then exit repeat
-            delay 1
+            if composeReady then exit repeat
         end repeat
-
-        if targetMsg is missing value then
-            return "DRAFT_NOT_FOUND"
+        if not composeReady then
+            tell application "System Events"
+                tell application process "Mail"
+                    set openNames to (name of windows) as text
+                end tell
+            end tell
+            return "NO_COMPOSE_WINDOW:expected " & composeName & " — open: " & openNames
         end if
 
-        tell application "Mail"
-            open targetMsg
-            activate
-            delay 1
-            repeat with w in windows
-                if name of w is "{win_subject_safe}" then
-                    set index of w to 1
-                    exit repeat
-                end if
-            end repeat
-        end tell
-
-        delay 0.3
-
-        -- Step 4: click Send toolbar button via System Events.
-        tell application "System Events"
-            tell application process "Mail"
-                set w to window 1
-                -- Dismiss any blocking "Save as draft?" sheet first.
-                try
-                    click button "Cancel" of (first sheet of w)
-                    delay 0.3
-                end try
-                set tb to first toolbar of w
-                set sendBtn to first button of tb whose description is "Send"
-                click sendBtn
-            end tell
-        end tell
-
-        return "SENT"
+        -- Step 3: verified Send directly from the live mailto window
+        -- (enabled-gate wait, window-gone + sent-copy postconditions).
+        -- The former close-saving-yes → reopen-draft dance is GONE: the
+        -- close failed silently (like every Mail-dictionary close, see
+        -- docs/reference/UI_GROUNDING_MAIL_SEND.md), leaving a half-state
+        -- window whose Send never re-enabled — observed live 2026-07-20.
+        {verified_send_block}
+        return sendOutcome
         """
         result = self._run_applescript(script).strip()
         if result == "SENT":
             return {"draft_id": "", "sent_message_id": ""}
         raise MailAppleScriptError(
             f"mailto-send: {result!r}"
+        )
+
+    @staticmethod
+    def _paste_probe_strings(body: str) -> tuple[str, str]:
+        """Compute the paste read-back probes for an HTML body.
+
+        Returns ``(snippet, raw_marker)``:
+          - ``snippet``: first chunk of the TAG-STRIPPED text content —
+            after a successful paste this text must be readable in the
+            WebArea (arrival check). Empty when the HTML has no text
+            content (checks degrade gracefully).
+          - ``raw_marker``: first chunk of the raw source when it starts
+            with a tag — if this appears LITERALLY in the WebArea, the
+            paste degraded to plain text (the 2026-07-21 raw-``<p>``
+            regression; see docs/reference/UI_GROUNDING_MAIL_SEND.md).
+        """
+        text = re.sub(r"<[^>]+>", " ", body)
+        text = " ".join(text.split())
+        snippet = text[:24].strip()
+        raw_marker = body.strip()[:16] if body.lstrip().startswith("<") else ""
+        return snippet, raw_marker
+
+    def _build_paste_script(
+        self,
+        *,
+        window_name: str,
+        body: str,
+        place_above_existing: bool,
+        undo_first: bool,
+    ) -> str:
+        """Full osascript source: verified HTML paste into the named
+        compose window (2026-07-22 raw-``<p>`` regression fixes):
+
+          1. readiness — poll until the body WebArea EXISTS (window-name
+             alone races WebKit initialization);
+          2. focus — ``set focused`` then VERIFY AXFocusedUIElement is the
+             WebArea (a click can leave focus in the To field, sending
+             cmd+v to the wrong control);
+          3. paste, then restore the clipboard IMMEDIATELY (shortest
+           possible hold; restore also runs on every error path).
+
+        Returns "PASTED_UNVERIFIED" — content verification happens in a
+        SEPARATE osascript run (``_build_readback_script``): within one
+        process System Events serves a stale AX subtree after WebKit
+        re-renders, so an in-script read-back sees nothing (observed
+        live). ``undo_first`` prepends cmd+z for the retry attempt.
+        """
+        body_safe = escape_applescript_string(sanitize_input(body))
+        win_safe = escape_applescript_string(window_name)
+        caret_block = (
+            "key code 126 using command down\n            delay 0.2"
+            if place_above_existing
+            else ""
+        )
+        undo_block = (
+            'keystroke "z" using command down\n            delay 0.5'
+            if undo_first
+            else ""
+        )
+        return f"""
+use framework "AppKit"
+use framework "Foundation"
+use scripting additions
+
+set theHTML to "{body_safe}"
+set composeName to "{win_safe}"
+
+set pb to current application's NSPasteboard's generalPasteboard()
+set savedTypes to (pb's types()) as list
+set savedPairs to {{}}
+repeat with t in savedTypes
+    set theData to (pb's dataForType:(t as text))
+    if theData is not missing value then
+        set end of savedPairs to {{pbType:(t as text), pbData:theData}}
+    end if
+end repeat
+
+set htmlNSString to current application's NSString's stringWithString:theHTML
+set htmlData to htmlNSString's dataUsingEncoding:(current application's NSUTF8StringEncoding)
+pb's clearContents()
+pb's setData:htmlData forType:"public.html"
+
+try
+    tell application "Mail" to activate
+    set bodyArea to missing value
+    repeat 15 times
+        tell application "System Events"
+            tell application process "Mail"
+                if exists window composeName then
+                    set w to window composeName
+                    repeat with g in groups of w
+                        try
+                            set sa to scroll area 1 of group 1 of g
+                            set waList to (UI elements of sa whose role is "AXWebArea")
+                            if (count of waList) > 0 then
+                                set bodyArea to item 1 of waList
+                                exit repeat
+                            end if
+                        end try
+                    end repeat
+                end if
+            end tell
+        end tell
+        if bodyArea is not missing value then exit repeat
+        delay 0.5
+    end repeat
+    if bodyArea is missing value then error "NO_BODY_AREA:webarea never appeared in " & composeName
+    set focusOK to false
+    tell application "System Events"
+        tell application process "Mail"
+            if exists menu item "Make Rich Text" of menu "Format" of menu bar 1 then
+                click menu item "Make Rich Text" of menu "Format" of menu bar 1
+                delay 0.3
+            end if
+            repeat 5 times
+                set focused of bodyArea to true
+                delay 0.3
+                try
+                    if role of (value of attribute "AXFocusedUIElement" of it) is "AXWebArea" then
+                        set focusOK to true
+                        exit repeat
+                    end if
+                end try
+                click bodyArea
+                delay 0.3
+            end repeat
+        end tell
+    end tell
+    if not focusOK then error "PASTE_FOCUS_FAILED:body area would not take keyboard focus in " & composeName
+    tell application "System Events"
+        tell application process "Mail"
+            {undo_block}
+            {caret_block}
+            keystroke "v" using command down
+            delay 0.8
+        end tell
+    end tell
+on error errText
+    pb's clearContents()
+    repeat with pair in savedPairs
+        pb's setData:(pbData of pair) forType:(pbType of pair)
+    end repeat
+    return errText
+end try
+
+pb's clearContents()
+repeat with pair in savedPairs
+    pb's setData:(pbData of pair) forType:(pbType of pair)
+end repeat
+
+return "PASTED_UNVERIFIED"
+"""
+
+    def _salvage_compose_to_draft(self, window_name: str) -> str:
+        """Close a compose window SAVING it as a draft (best effort).
+
+        Failure policy on a headless machine (Jonah, 2026-07-23): a
+        failed send attempt must never park an open compose window —
+        salvage the content to Drafts (close button → "Save" on the
+        save sheet) so nothing is lost and nothing blocks later UI
+        automation. Returns "SALVAGED", "NO_WINDOW", or the observed
+        state on failure — callers append this to their error, never
+        mask the original failure with it.
+        """
+        win_safe = escape_applescript_string(window_name)
+        try:
+            return self._run_applescript(f"""
+tell application "System Events"
+    tell application process "Mail"
+        if not (exists window "{win_safe}") then return "NO_WINDOW"
+        click (first button of window "{win_safe}" whose subrole is "AXCloseButton")
+        delay 0.8
+        if exists window "{win_safe}" then
+            if exists (first sheet of window "{win_safe}") then
+                click button "Save" of first sheet of window "{win_safe}"
+                delay 0.8
+            end if
+        end if
+        if exists window "{win_safe}" then return "SALVAGE_FAILED:window still open"
+        return "SALVAGED"
+    end tell
+end tell
+""").strip()
+        except MailAppleScriptError as exc:
+            return f"SALVAGE_FAILED:{exc}"
+
+    @staticmethod
+    def _build_readback_script(window_name: str) -> str:
+        """Full osascript source: read the compose body's text content.
+
+        Runs as its OWN osascript process — a fresh process gets a fresh
+        AX snapshot; the pasting process reads a stale (empty) subtree
+        after WebKit re-renders on paste (observed live 2026-07-22).
+        Returns the concatenated static-text content, or
+        "READBACK_NO_AREA" when the window/WebArea can't be resolved.
+        """
+        win_safe = escape_applescript_string(window_name)
+        return f"""
+tell application "System Events"
+    tell application process "Mail"
+        if not (exists window "{win_safe}") then return "READBACK_NO_AREA"
+        set bodyArea to missing value
+        repeat with g in groups of window "{win_safe}"
+            try
+                set sa to scroll area 1 of group 1 of g
+                set waList to (UI elements of sa whose role is "AXWebArea")
+                if (count of waList) > 0 then
+                    set bodyArea to item 1 of waList
+                    exit repeat
+                end if
+            end try
+        end repeat
+        if bodyArea is missing value then return "READBACK_NO_AREA"
+        -- Pasted HTML nests as AXGroup > AXStaticText (typed text sits
+        -- directly under the WebArea) — descend three levels.
+        set seenText to ""
+        try
+            repeat with l1 in UI elements of bodyArea
+                if role of l1 is "AXStaticText" then
+                    set seenText to seenText & (value of l1) & " "
+                else
+                    try
+                        repeat with l2 in UI elements of l1
+                            if role of l2 is "AXStaticText" then
+                                set seenText to seenText & (value of l2) & " "
+                            else
+                                try
+                                    repeat with l3 in UI elements of l2
+                                        if role of l3 is "AXStaticText" then set seenText to seenText & (value of l3) & " "
+                                    end repeat
+                                end try
+                            end if
+                        end repeat
+                    end try
+                end if
+            end repeat
+        end try
+        return seenText
+    end tell
+end tell
+"""
+
+    def _send_html_reply(
+        self,
+        *,
+        to: list[str],
+        cc: list[str] | None,
+        bcc: list[str] | None,
+        subject: str,
+        body: str,  # HTML string
+        from_account: str | None,
+        reply_to: str,
+    ) -> dict[str, str]:
+        """Send an HTML reply into an existing thread.
+
+        Two scripts with the outbound-allowlist gate BETWEEN them:
+
+        A. Open the reply compose window (``reply origMsg opening window
+           true`` — Mail carries the threading headers), identify it by
+           window-set diff (never by guessed subject), apply recipient /
+           subject / sender overrides at the scripting-DICTIONARY level
+           (header-only — the ``content`` setter that causes the iOS
+           purple bar is never touched), then read the FINAL recipient
+           set and derived subject back from the outgoing-message model
+           (UI To-field values are display pills, not addresses).
+
+        B. Only if every recipient passes the allowlist: inject the HTML
+           via clipboard paste ABOVE Mail's auto-quoted original
+           (cmd+up first), then the Phase-0 verified send.
+
+        Off-list recipients (including any the caller supplied): hard
+        fail — the compose window is discarded (verified), nothing is
+        pasted or sent, and ``MailOutboundDisallowedError`` names them.
+        There are no allowlist exceptions; ``reply_all`` does not exist —
+        callers wanting it pass the full participant list via ``to``/``cc``
+        explicitly.
+        """
+        seed_id = self._maybe_resolve_rfc_seed_id("reply", reply_to)
+        seed_id_safe = escape_applescript_string(sanitize_input(seed_id or ""))
+
+        def _override_block(kind: str, addrs: list[str] | None) -> str:
+            if not addrs:
+                return ""
+            list_str = ", ".join(
+                f'"{escape_applescript_string(a)}"' for a in addrs
+            )
+            return f"""
+                delete (every {kind} recipient of replyMsg)
+                repeat with addr in {{{list_str}}}
+                    make new {kind} recipient at end of {kind} recipients of replyMsg with properties {{address:addr}}
+                end repeat
+            """
+
+        to_over = _override_block("to", to)
+        cc_over = _override_block("cc", cc)
+        bcc_over = _override_block("bcc", bcc)
+        subject_override = (
+            f'set subject of replyMsg to "{escape_applescript_string(sanitize_input(subject))}"'
+            if subject
+            else ""
+        )
+        sender_clause = ""
+        if from_account is not None:
+            sender_email = self._resolve_account_to_sender(from_account)
+            sender_clause = (
+                f'set sender of replyMsg to '
+                f'"{escape_applescript_string(sanitize_input(sender_email))}"'
+            )
+
+        script_a_body = f"""
+tell application "System Events"
+    tell application process "Mail"
+        set beforeNames to name of windows
+    end tell
+end tell
+tell application "Mail"
+    activate
+    set origMsg to missing value
+    repeat with acc in accounts
+        try
+            repeat with mb in mailboxes of acc
+                try
+                    set origMsg to first message of mb whose id is "{seed_id_safe}"
+                    exit repeat
+                end try
+            end repeat
+        end try
+        if origMsg is not missing value then exit repeat
+    end repeat
+    if origMsg is missing value then error "SEED_NOT_FOUND"
+    set replyMsg to reply origMsg opening window true
+end tell
+-- Identify the new compose window by set-diff (bounded poll).
+set newName to ""
+repeat 10 times
+    delay 0.5
+    tell application "System Events"
+        tell application process "Mail"
+            set afterNames to name of windows
+        end tell
+    end tell
+    repeat with n in afterNames
+        if beforeNames does not contain (n as text) then
+            set newName to (n as text)
+            exit repeat
+        end if
+    end repeat
+    if newName is not "" then exit repeat
+end repeat
+if newName is "" then error "NO_REPLY_WINDOW"
+tell application "Mail"
+    {to_over}
+    {cc_over}
+    {bcc_over}
+    {subject_override}
+    {sender_clause}
+    set toAddrs to address of to recipients of replyMsg
+    if toAddrs is missing value then set toAddrs to {{}}
+    set ccAddrs to address of cc recipients of replyMsg
+    if ccAddrs is missing value then set ccAddrs to {{}}
+    set bccAddrs to address of bcc recipients of replyMsg
+    if bccAddrs is missing value then set bccAddrs to {{}}
+    set resultData to {{|window|:newName, |subject|:(subject of replyMsg as text), |to|:toAddrs, |cc|:ccAddrs, |bcc|:bccAddrs}}
+end tell
+"""
+        raw = self._run_applescript(
+            _wrap_as_json_script(script_a_body, timeout=self.timeout)
+        )
+        meta = cast(dict[str, Any], parse_applescript_json(raw))
+        win_name = str(meta.get("window") or "")
+        derived_subject = str(meta.get("subject") or "")
+        resolved_to = [str(a) for a in (meta.get("to") or [])]
+        resolved_cc = [str(a) for a in (meta.get("cc") or [])]
+        resolved_bcc = [str(a) for a in (meta.get("bcc") or [])]
+
+        # HARD POLICY GATE on the post-override recipients read back from
+        # the model. No exceptions. On failure: discard (verified), raise.
+        try:
+            assert_recipients_allowed_for_send(
+                resolved_to or None,
+                resolved_cc or None,
+                resolved_bcc or None,
+                seed="new",
+            )
+        except MailOutboundDisallowedError:
+            win_safe = escape_applescript_string(win_name)
+            self._run_applescript(
+                f'set discardName to "{win_safe}"\n'
+                + self._as_discard_compose_block("discardName")
+                + "\nreturn discardOutcome"
+            )
+            raise
+
+        return self._inject_html_and_send(
+            window_name=win_name,
+            sent_subject=derived_subject,
+            body=body,
+            place_above_existing=True,
+        )
+
+    def _inject_html_and_send(
+        self,
+        *,
+        window_name: str,
+        sent_subject: str,
+        body: str,
+        place_above_existing: bool,
+    ) -> dict[str, str]:
+        """Clipboard-inject HTML into the named compose window (verified),
+        then run the verified send. ``place_above_existing`` moves the
+        caret to the top first (cmd+up) so pasted HTML lands ABOVE Mail's
+        auto-quoted original.
+
+        Three osascript invocations — paste, read-back, send — because a
+        fresh process is the only reliable way to read the post-paste AX
+        tree (within one process System Events serves a stale subtree
+        after WebKit re-renders; observed live 2026-07-22). The read-back
+        must see the tag-stripped text and must NOT see the raw source
+        (the 2026-07-21 literal-``<p>`` regression); one undo-and-retry,
+        then a loud PASTE_FAILED. The compose window is left intact on
+        failure for recovery.
+        """
+        snippet, raw_marker = self._paste_probe_strings(body)
+
+        for attempt in (1, 2):
+            paste_result = self._run_applescript(
+                self._build_paste_script(
+                    window_name=window_name,
+                    body=body,
+                    place_above_existing=place_above_existing,
+                    undo_first=(attempt == 2),
+                )
+            ).strip()
+            if paste_result != "PASTED_UNVERIFIED":
+                salvage = self._salvage_compose_to_draft(window_name)
+                raise MailAppleScriptError(
+                    f"html-send: {paste_result!r} (compose window: {salvage})"
+                )
+            seen = self._run_applescript(
+                self._build_readback_script(window_name)
+            ).strip()
+            # Normalize whitespace: styled runs (<b>…) split AX static
+            # texts, so the joined read-back carries doubled spaces.
+            seen_norm = " ".join(seen.split())
+            raw_norm = " ".join(raw_marker.split())
+            arrived = (not snippet) or (snippet in seen_norm)
+            degraded = bool(raw_norm) and raw_norm in seen_norm
+            if arrived and not degraded:
+                break
+            if attempt == 2:
+                salvage = self._salvage_compose_to_draft(window_name)
+                raise MailAppleScriptError(
+                    f"html-send: 'PASTE_FAILED:read-back saw [{seen}] "
+                    f"wanted [{snippet}] without raw [{raw_marker}]' "
+                    f"(compose window: {salvage})"
+                )
+
+        win_safe = escape_applescript_string(window_name)
+        subject_safe = escape_applescript_string(sent_subject)
+        send_script = (
+            f'set composeName to "{win_safe}"\n'
+            f'set composeSubject to "{subject_safe}"\n'
+            + self._as_verified_send_block()
+            + "\nreturn sendOutcome"
+        )
+        result = self._run_applescript(send_script).strip()
+        if result == "SENT":
+            return {"draft_id": "", "sent_message_id": ""}
+        salvage = self._salvage_compose_to_draft(window_name)
+        raise MailAppleScriptError(
+            f"html-send: {result!r} (compose window: {salvage})"
         )
 
     def _send_html_email(
@@ -3757,6 +4619,7 @@ class AppleMailConnector:
         body: str,  # HTML string
         from_account: str | None,  # noqa: ARG002 — see TODO below
         attachment_paths: list[Path] | None = None,
+        reply_to: str | None = None,
     ) -> dict[str, str]:
         """Send an HTML email directly via clipboard injection.
 
@@ -3796,102 +4659,51 @@ class AppleMailConnector:
                 "with attachments."
             )
 
+        if reply_to is not None:
+            return self._send_html_reply(
+                to=to,
+                cc=cc,
+                bcc=bcc,
+                subject=subject,
+                body=body,
+                from_account=from_account,
+                reply_to=reply_to,
+            )
+
         # Build mailto: URL with URL-encoded subject and recipients.
-        # subject is URL-encoded for the mailto: URL; body is passed as
-        # an AppleScript string literal (clipboard injection), not in the URL.
+        # subject is URL-encoded for the mailto: URL; body is NEVER in the
+        # URL (clipboard injection — a URL body would insert the raw HTML
+        # source as literal text).
         to_str = urllib.parse.quote(",".join(to), safe="@,")
         encoded_subject = urllib.parse.quote(subject, safe="")
         mailto_url = f"mailto:{to_str}?subject={encoded_subject}"
-
         mailto_url_safe = escape_applescript_string(mailto_url)
 
-        # Escape all user-supplied strings for AppleScript interpolation.
-        body_safe = escape_applescript_string(sanitize_input(body))
+        # Compose window name = subject ("New Message" when empty) — the
+        # window is resolved BY NAME throughout; `window 1` may be the
+        # viewer (docs/reference/UI_GROUNDING_MAIL_SEND.md).
+        win_subject = subject if subject else "New Message"
 
-        script = f"""
-use framework "AppKit"
-use framework "Foundation"
-use scripting additions
+        # Step 1: open the compose window (URL handler populates
+        # recipients + subject). The paste step polls for the body
+        # WebArea itself — readiness = WebArea present, NOT window name;
+        # window-name-only readiness raced WebKit init and caused the
+        # 2026-07-21 raw-<p> paste degradation.
+        self._run_applescript(
+            f'tell application "Mail"\n'
+            f'    open location "{mailto_url_safe}"\n'
+            f'    activate\n'
+            f'end tell\n'
+            f'return "OPENED"'
+        )
 
-set theHTML to "{body_safe}"
-set mailtoURL to "{mailto_url_safe}"
-
--- 1. Save clipboard
-set pb to current application's NSPasteboard's generalPasteboard()
-set savedTypes to (pb's types()) as list
-set savedPairs to {{}}
-repeat with t in savedTypes
-    set theData to (pb's dataForType:(t as text))
-    if theData is not missing value then
-        set end of savedPairs to {{pbType:(t as text), pbData:theData}}
-    end if
-end repeat
-
--- 2. Write HTML to clipboard
-set htmlNSString to current application's NSString's stringWithString:theHTML
-set htmlData to htmlNSString's dataUsingEncoding:(current application's NSUTF8StringEncoding)
-pb's clearContents()
-pb's setData:htmlData forType:"public.html"
-
--- 3. Open compose window
-tell application "Mail"
-    open location mailtoURL
-    delay 2
-    activate
-end tell
-
--- 4. Rich text, find body WebArea, paste, click Send
-tell application "System Events"
-    tell application process "Mail"
-        set w to window 1
-        try
-            click menu item "Make Rich Text" of menu "Format" of menu bar 1
-            delay 0.3
-        end try
-        -- Find body WebArea: top-level groups -> group[1] -> scroll area[1] -> AXWebArea
-        set bodyArea to missing value
-        repeat with g in groups of w
-            try
-                set sa to scroll area 1 of group 1 of g
-                set waList to (UI elements of sa whose role is "AXWebArea")
-                if (count of waList) > 0 then
-                    set bodyArea to item 1 of waList
-                    exit repeat
-                end if
-            end try
-        end repeat
-        if bodyArea is missing value then
-            -- Restore clipboard and abort
-            pb's clearContents()
-            repeat with pair in savedPairs
-                pb's setData:(pbData of pair) forType:(pbType of pair)
-            end repeat
-            return "NO_BODY_AREA"
-        end if
-        click bodyArea
-        delay 0.2
-        keystroke "v" using command down
-        delay 0.5
-        -- Click Send directly
-        set sendBtn to first button of (first toolbar of w) whose description is "Send"
-        click sendBtn
-    end tell
-end tell
-
--- 5. Restore clipboard
-pb's clearContents()
-repeat with pair in savedPairs
-    pb's setData:(pbData of pair) forType:(pbType of pair)
-end repeat
-
-return "SENT"
-        """
-
-        result = self._run_applescript(script).strip()
-        if result == "SENT":
-            return {"draft_id": "", "sent_message_id": ""}
-        raise MailAppleScriptError(
-            f"html-send: {result!r}"
+        # Steps 2–4: verified paste (separate read-back process), then
+        # verified send. Shared with the reply path.
+        return self._inject_html_and_send(
+            window_name=win_subject,
+            sent_subject=subject or "",
+            body=body,
+            place_above_existing=False,
         )
 
     def create_draft(

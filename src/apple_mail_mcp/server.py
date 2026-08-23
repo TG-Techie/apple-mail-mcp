@@ -6,6 +6,7 @@ import argparse
 import atexit
 import logging
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
@@ -53,7 +54,16 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Create FastMCP server
-mcp = FastMCP("apple-mail")
+mcp = FastMCP(
+    "apple-mail",
+    instructions=(
+        "Sending email: ``email_send_html`` is the preferred send tool — use it "
+        "for fresh mail and replies. Reserve the ``draft_create`` + "
+        "``draft_send`` flow for when a human wants to review or edit the "
+        "draft in Mail.app before it goes out. Both paths enforce the same "
+        "outbound recipient allowlist."
+    ),
+)
 
 # Initialize mail connector. Pool is opt-in via APPLE_MAIL_MCP_IMAP_POOL=1
 # (default off, per #75 acceptance criteria — keep per-call lifecycle the
@@ -597,14 +607,19 @@ def _resolve_id_list_to_messages(
     mailbox: str | None,
     headers_only: bool = False,
     include_attachments: bool = False,
+    on_missing: Callable[[str], None] | None = None,
 ) -> list[dict[str, Any]]:
     """Resolve a mixed list of ids and ``SELECTED`` tokens to message dicts.
 
     ``SELECTED`` tokens expand inline to Mail.app's current UI selection
     (zero-or-more messages). Real ids are looked up via
-    ``mail.get_message()``. Missing ids drop out silently
-    (partial-results convention). The connector ``get_selected_messages``
-    is called at most once even if ``SELECTED`` appears multiple times.
+    ``mail.get_message()``. An explicitly-requested id that cannot be
+    located still drops from the returned list (partial-results
+    convention), but the drop is no longer silent: ``on_missing`` (if
+    provided) is invoked with each such id so the caller can surface the
+    cardinality gap (NO SILENT ERRORS). The connector
+    ``get_selected_messages`` is called at most once even if ``SELECTED``
+    appears multiple times.
 
     Used by both ``search_messages.source`` (metadata mode,
     ``include_content=False``) and ``get_messages.message_ids`` (bodies
@@ -633,7 +648,10 @@ def _resolve_id_list_to_messages(
                 )
                 out.append(msg)
             except MailMessageNotFoundError:
-                # Partial-results: missing ids drop out silently.
+                # Partial-results: the id drops from the list, but report
+                # it so the caller never fails quiet on a cardinality gap.
+                if on_missing is not None:
+                    on_missing(id_or_token)
                 continue
     return out
 
@@ -969,9 +987,11 @@ def get_messages(
             token ``"SELECTED"``, which the server resolves at call time
             to Mail.app's current UI selection (zero-or-more messages).
             Mixed lists like ``["SELECTED", "12345"]`` are valid. Empty
-            list is a no-op (returns empty result, no error). Missing ids
-            drop out silently (partial-results convention) — the response
-            contains whatever was found.
+            list is a no-op (returns empty result, no error). An
+            explicitly-requested id that cannot be located drops from the
+            ``messages`` list (partial-results convention) but is reported
+            in the response ``warnings`` field, so a count lower than the
+            number of requested ids is never silent.
         include_content: Include message bodies (default: True).
         headers_only: Skip body fetch on the IMAP path for explicit ids
             (default: False). Silently ignored on the AppleScript fallback.
@@ -1006,6 +1026,7 @@ def get_messages(
 
         logger.info(f"Getting messages: {len(message_ids)} ids")
 
+        missing_ids: list[str] = []
         messages = _resolve_id_list_to_messages(
             message_ids,
             include_content=include_content,
@@ -1013,7 +1034,25 @@ def get_messages(
             mailbox=mailbox,
             headers_only=headers_only,
             include_attachments=include_attachments,
+            on_missing=missing_ids.append,
         )
+
+        # NO SILENT ERRORS: surface both kinds of non-fatal degradation at
+        # the response root. (1) Ids that were requested but not located —
+        # the cardinality gap is reported, never dropped quietly. (2)
+        # Per-message attachment-enumeration warnings emitted by the
+        # connector (e.g. inline-image -10000) are lifted to the top level,
+        # mirroring search_messages' top-level ``warnings`` field, while
+        # remaining attributable on each message dict.
+        warnings: list[str] = []
+        if missing_ids:
+            warnings.append(
+                "requested ids not found and dropped from results: "
+                + ", ".join(missing_ids)
+            )
+        for m in messages:
+            for w in m.get("warnings", []) or []:
+                warnings.append(w)
 
         operation_logger.log_operation(
             "get_messages",
@@ -1021,11 +1060,14 @@ def get_messages(
             "success"
         )
 
-        return {
+        response: dict[str, Any] = {
             "success": True,
             "messages": messages,
             "count": len(messages),
         }
+        if warnings:
+            response["warnings"] = warnings
+        return response
 
     except Exception as e:
         logger.error(f"Error getting messages: {e}")
@@ -1318,7 +1360,7 @@ def save_attachments(
             f"Saving attachments from message {message_id} to {save_directory}"
         )
 
-        count = mail.save_attachments(
+        count, warnings = mail.save_attachments(
             message_id=message_id,
             save_directory=save_path,
             attachment_indices=attachment_indices,
@@ -1334,11 +1376,17 @@ def save_attachments(
             "success"
         )
 
-        return {
+        # NO SILENT ERRORS: connector returns (count, warnings); lift
+        # warnings to the response when present so a 0-saved result
+        # caused by Mail.app -10000 enumeration is never silent.
+        response: dict[str, Any] = {
             "success": True,
             "saved": count,
             "directory": save_directory,
         }
+        if warnings:
+            response["warnings"] = warnings
+        return response
 
     except (FileNotFoundError, ValueError) as e:
         logger.error(f"Validation error: {e}")
@@ -3071,34 +3119,68 @@ async def draft_send(
 
 @mcp.tool()
 async def email_send_html(
-    to: list[str],
-    subject: str,
-    body: str,
+    to: list[str] = [],  # noqa: B006 — coerced below
+    subject: str = "",
+    body: str = "",
     cc: list[str] = [],  # noqa: B006 — coerced below
     bcc: list[str] = [],  # noqa: B006 — coerced below
     from_account: str | None = None,
+    reply_to: str | None = None,
     ctx: Context | None = None,
 ) -> dict:
     """Send an HTML email directly. Does not save a draft first.
 
-    Body must be an HTML string. The email is composed via clipboard injection
-    into Mail.app's rich-text compose window and sent immediately.
+    This is the PREFERRED send tool — use it for fresh mail and replies
+    unless a human wants to review the draft in Mail.app first (then use
+    ``draft_create`` + ``draft_send``).
 
-    Outbound allowlist policy applies — all recipients must be on the allowlist.
+    Body must be an HTML string. The email is composed via clipboard injection
+    into Mail.app's rich-text compose window and sent immediately, with
+    mechanical verification of dispatch (a success result means a Sent-mailbox
+    copy exists).
+
+    **Fresh mail** (default): ``to`` and ``subject`` are required.
+
+    **Reply into a thread**: pass ``reply_to=<message_id>`` (Mail internal or
+    RFC 5322 id — use the LATEST message of the thread, e.g. from
+    ``get_thread``). Mail carries the threading headers; ``subject`` defaults
+    to the derived "Re: …" and ``to`` defaults to Mail's derived reply
+    recipients. The pasted HTML lands ABOVE the auto-quoted original.
+
+    **Reply-all**: there is no reply_all flag. Fetch the thread participants
+    (``get_thread`` / ``get_messages``) and pass them explicitly via
+    ``to``/``cc`` — every recipient is validated against the outbound
+    allowlist, with no exceptions; one off-list participant blocks the whole
+    send (the compose window is discarded, nothing partial is sent).
 
     Args:
-        to: List of recipient email addresses.
-        subject: Email subject line.
+        to: Recipient email addresses. Optional when ``reply_to`` is given
+            (Mail derives them; explicit values REPLACE the derived set).
+        subject: Email subject line. Optional when ``reply_to`` is given.
         body: HTML string for the email body.
-        cc: Optional CC recipients.
+        cc: Optional CC recipients (replace derived CC when replying).
         bcc: Optional BCC recipients.
         from_account: Mail.app account name or UUID. None uses Mail's default.
+        reply_to: Message id to reply to. Enables reply mode.
 
     Returns:
         ``{"success": True, "draft_id": "", "sent_message_id": ""}`` on success.
     """
     cc_list = cc or []
     bcc_list = bcc or []
+
+    if reply_to is None and not to:
+        return {
+            "success": False,
+            "error": "email_send_html: 'to' is required unless reply_to is given",
+            "error_type": "validation_error",
+        }
+    if reply_to is None and not subject:
+        return {
+            "success": False,
+            "error": "email_send_html: 'subject' is required unless reply_to is given",
+            "error_type": "validation_error",
+        }
 
     all_recipients = list(to) + list(cc_list) + list(bcc_list)
 
@@ -3118,7 +3200,7 @@ async def email_send_html(
             "error_type": "outbound_disallowed",
         }
 
-    if not all_recipients:
+    if not all_recipients and reply_to is None:
         return {
             "success": False,
             "error": "email_send_html: no recipients specified",
@@ -3126,17 +3208,25 @@ async def email_send_html(
         }
 
     # Elicitation / rate-limit gate (same pattern as other send tools).
+    # Reply mode with no explicit recipients defers the allowlist check to
+    # the connector, which reads Mail's DERIVED recipients back from the
+    # outgoing-message model and hard-gates those (off-list → verified
+    # discard + outbound_disallowed). Explicit recipients are checked
+    # here too for a cheap fail-fast; the connector re-gates the final
+    # post-override set regardless.
     from .outbound_allowlist import assert_recipients_allowed_for_send
-    try:
-        assert_recipients_allowed_for_send(to, cc_list or None, bcc_list or None)
-    except Exception as e:
-        handled = _draft_action_error("email_send_html", e)
-        if handled is not None:
-            return handled
-        return {"success": False, "error": str(e), "error_type": "unknown"}
+    if all_recipients:
+        try:
+            assert_recipients_allowed_for_send(to, cc_list or None, bcc_list or None)
+        except Exception as e:
+            handled = _draft_action_error("email_send_html", e)
+            if handled is not None:
+                return handled
+            return {"success": False, "error": str(e), "error_type": "unknown"}
 
     summary = _build_draft_send_summary(
-        "new", to, cc_list or None, bcc_list or None, subject, body
+        "reply" if reply_to is not None else "new",
+        to, cc_list or None, bcc_list or None, subject, body,
     )
     gate_err = await _run_send_now_gates(
         operation="email_send_html",
@@ -3157,6 +3247,7 @@ async def email_send_html(
             subject=subject,
             body=body,
             from_account=from_account,
+            reply_to=reply_to,
         )
         operation_logger.log_operation(
             "email_send_html",

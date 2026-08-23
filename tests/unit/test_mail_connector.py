@@ -5059,14 +5059,16 @@ class TestCreateDraft:
         # Step 1: open compose window via mailto: URL handler.
         assert "open location" in script
         assert "mailto:" in script
-        # Step 2: close and save as draft.
-        assert "close targetWin saving yes" in script
-        # Step 3: find draft across all accounts and reopen.
-        assert 'mailbox "Drafts" of acct' in script
-        assert "open targetMsg" in script
-        # Step 4: System Events click Send button.
+        # Step 2: compose window resolved BY NAME with a bounded poll.
+        assert "exists window composeName" in script
+        # Step 3: verified Send directly from the live mailto window —
+        # the old close-saving-yes → reopen-draft dance is gone (the close
+        # failed silently, leaving Send permanently disabled; see
+        # docs/reference/UI_GROUNDING_MAIL_SEND.md).
         assert 'description is "Send"' in script
         assert "click sendBtn" in script
+        assert "close targetWin saving yes" not in script
+        assert "open targetMsg" not in script
         # Never uses the blockquote-injecting AppleScript compose path.
         assert "make new outgoing message" not in script
         assert "set content of" not in script
@@ -6042,8 +6044,42 @@ class TestDeleteMailbox:
         mock_imap_cls.assert_not_called()
 
 
+def _run_html_flow(
+    connector: AppleMailConnector,
+    *,
+    body: str = "<p>Hi there probe</p>",
+    subject: str = "Hello",
+) -> list[str]:
+    """Drive the fresh HTML flow with a well-behaved mock and return the
+    captured scripts: [open-mailto, paste, read-back, verified-send]."""
+    snippet, _ = AppleMailConnector._paste_probe_strings(body)
+    captured: list[str] = []
+    outcomes = ["OPENED", "PASTED_UNVERIFIED", f"padding {snippet} padding", "SENT"]
+
+    def fake_run(script: str) -> str:
+        captured.append(script)
+        return outcomes[min(len(captured) - 1, len(outcomes) - 1)]
+
+    connector._run_applescript = fake_run  # type: ignore[method-assign]
+    result = connector._send_html_email(
+        to=["test@example.com"],
+        cc=None,
+        bcc=None,
+        subject=subject,
+        body=body,
+        from_account=None,
+    )
+    assert result == {"draft_id": "", "sent_message_id": ""}
+    return captured
+
+
 class TestSendHtmlEmail:
-    """Tests for AppleMailConnector._send_html_email."""
+    """Tests for AppleMailConnector._send_html_email (fresh mode).
+
+    The flow is FOUR osascript invocations: open mailto → verified paste
+    → read-back (fresh process — same-process AX reads are stale after a
+    WebKit re-render) → verified send.
+    """
 
     @pytest.fixture
     def connector(self) -> AppleMailConnector:
@@ -6052,41 +6088,29 @@ class TestSendHtmlEmail:
     def test_html_send_uses_clipboard_path(
         self, connector: AppleMailConnector
     ) -> None:
-        """Happy path: mock _run_applescript returning SENT. Verify the
-        generated script contains the clipboard-injection landmarks and
-        does NOT contain draft-save primitives."""
-        captured: list[str] = []
-
-        def fake_run(script: str) -> str:
-            captured.append(script)
-            return "SENT"
-
-        connector._run_applescript = fake_run  # type: ignore[method-assign]
-        result = connector._send_html_email(
-            to=["test@example.com"],
-            cc=None,
-            bcc=None,
-            subject="Hello",
-            body="<p>Hi</p>",
-            from_account=None,
-        )
-        assert result == {"draft_id": "", "sent_message_id": ""}
-        assert len(captured) == 1
-        script = captured[0]
-        # Clipboard-inject landmarks
-        assert "public.html" in script
-        assert "Make Rich Text" in script
-        assert "AXWebArea" in script
-        assert "click sendBtn" in script
-        # Must NOT use the draft-save path
-        assert "close" not in script
-        assert "saving yes" not in script
+        scripts = _run_html_flow(connector)
+        assert len(scripts) == 4
+        open_s, paste_s, readback_s, send_s = scripts
+        assert "open location" in open_s
+        # Clipboard-inject landmarks live in the paste script.
+        assert "public.html" in paste_s
+        assert "Make Rich Text" in paste_s
+        assert "AXWebArea" in paste_s
+        assert "click sendBtn" in send_s
+        # Must NOT use the draft-save path anywhere.
+        assert all("saving yes" not in s for s in scripts)
 
     def test_html_send_no_body_area_raises(
         self, connector: AppleMailConnector
     ) -> None:
-        """NO_BODY_AREA result → MailAppleScriptError."""
-        connector._run_applescript = lambda _: "NO_BODY_AREA"  # type: ignore[method-assign]
+        """NO_BODY_AREA from the paste step → MailAppleScriptError."""
+        captured: list[str] = []
+
+        def fake_run(script: str) -> str:
+            captured.append(script)
+            return "OPENED" if len(captured) == 1 else "NO_BODY_AREA:x"
+
+        connector._run_applescript = fake_run  # type: ignore[method-assign]
         with pytest.raises(MailAppleScriptError, match="NO_BODY_AREA"):
             connector._send_html_email(
                 to=["test@example.com"],
@@ -6121,31 +6145,41 @@ class TestSendHtmlEmail:
         self, connector: AppleMailConnector
     ) -> None:
         """Subject with special characters is URL-encoded in the mailto: URL."""
-        captured: list[str] = []
-
-        def fake_run(script: str) -> str:
-            captured.append(script)
-            return "SENT"
-
-        connector._run_applescript = fake_run  # type: ignore[method-assign]
-        connector._send_html_email(
-            to=["test@example.com"],
-            cc=None,
-            bcc=None,
-            subject="Hello World & <Test>",
-            body="<p>body</p>",
-            from_account=None,
-        )
-        script = captured[0]
-        # URL-encoded subject should appear; raw ampersand should not be
-        # in the mailto: URL portion
-        assert "Hello%20World" in script or "Hello+World" in script or "%26" in script
+        scripts = _run_html_flow(connector, subject="Hello World & <Test>")
+        open_s = scripts[0]
+        assert "Hello%20World" in open_s or "Hello+World" in open_s or "%26" in open_s
 
     def test_html_send_escapes_body(
         self, connector: AppleMailConnector
     ) -> None:
         """Body with AppleScript-special characters (quotes, backslashes) is
-        escaped before interpolation so the script remains valid."""
+        escaped before interpolation so the paste script remains valid."""
+        scripts = _run_html_flow(
+            connector, body='<p>He said "hello" and back\\slash probe</p>'
+        )
+        paste_s = scripts[1]
+        assert '\\"' in paste_s or "\\\\back" in paste_s
+
+
+class TestVerifiedSendPrimitives:
+    """Phase 0 of PLAN-html-reply-send: every UI action in the send paths
+    gets a mechanical read-back (docs/reference/UI_GROUNDING_MAIL_SEND.md).
+
+    Contract for BOTH `_send_new_via_eml` and `_send_html_email` scripts:
+      - PRE: Send button resolved on a window found BY NAME (never a bare
+        `window 1`), existence checked, and `enabled` checked — clicking a
+        disabled button is a silent no-op (the 2026-07-20 vanished send).
+      - ACT: click by AX reference.
+      - POST: poll until compose window is gone AND the message appears in
+        the sent mailbox; a sheet mid-flight surfaces its static texts.
+      - All non-SENT sentinels raise MailAppleScriptError with the detail.
+    """
+
+    @pytest.fixture
+    def connector(self) -> AppleMailConnector:
+        return AppleMailConnector(timeout=30)
+
+    def _mailto_script(self, connector: AppleMailConnector) -> str:
         captured: list[str] = []
 
         def fake_run(script: str) -> str:
@@ -6153,15 +6187,429 @@ class TestSendHtmlEmail:
             return "SENT"
 
         connector._run_applescript = fake_run  # type: ignore[method-assign]
-        connector._send_html_email(
+        connector.create_draft(
+            seed="new",
             to=["test@example.com"],
+            subject="Probe",
+            body="x",
+            send_now=True,
+        )
+        return captured[0]
+
+    def _html_scripts(self, connector: AppleMailConnector) -> list[str]:
+        """Captured scripts for the fresh HTML flow:
+        [open-mailto, paste, read-back, verified-send]."""
+        return _run_html_flow(connector)
+
+    # -- precondition: send-enabled check, window by name ------------------
+
+    def test_mailto_script_checks_send_enabled(
+        self, connector: AppleMailConnector
+    ) -> None:
+        script = self._mailto_script(connector)
+        assert "enabled of sendBtn" in script
+        assert "SEND_DISABLED" in script
+
+    def test_html_script_checks_send_enabled(
+        self, connector: AppleMailConnector
+    ) -> None:
+        send_s = self._html_scripts(connector)[-1]
+        assert "enabled of sendBtn" in send_s
+        assert "SEND_DISABLED" in send_s
+
+    def test_html_script_resolves_window_by_name(
+        self, connector: AppleMailConnector
+    ) -> None:
+        """The HTML path may not act on a bare `window 1` — the compose
+        window is resolved by its name (= subject) in every script."""
+        for script in self._html_scripts(connector):
+            assert "set w to window 1" not in script
+
+    # -- postcondition: window gone + sent copy, sheet surfacing -----------
+
+    def test_mailto_script_verifies_dispatch(
+        self, connector: AppleMailConnector
+    ) -> None:
+        script = self._mailto_script(connector)
+        assert "sent mailbox" in script
+        assert "POSTCONDITION_TIMEOUT" in script
+        assert "SHEET:" in script
+
+    def test_html_script_verifies_dispatch(
+        self, connector: AppleMailConnector
+    ) -> None:
+        send_s = self._html_scripts(connector)[-1]
+        assert "sent mailbox" in send_s
+        assert "POSTCONDITION_TIMEOUT" in send_s
+        assert "SHEET:" in send_s
+
+    # -- paste read-back (2026-07-22 raw-<p> regression) -------------------
+
+    def test_html_paste_script_verifies_focus(
+        self, connector: AppleMailConnector
+    ) -> None:
+        """Focus is SET and VERIFIED (a click can leave focus in the To
+        field, sending cmd+v to the wrong control)."""
+        paste_s = self._html_scripts(connector)[1]
+        assert "set focused of bodyArea to true" in paste_s
+        assert "AXFocusedUIElement" in paste_s
+        assert "PASTE_FOCUS_FAILED" in paste_s
+
+    def test_html_readback_runs_in_fresh_process_and_gates_send(
+        self, connector: AppleMailConnector
+    ) -> None:
+        """A bad read-back (raw source visible = paste degraded to
+        literal text) must retry once then raise PASTE_FAILED WITHOUT
+        ever running the send script — shipping without this sent
+        literal <p> tags on 2026-07-21."""
+        body = "<p>Hi there probe</p>"
+        captured: list[str] = []
+
+        def fake_run(script: str) -> str:
+            captured.append(script)
+            n = len(captured)
+            if n == 1:
+                return "OPENED"
+            if n in (2, 4):  # paste attempts
+                return "PASTED_UNVERIFIED"
+            return "<p>Hi there probe</p>"  # read-back sees RAW source
+
+        connector._run_applescript = fake_run  # type: ignore[method-assign]
+        with pytest.raises(MailAppleScriptError, match="PASTE_FAILED"):
+            connector._send_html_email(
+                to=["test@example.com"],
+                cc=None,
+                bcc=None,
+                subject="Probe",
+                body=body,
+                from_account=None,
+            )
+        # open, paste, readback, retry-paste (with undo), retry-readback,
+        # salvage-to-draft — and NO send script.
+        assert len(captured) == 6
+        assert 'keystroke "z" using command down' in captured[3]
+        # Headless policy: the failed compose window is salvaged to
+        # Drafts (close → Save), never left open.
+        assert 'button "Save"' in captured[5]
+        assert all("click sendBtn" not in s for s in captured)
+
+    def test_paste_probe_strings(self) -> None:
+        snippet, raw = AppleMailConnector._paste_probe_strings(
+            "<p>Hello <b>world</b> of probes</p>"
+        )
+        assert snippet.startswith("Hello world")
+        assert "<" not in snippet
+        assert raw.startswith("<p>Hello ") and len(raw) == 16
+        # Text-led body: no raw marker (nothing tag-like to detect).
+        _, raw2 = AppleMailConnector._paste_probe_strings("plain text body")
+        assert raw2 == ""
+
+    # -- clipboard restore must survive AppleScript errors -----------------
+
+    def test_html_paste_script_restores_clipboard_on_error(
+        self, connector: AppleMailConnector
+    ) -> None:
+        """The paste script is wrapped so a mid-script error still restores
+        the user's clipboard before the error propagates; the success path
+        restores IMMEDIATELY after the paste (shortest possible hold)."""
+        paste_s = self._html_scripts(connector)[1]
+        assert "on error" in paste_s
+        # restore loop appears at least twice: success path + error path
+        assert paste_s.count("repeat with pair in savedPairs") >= 2
+
+    # -- sentinel → exception mapping --------------------------------------
+
+    @pytest.mark.parametrize(
+        "sentinel",
+        ["SEND_DISABLED", "SHEET:Save this message as a draft?",
+         "POSTCONDITION_TIMEOUT:window still open"],
+    )
+    def test_mailto_sentinels_raise_with_detail(
+        self, connector: AppleMailConnector, sentinel: str
+    ) -> None:
+        connector._run_applescript = lambda _: sentinel  # type: ignore[method-assign]
+        with pytest.raises(MailAppleScriptError) as exc:
+            connector.create_draft(
+                seed="new",
+                to=["test@example.com"],
+                subject="Probe",
+                body="x",
+                send_now=True,
+            )
+        assert sentinel.split(":")[0] in str(exc.value)
+
+    @pytest.mark.parametrize(
+        "sentinel",
+        ["SEND_DISABLED", "SHEET:Save this message as a draft?",
+         "POSTCONDITION_TIMEOUT:window still open"],
+    )
+    def test_html_sentinels_raise_with_detail(
+        self, connector: AppleMailConnector, sentinel: str
+    ) -> None:
+        """Verified-send sentinels from the send script surface as errors."""
+        body = "<p>Hi there probe</p>"
+        snippet, _ = AppleMailConnector._paste_probe_strings(body)
+        outcomes = ["OPENED", "PASTED_UNVERIFIED", f"x {snippet} x", sentinel]
+        calls: list[str] = []
+
+        def fake_run(script: str) -> str:
+            calls.append(script)
+            return outcomes[min(len(calls) - 1, len(outcomes) - 1)]
+
+        connector._run_applescript = fake_run  # type: ignore[method-assign]
+        with pytest.raises(MailAppleScriptError) as exc:
+            connector._send_html_email(
+                to=["test@example.com"],
+                cc=None,
+                bcc=None,
+                subject="Probe",
+                body=body,
+                from_account=None,
+            )
+        assert sentinel.split(":")[0] in str(exc.value)
+
+    # -- discard primitive (used on gate-abort in later phases) ------------
+
+    def test_discard_block_uses_curly_apostrophe_and_verifies(
+        self, connector: AppleMailConnector
+    ) -> None:
+        """`Don’t Save` carries U+2019 (a straight quote never matches) and
+        the block must verify the window actually closed — both Mail-
+        dictionary discard routes fail silently (grounding report)."""
+        block = connector._as_discard_compose_block("targetName")
+        assert "Don’t Save" in block
+        assert "DISCARD_FAILED" in block
+
+
+class TestMailAutomationLock:
+    """Cross-process serialization of Mail automation (2026-07-23).
+
+    Multiple agent sessions each spawn their own MCP server; concurrent
+    AppleScript against Mail.app collides into AppleEvent timeouts
+    (-1712) and invalid connections (-609). A file lock under
+    APPLE_MAIL_MCP_HOME queues callers instead, and a caller that cannot
+    acquire the lock in time gets a CLEAR busy error instead of
+    AppleEvent garbage.
+    """
+
+    def test_lock_file_created_under_home(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: object
+    ) -> None:
+        from pathlib import Path
+        from unittest.mock import MagicMock, patch
+
+        monkeypatch.setenv("APPLE_MAIL_MCP_HOME", str(tmp_path))
+        connector = AppleMailConnector(timeout=5)
+        fake = MagicMock()
+        fake.returncode = 0
+        fake.stdout = "ok"
+        with patch("subprocess.run", return_value=fake):
+            assert connector._run_applescript("return 1") == "ok"
+        assert (Path(str(tmp_path)) / "mail_automation.lock").exists()
+
+    def test_lock_contention_raises_clear_busy_error(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: object
+    ) -> None:
+        """Another PROCESS holding the lock → MailAppleScriptError naming
+        the busy condition (never reaches osascript)."""
+        import subprocess as sp
+        import sys
+        import time as time_mod
+        from pathlib import Path
+        from unittest.mock import patch
+
+        monkeypatch.setenv("APPLE_MAIL_MCP_HOME", str(tmp_path))
+        lock_path = Path(str(tmp_path)) / "mail_automation.lock"
+        holder = sp.Popen(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import fcntl,sys,time\n"
+                    f"fh=open({str(lock_path)!r},'w')\n"
+                    "fcntl.flock(fh, fcntl.LOCK_EX)\n"
+                    "print('held',flush=True)\n"
+                    "time.sleep(10)\n"
+                ),
+            ],
+            stdout=sp.PIPE,
+            text=True,
+        )
+        try:
+            assert holder.stdout is not None
+            assert holder.stdout.readline().strip() == "held"
+            connector = AppleMailConnector(timeout=5, lock_timeout=0.5)
+            start = time_mod.monotonic()
+            with patch("subprocess.run") as mock_run, pytest.raises(
+                MailAppleScriptError, match="busy"
+            ):
+                connector._run_applescript("return 1")
+            assert mock_run.call_count == 0, "osascript must not run without the lock"
+            assert time_mod.monotonic() - start < 5
+        finally:
+            holder.kill()
+            holder.wait()
+
+
+class TestSendHtmlReply:
+    """Phases 1–3 of PLAN-html-reply-send: HTML replies via
+    ``_send_html_email(reply_to=...)``.
+
+    Flow contract (two scripts + Python policy gate between them):
+      A. open the reply compose window (`reply origMsg opening window true`),
+         identify it by window-set diff, apply recipient overrides at the
+         scripting-dictionary level, return {window, subject, to, cc} JSON.
+      B. inject HTML above Mail's auto-quote (cmd+up before paste) and run
+         the verified-send block.
+    The outbound allowlist gate runs in Python on the recipients script A
+    read back from the outgoing-message MODEL (not UI pills). Off-list →
+    hard fail, discard the compose window, send nothing. No exceptions.
+    """
+
+    @pytest.fixture
+    def connector(self) -> AppleMailConnector:
+        return AppleMailConnector(timeout=30)
+
+    _REPLY_META = (
+        '{"window": "Re: Probe", "subject": "Re: Probe", '
+        '"to": ["jonah@tg-techie.com"], "cc": []}'
+    )
+
+    def _run_reply(
+        self,
+        connector: AppleMailConnector,
+        *,
+        meta: str | None = None,
+        to: list[str] | None = None,
+        subject: str = "",
+    ) -> list[str]:
+        scripts: list[str] = []
+        outcomes = [
+            meta or self._REPLY_META,
+            "PASTED_UNVERIFIED",
+            "padding reply body padding",  # read-back sees the pasted text
+            "SENT",
+        ]
+
+        def fake_run(script: str) -> str:
+            scripts.append(script)
+            return outcomes[min(len(scripts) - 1, len(outcomes) - 1)]
+
+        connector._run_applescript = fake_run  # type: ignore[method-assign]
+        connector._send_html_email(
+            to=to or [],
             cc=None,
             bcc=None,
-            subject="Test",
-            body='<p>He said "hello" and back\\slash</p>',
+            subject=subject,
+            body="<p>reply body</p>",
             from_account=None,
+            reply_to="12345",
         )
-        script = captured[0]
-        # Verify escaped forms appear; raw unescaped double-quote
-        # inside the AppleScript string would break the interpolation
-        assert '\\"' in script or "\\\\back" in script
+        return scripts
+
+    def test_reply_flow_opens_reply_window_and_reads_model(
+        self, connector: AppleMailConnector
+    ) -> None:
+        scripts = self._run_reply(connector)
+        # meta, paste, read-back (fresh process), verified send.
+        assert len(scripts) == 4
+        script_a = scripts[0]
+        # Cross-account id lookup + reply verb with a VISIBLE window.
+        assert 'whose id is "12345"' in script_a
+        assert "reply origMsg opening window true" in script_a
+        # Window identified by set-diff, not by guessed subject.
+        assert "beforeNames" in script_a
+        # Recipients read from the outgoing-message model, not UI pills.
+        assert "address of to recipients" in script_a
+
+    def test_reply_flow_pastes_above_quote_and_verifies_send(
+        self, connector: AppleMailConnector
+    ) -> None:
+        scripts = self._run_reply(connector)
+        paste_s, send_s = scripts[1], scripts[3]
+        # cmd+up puts the caret above Mail's auto-quoted original.
+        assert "key code 126 using command down" in paste_s
+        assert 'keystroke "v" using command down' in paste_s
+        # Verified-send landmarks (Phase 0 primitives).
+        assert "enabled of sendBtn" in send_s
+        assert "sent mailbox" in send_s
+
+    def test_reply_off_list_recipient_hard_fails_and_discards(
+        self, connector: AppleMailConnector
+    ) -> None:
+        """Derived recipients off the allowlist → MailOutboundDisallowedError,
+        compose window discarded, HTML never pasted, nothing sent."""
+        from apple_mail_mcp.exceptions import MailOutboundDisallowedError
+
+        scripts: list[str] = []
+        meta = (
+            '{"window": "Re: Probe", "subject": "Re: Probe", '
+            '"to": ["evil@other.com"], "cc": []}'
+        )
+
+        def fake_run(script: str) -> str:
+            scripts.append(script)
+            return meta if len(scripts) == 1 else "DISCARDED"
+
+        connector._run_applescript = fake_run  # type: ignore[method-assign]
+        with pytest.raises(MailOutboundDisallowedError, match="evil@other.com"):
+            connector._send_html_email(
+                to=[],
+                cc=None,
+                bcc=None,
+                subject="",
+                body="<p>x</p>",
+                from_account=None,
+                reply_to="12345",
+            )
+        # Script 2 must be the discard, and no paste/send script ever ran.
+        assert len(scripts) == 2
+        assert "AXCloseButton" in scripts[1]
+        assert all('keystroke "v"' not in s for s in scripts)
+
+    def test_reply_recipient_override_applied_in_model(
+        self, connector: AppleMailConnector
+    ) -> None:
+        """Explicit to= replaces Mail's derived recipients at the
+        scripting-dictionary level (reply-all = caller passes the full
+        participant list explicitly; there is no reply_all parameter)."""
+        meta = (
+            '{"window": "Re: Probe", "subject": "Re: Probe", '
+            '"to": ["jonah@tg-techie.com", "other@tg-techie.com"], "cc": []}'
+        )
+        scripts = self._run_reply(
+            connector, meta=meta,
+            to=["jonah@tg-techie.com", "other@tg-techie.com"],
+        )
+        script_a = scripts[0]
+        assert "delete (every to recipient of replyMsg)" in script_a
+        assert "other@tg-techie.com" in script_a
+
+    def test_reply_gate_uses_post_override_recipients(
+        self, connector: AppleMailConnector
+    ) -> None:
+        """The gate judges what script A read back AFTER overrides — an
+        off-list override is caught even though the caller supplied it."""
+        from apple_mail_mcp.exceptions import MailOutboundDisallowedError
+
+        meta = (
+            '{"window": "Re: Probe", "subject": "Re: Probe", '
+            '"to": ["evil@other.com"], "cc": []}'
+        )
+        scripts: list[str] = []
+
+        def fake_run(script: str) -> str:
+            scripts.append(script)
+            return meta if len(scripts) == 1 else "DISCARDED"
+
+        connector._run_applescript = fake_run  # type: ignore[method-assign]
+        with pytest.raises(MailOutboundDisallowedError):
+            connector._send_html_email(
+                to=["evil@other.com"],
+                cc=None,
+                bcc=None,
+                subject="",
+                body="<p>x</p>",
+                from_account=None,
+                reply_to="12345",
+            )
