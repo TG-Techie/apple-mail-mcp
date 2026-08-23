@@ -25,8 +25,10 @@ class TestGetAttachments:
     ) -> None:
         """Test listing attachments from a message."""
         mock_run.return_value = (
-            '[{"name":"document.pdf","mime_type":"application/pdf","size":524288,"downloaded":true},'
-            '{"name":"image.jpg","mime_type":"image/jpeg","size":102400,"downloaded":true}]'
+            '{"attachments":['
+            '{"name":"document.pdf","mime_type":"application/pdf","size":524288,"downloaded":true},'
+            '{"name":"image.jpg","mime_type":"image/jpeg","size":102400,"downloaded":true}'
+            '],"warnings":[]}'
         )
 
         result = connector.get_attachments("12345")
@@ -42,7 +44,7 @@ class TestGetAttachments:
         self, mock_run: MagicMock, connector: AppleMailConnector
     ) -> None:
         """Test getting attachments from message with none."""
-        mock_run.return_value = "[]"
+        mock_run.return_value = '{"attachments":[],"warnings":[]}'
 
         result = connector.get_attachments("12345")
 
@@ -53,7 +55,8 @@ class TestGetAttachments:
         self, mock_run: MagicMock, connector: AppleMailConnector
     ) -> None:
         mock_run.return_value = (
-            '[{"name":"q1|q2.pdf","mime_type":"application/pdf","size":1000,"downloaded":true}]'
+            '{"attachments":[{"name":"q1|q2.pdf","mime_type":"application/pdf",'
+            '"size":1000,"downloaded":true}],"warnings":[]}'
         )
         result = connector.get_attachments("12345")
         assert result[0]["name"] == "q1|q2.pdf"
@@ -73,7 +76,7 @@ class TestGetAttachments:
         self, mock_run: MagicMock, connector: AppleMailConnector
     ) -> None:
         """The AppleScript must use |name| so NSJSONSerialization preserves it."""
-        mock_run.return_value = "[]"
+        mock_run.return_value = '{"attachments":[],"warnings":[]}'
         connector.get_attachments("12345")
         script = mock_run.call_args[0][0]
         assert "|name|:(name of att)" in script
@@ -87,7 +90,7 @@ class TestGetAttachments:
         AppleScript record key `size:` collides with NSSize/NSObject selectors
         and gets stripped during NSDictionary conversion. Must be `|size|:`.
         """
-        mock_run.return_value = "[]"
+        mock_run.return_value = '{"attachments":[],"warnings":[]}'
         connector.get_attachments("msg-1")
         script = mock_run.call_args[0][0]
         assert "|size|:(file size of att)" in script
@@ -106,8 +109,19 @@ class TestSaveAttachments:
     def test_save_single_attachment(
         self, mock_run: MagicMock, connector: AppleMailConnector, tmp_path: Path
     ) -> None:
-        """Test saving a single attachment."""
-        mock_run.return_value = "1"
+        """Test saving a single attachment.
+
+        Two-pass contract: pass 1 enumerates metadata (record with
+        ``attachments``/``warnings``), pass 2 saves by 1-based index and
+        returns the saved count. ``save_attachments`` returns
+        ``(count, warnings)``.
+        """
+        mock_run.side_effect = [
+            '{"attachments":[{"name":"document.pdf",'
+            '"mime_type":"application/pdf","size":1000,"downloaded":true}],'
+            '"warnings":[]}',
+            "1",
+        ]
 
         result = connector.save_attachments(
             message_id="12345",
@@ -115,23 +129,33 @@ class TestSaveAttachments:
             attachment_indices=[0]
         )
 
-        assert result == 1
+        assert result == (1, [])
+        # Last call is the pass-2 save script, which carries the directory.
         call_args = mock_run.call_args[0][0]
         assert str(tmp_path) in call_args
+        assert "items {1} of mail attachments" in call_args
 
     @patch.object(AppleMailConnector, "_run_applescript")
     def test_save_all_attachments(
         self, mock_run: MagicMock, connector: AppleMailConnector, tmp_path: Path
     ) -> None:
         """Test saving all attachments from a message."""
-        mock_run.return_value = "3"
+        mock_run.side_effect = [
+            '{"attachments":['
+            '{"name":"a.pdf","mime_type":"application/pdf","size":1,"downloaded":true},'
+            '{"name":"b.pdf","mime_type":"application/pdf","size":2,"downloaded":true},'
+            '{"name":"c.pdf","mime_type":"application/pdf","size":3,"downloaded":true}'
+            '],"warnings":[]}',
+            "3",
+        ]
 
         result = connector.save_attachments(
             message_id="12345",
             save_directory=tmp_path
         )
 
-        assert result == 3
+        assert result == (3, [])
+        assert "items {1, 2, 3} of mail attachments" in mock_run.call_args[0][0]
 
     def test_save_to_invalid_directory(self, connector: AppleMailConnector) -> None:
         """Test error when save directory is invalid."""

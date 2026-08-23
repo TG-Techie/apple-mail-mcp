@@ -3768,7 +3768,7 @@ class TestAppleMailConnector:
     ) -> None:
         """Smoke test: existing callers passing only message_id still work,
         going through the AppleScript path unchanged."""
-        mock_run.return_value = '[]'
+        mock_run.return_value = '{"attachments":[],"warnings":[]}'
         result = connector.get_attachments("x")
         assert result == []
 
@@ -4474,12 +4474,17 @@ class TestBulkOpsSourceMailbox:
 
 
 class TestWhoseIdQuoting:
-    """Regression guards for #86: `whose id is X` must wrap X in quotes
-    even when X is already escape_applescript_string'd.
+    """Regression guards for #86: the id in a `whose ... is X` clause must
+    be wrapped in quotes even when X is already escape_applescript_string'd.
 
     Without quotes, AppleScript chokes on UUID-style ids like
     'CF7C3761-...@icloud.com' because the dashes/dots/@ get parsed as
     syntax (dash = subtraction, @ = bare identifier, etc.).
+
+    Which PROPERTY is matched depends on the id form: an all-digit id is
+    Mail's internal integer `id`, anything else is an RFC 5322 `message id`
+    and is angle-bracketed. Both forms must be quoted — that is the
+    invariant these tests pin.
     """
 
     @pytest.fixture
@@ -4494,35 +4499,50 @@ class TestWhoseIdQuoting:
         uuid_id = "CF7C3761-C190-40BA-B94E-3EBC321980ED@icloud.com"
         connector.get_message(uuid_id, include_content=False)
         script = mock_run.call_args[0][0]
-        assert f'whose id is "{uuid_id}"' in script
+        assert f'whose message id is "<{uuid_id}>"' in script
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_get_message_quotes_numeric_id_in_whose(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        """All-digit ids match Mail's integer `id` — still quoted."""
+        mock_run.return_value = '{"id":"x","subject":"s","sender":"","date_received":"","read_status":false,"flagged":false,"content":""}'
+        connector.get_message("12345", include_content=False)
+        script = mock_run.call_args[0][0]
+        assert 'whose id is "12345"' in script
 
     @patch.object(AppleMailConnector, "_run_applescript")
     def test_get_attachments_quotes_id_in_whose(
         self, mock_run: MagicMock, connector: AppleMailConnector
     ) -> None:
-        mock_run.return_value = "[]"
+        mock_run.return_value = '{"attachments":[],"warnings":[]}'
         uuid_id = "CF7C3761-C190-40BA-B94E-3EBC321980ED@icloud.com"
         connector.get_attachments(uuid_id)
         script = mock_run.call_args[0][0]
-        assert f'whose id is "{uuid_id}"' in script
+        assert f'whose message id is "<{uuid_id}>"' in script
 
     @patch.object(AppleMailConnector, "_run_applescript")
     def test_save_attachments_quotes_id_in_whose(
         self, mock_run: MagicMock, connector: AppleMailConnector
     ) -> None:
-        mock_run.return_value = "[]"
         uuid_id = "CF7C3761-C190-40BA-B94E-3EBC321980ED@icloud.com"
+        # Pass 1 enumerates, pass 2 saves; both must quote the id.
+        mock_run.side_effect = [
+            '{"attachments":[{"name":"a.pdf","mime_type":"application/pdf",'
+            '"size":1,"downloaded":true}],"warnings":[]}',
+            "1",
+        ]
         # save_attachments takes a Path (uses .exists()).
         import tempfile
         from pathlib import Path
         with tempfile.TemporaryDirectory() as td:
             connector.save_attachments(uuid_id, Path(td))
-        # Multiple AppleScript calls may happen; check at least one
-        # contained the quoted-id pattern.
+        # Both passes re-locate the message; every one must quote the id.
         scripts = [c[0][0] for c in mock_run.call_args_list]
-        assert any(f'whose id is "{uuid_id}"' in s for s in scripts), (
-            f"expected quoted id in one of the scripts: {scripts}"
-        )
+        assert len(scripts) == 2, f"expected 2 passes, got {len(scripts)}"
+        assert all(
+            f'whose message id is "<{uuid_id}>"' in s for s in scripts
+        ), f"expected quoted id in every script: {scripts}"
 
 
 class TestWrapAsJsonScript:

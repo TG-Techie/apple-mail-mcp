@@ -1689,14 +1689,35 @@ class TestSaveAttachments:
     def test_success_returns_saved_count(
         self, mock_mail: MagicMock, mock_logger: MagicMock, tmp_path: Any
     ) -> None:
-        mock_mail.save_attachments.return_value = 2
+        mock_mail.save_attachments.return_value = (2, [])
 
         result = save_attachments("1", str(tmp_path))
 
         assert result["success"] is True
         assert result["saved"] == 2
         assert result["directory"] == str(tmp_path)
+        # No warnings from the connector -> no warnings key in the response.
+        assert "warnings" not in result
         mock_logger.log_operation.assert_called_once()
+
+    def test_connector_warnings_surface_in_response(
+        self, mock_mail: MagicMock, mock_logger: MagicMock, tmp_path: Any
+    ) -> None:
+        """NO SILENT ERRORS: a degraded enumeration (Mail.app -10000) saves
+        nothing, and the reason must reach the caller rather than looking
+        like a message that simply had no attachments."""
+        mock_mail.save_attachments.return_value = (
+            0,
+            ["attachment enumeration failed for message 1: ... (error -10000)"],
+        )
+
+        result = save_attachments("1", str(tmp_path))
+
+        assert result["success"] is True
+        assert result["saved"] == 0
+        assert result["warnings"] == [
+            "attachment enumeration failed for message 1: ... (error -10000)"
+        ]
 
     def test_directory_not_found(
         self, mock_mail: MagicMock, mock_logger: MagicMock, tmp_path: Any
