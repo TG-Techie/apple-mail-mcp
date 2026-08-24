@@ -2211,11 +2211,56 @@ def _fresh_send_attachment_guard(
         "error": (
             "auto-send of a fresh draft with attachments is not "
             "supported — the mailto: dispatch path cannot carry "
-            "attachments. The draft is unchanged. Open Mail.app and "
-            "press Send manually, or send without attachments."
+            "attachments. The draft is unchanged. Use email_send_html "
+            "with attachment_paths (attachments ARE supported there), "
+            "open Mail.app and press Send manually, or send without "
+            "attachments."
         ),
         "error_type": "attachments_unsupported",
     }
+
+
+def _validate_html_send_attachments(
+    attachment_paths: list[str],
+) -> dict[str, Any] | None:
+    """Validate attachment files for email_send_html BEFORE any compose.
+
+    Checks per the security checklist: file exists, extension not in the
+    executable blocklist, size within the 25MB cap. Returns an error
+    response dict, or None when all files pass. (The draft path predates
+    these checks and only verifies existence — see #TODO in TOOLS.md.)
+    """
+    from pathlib import Path as _P
+
+    from .security import validate_attachment_size, validate_attachment_type
+
+    for raw in attachment_paths:
+        path = _P(raw)
+        if not path.is_file():
+            return {
+                "success": False,
+                "error": f"attachment not found: {raw}",
+                "error_type": "file_not_found",
+            }
+        if not validate_attachment_type(path.name):
+            return {
+                "success": False,
+                "error": (
+                    f"attachment type not allowed: {path.name} "
+                    "(executable extensions are blocked)"
+                ),
+                "error_type": "validation_error",
+            }
+        if not validate_attachment_size(path.stat().st_size):
+            return {
+                "success": False,
+                "error": (
+                    f"attachment too large: {path.name} exceeds the "
+                    "25MB limit"
+                ),
+                "error_type": "validation_error",
+            }
+    return None
 
 
 def _resolve_draft_attachments(
@@ -3162,6 +3207,92 @@ async def draft_send(
     )
 
 
+def _validate_html_send_request(
+    *,
+    to: list[str],
+    cc_list: list[str],
+    bcc_list: list[str],
+    subject: str,
+    reply_to: str | None,
+    attachment_paths: list[str],
+    all_recipients: list[str],
+) -> dict[str, Any] | None:
+    """All pre-gate validation for email_send_html: required fields,
+    attachment rules, and the hard outbound-allowlist policy gate (same
+    as draft_send). Returns an error response, or None to proceed.
+
+    Reply mode with no explicit recipients defers the allowlist check to
+    the connector, which reads Mail's DERIVED recipients back from the
+    outgoing-message model and hard-gates those (off-list → verified
+    discard + outbound_disallowed). Explicit recipients are checked here
+    too for a cheap fail-fast; the connector re-gates the final
+    post-override set regardless."""
+    if reply_to is None and not to:
+        return {
+            "success": False,
+            "error": "email_send_html: 'to' is required unless reply_to is given",
+            "error_type": "validation_error",
+        }
+    if reply_to is None and not subject:
+        return {
+            "success": False,
+            "error": "email_send_html: 'subject' is required unless reply_to is given",
+            "error_type": "validation_error",
+        }
+
+    if attachment_paths and reply_to is not None:
+        return {
+            "success": False,
+            "error": (
+                "email_send_html: attachments are not supported on "
+                "replies yet — send them in a fresh message, or save a "
+                "reply draft via draft_create and send manually from "
+                "Mail.app."
+            ),
+            "error_type": "attachments_unsupported",
+        }
+    if attachment_paths:
+        attach_err = _validate_html_send_attachments(attachment_paths)
+        if attach_err:
+            return attach_err
+
+    # Hard allowlist policy gate — same as draft_send.
+    from .outbound_allowlist import disallowed_recipients
+    bad = disallowed_recipients(all_recipients)
+    if bad:
+        logger.warning(
+            "email_send_html blocked — off-list recipients: %s", bad
+        )
+        return {
+            "success": False,
+            "error": (
+                "send blocked — recipients not on outbound allowlist: "
+                + ", ".join(repr(b) for b in bad)
+            ),
+            "error_type": "outbound_disallowed",
+        }
+
+    if not all_recipients and reply_to is None:
+        return {
+            "success": False,
+            "error": "email_send_html: no recipients specified",
+            "error_type": "validation_error",
+        }
+
+    from .outbound_allowlist import assert_recipients_allowed_for_send
+    if all_recipients:
+        try:
+            assert_recipients_allowed_for_send(
+                to, cc_list or None, bcc_list or None
+            )
+        except Exception as e:
+            handled = _draft_action_error("email_send_html", e)
+            if handled is not None:
+                return handled
+            return {"success": False, "error": str(e), "error_type": "unknown"}
+    return None
+
+
 @mcp.tool()
 async def email_send_html(
     to: list[str] = [],  # noqa: B006 — coerced below
@@ -3171,6 +3302,7 @@ async def email_send_html(
     bcc: list[str] = [],  # noqa: B006 — coerced below
     from_account: str | None = None,
     reply_to: str | None = None,
+    attachment_paths: list[str] = [],  # noqa: B006 — coerced below
     ctx: Context | None = None,
 ) -> dict:
     """Send an HTML email directly. Does not save a draft first.
@@ -3205,6 +3337,12 @@ async def email_send_html(
         body: HTML string for the email body.
         cc: Optional CC recipients (replace derived CC when replying).
         bcc: Optional BCC recipients.
+        attachment_paths: Optional file paths to attach (fresh mail only —
+            not supported with ``reply_to`` yet). Files must exist, must
+            not carry executable extensions, and must be under 25MB each.
+            The send is verified end-to-end: each attachment must be
+            visible in the compose window before Send is clicked, and the
+            Sent-mailbox copy is checked for the attachment count.
         from_account: Mail.app account name or UUID. None uses Mail's default.
         reply_to: Message id to reply to. Enables reply mode.
 
@@ -3213,61 +3351,16 @@ async def email_send_html(
     """
     cc_list = cc or []
     bcc_list = bcc or []
-
-    if reply_to is None and not to:
-        return {
-            "success": False,
-            "error": "email_send_html: 'to' is required unless reply_to is given",
-            "error_type": "validation_error",
-        }
-    if reply_to is None and not subject:
-        return {
-            "success": False,
-            "error": "email_send_html: 'subject' is required unless reply_to is given",
-            "error_type": "validation_error",
-        }
-
+    attachment_paths = attachment_paths or []
     all_recipients = list(to) + list(cc_list) + list(bcc_list)
 
-    # Hard allowlist policy gate — same as draft_send.
-    from .outbound_allowlist import disallowed_recipients
-    bad = disallowed_recipients(all_recipients)
-    if bad:
-        logger.warning(
-            "email_send_html blocked — off-list recipients: %s", bad
-        )
-        return {
-            "success": False,
-            "error": (
-                "send blocked — recipients not on outbound allowlist: "
-                + ", ".join(repr(b) for b in bad)
-            ),
-            "error_type": "outbound_disallowed",
-        }
-
-    if not all_recipients and reply_to is None:
-        return {
-            "success": False,
-            "error": "email_send_html: no recipients specified",
-            "error_type": "validation_error",
-        }
-
-    # Elicitation / rate-limit gate (same pattern as other send tools).
-    # Reply mode with no explicit recipients defers the allowlist check to
-    # the connector, which reads Mail's DERIVED recipients back from the
-    # outgoing-message model and hard-gates those (off-list → verified
-    # discard + outbound_disallowed). Explicit recipients are checked
-    # here too for a cheap fail-fast; the connector re-gates the final
-    # post-override set regardless.
-    from .outbound_allowlist import assert_recipients_allowed_for_send
-    if all_recipients:
-        try:
-            assert_recipients_allowed_for_send(to, cc_list or None, bcc_list or None)
-        except Exception as e:
-            handled = _draft_action_error("email_send_html", e)
-            if handled is not None:
-                return handled
-            return {"success": False, "error": str(e), "error_type": "unknown"}
+    err = _validate_html_send_request(
+        to=to, cc_list=cc_list, bcc_list=bcc_list, subject=subject,
+        reply_to=reply_to, attachment_paths=attachment_paths,
+        all_recipients=all_recipients,
+    )
+    if err:
+        return err
 
     summary = _build_draft_send_summary(
         "reply" if reply_to is not None else "new",
@@ -3293,6 +3386,7 @@ async def email_send_html(
             body=body,
             from_account=from_account,
             reply_to=reply_to,
+            attachment_paths=[Path(a) for a in attachment_paths] or None,
         )
         operation_logger.log_operation(
             "email_send_html",

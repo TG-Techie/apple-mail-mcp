@@ -3,6 +3,7 @@
 import logging
 import time
 import warnings
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -6141,11 +6142,12 @@ class TestSendHtmlEmail:
                 from_account=None,
             )
 
-    def test_html_send_with_attachments_raises(
+    def test_html_reply_with_attachments_raises(
         self, connector: AppleMailConnector
     ) -> None:
-        """Passing attachment_paths raises NotImplementedError immediately,
-        before any AppleScript is called."""
+        """reply_to + attachment_paths raises NotImplementedError
+        immediately, before any AppleScript is called. (Fresh sends with
+        attachments are supported — TestSendHtmlWithAttachments.)"""
         from pathlib import Path
         called: list[bool] = []
         connector._run_applescript = lambda _: (called.append(True), "SENT")[1]  # type: ignore[method-assign]
@@ -6157,9 +6159,37 @@ class TestSendHtmlEmail:
                 subject="Hi",
                 body="<p>x</p>",
                 from_account=None,
+                reply_to="12345",
                 attachment_paths=[Path("/tmp/file.pdf")],
             )
-        assert not called, "_run_applescript must not be called when attachments provided"
+        assert not called, "_run_applescript must not be called for reply+attachments"
+
+    def test_html_send_fresh_carries_cc_bcc_in_mailto(
+        self, connector: AppleMailConnector
+    ) -> None:
+        """Regression: the fresh path accepted cc/bcc, allowlist-validated
+        them, then silently dropped them from the mailto: URL — the mail
+        went out WITHOUT the cc/bcc. They must appear in the URL."""
+        captured: list[str] = []
+        snippet, _ = AppleMailConnector._paste_probe_strings("<p>x</p>")
+        outcomes = ["OPENED", "PASTED_UNVERIFIED", f"pad {snippet} pad", "SENT"]
+
+        def fake_run(script: str) -> str:
+            captured.append(script)
+            return outcomes[min(len(captured) - 1, len(outcomes) - 1)]
+
+        connector._run_applescript = fake_run  # type: ignore[method-assign]
+        connector._send_html_email(
+            to=["test@example.com"],
+            cc=["cc1@example.com"],
+            bcc=["bcc1@example.com"],
+            subject="Hi",
+            body="<p>x</p>",
+            from_account=None,
+        )
+        open_s = captured[0]
+        assert "cc=cc1%40example.com" in open_s or "cc=cc1@example.com" in open_s
+        assert "bcc=bcc1%40example.com" in open_s or "bcc=bcc1@example.com" in open_s
 
     def test_html_send_encodes_subject(
         self, connector: AppleMailConnector
@@ -6180,6 +6210,140 @@ class TestSendHtmlEmail:
         paste_s = scripts[1]
         assert '\\"' in paste_s or "\\\\back" in paste_s
 
+
+
+
+class TestSendHtmlWithAttachments:
+    """Fresh HTML send WITH attachments — the `make new outgoing message`
+    compose path (the mailto: URL handler's window is not scriptable, so
+    `make new attachment` cannot target it; verified live 2026-08-24).
+
+    Flow is SIX osascript invocations: compose(+recipients+attachments) →
+    AX attachment verify → paste → read-back → verified send → sent-copy
+    attachment count.
+    """
+
+    @pytest.fixture
+    def connector(self) -> AppleMailConnector:
+        return AppleMailConnector(timeout=30)
+
+    def _drive(
+        self,
+        connector: AppleMailConnector,
+        tmp_path: Path,
+        *,
+        outcomes_override: dict[int, str] | None = None,
+        n_files: int = 1,
+    ) -> tuple[list[str], list[Path], dict[str, str] | None, Exception | None]:
+        files = []
+        for i in range(n_files):
+            f = tmp_path / f"att{i}.txt"
+            f.write_text(f"content {i}")
+            files.append(f)
+        body = "<p>with attachment probe</p>"
+        snippet, _ = AppleMailConnector._paste_probe_strings(body)
+        outcomes = [
+            "COMPOSED",
+            "ATTACHMENTS_VERIFIED",
+            "PASTED_UNVERIFIED",
+            f"pad {snippet} pad",
+            "SENT",
+            str(n_files),
+        ]
+        for idx, val in (outcomes_override or {}).items():
+            outcomes[idx] = val
+        captured: list[str] = []
+
+        def fake_run(script: str) -> str:
+            captured.append(script)
+            return outcomes[min(len(captured) - 1, len(outcomes) - 1)]
+
+        connector._run_applescript = fake_run  # type: ignore[method-assign]
+        result: dict[str, str] | None = None
+        err: Exception | None = None
+        try:
+            result = connector._send_html_email(
+                to=["test@example.com"],
+                cc=["cc1@example.com"],
+                bcc=None,
+                subject="Attached",
+                body=body,
+                from_account=None,
+                attachment_paths=files,
+            )
+        except Exception as e:  # noqa: BLE001
+            err = e
+        return captured, files, result, err
+
+    def test_happy_path_six_scripts(
+        self, connector: AppleMailConnector, tmp_path: Path
+    ) -> None:
+        scripts, files, result, err = self._drive(connector, tmp_path)
+        assert err is None
+        assert result == {"draft_id": "", "sent_message_id": ""}
+        assert len(scripts) == 6
+        compose_s, verify_s, paste_s, readback_s, send_s, count_s = scripts
+        # Compose: scriptable outgoing message, never the mailto handler.
+        assert "make new outgoing message" in compose_s
+        assert "open location" not in compose_s
+        assert "make new attachment" in compose_s
+        assert files[0].resolve().as_posix() in compose_s
+        # Recipients set via the AppleScript model.
+        assert "test@example.com" in compose_s
+        assert "cc1@example.com" in compose_s
+        # NEVER set content — that is the purple-bar mechanism.
+        assert "set content" not in compose_s
+        # AX verify names the file.
+        assert files[0].name in verify_s
+        # Paste path is the shared clipboard-inject machinery.
+        assert "public.html" in paste_s
+        assert "click sendBtn" in send_s
+        # Post-send: sent-copy attachment count read-back.
+        assert "mail attachments" in count_s
+
+    def test_missing_file_raises_before_applescript(
+        self, connector: AppleMailConnector, tmp_path: Path
+    ) -> None:
+        called: list[bool] = []
+        connector._run_applescript = lambda _: (called.append(True), "X")[1]  # type: ignore[method-assign]
+        with pytest.raises(FileNotFoundError):
+            connector._send_html_email(
+                to=["test@example.com"], cc=None, bcc=None,
+                subject="s", body="<p>b</p>", from_account=None,
+                attachment_paths=[tmp_path / "ghost.pdf"],
+            )
+        assert not called
+
+    def test_ax_verify_failure_raises_and_no_send(
+        self, connector: AppleMailConnector, tmp_path: Path
+    ) -> None:
+        """If the attachment never appears in the compose window's AX
+        tree, the send must NOT be attempted (would dispatch without the
+        attachment — a silent failure)."""
+        scripts, _, result, err = self._drive(
+            connector, tmp_path,
+            outcomes_override={1: "ATTACH_MISSING:att0.txt"},
+        )
+        assert result is None
+        assert isinstance(err, MailAppleScriptError)
+        assert "att0.txt" in str(err)
+        # compose + verify + salvage-to-draft — no paste, no send.
+        assert len(scripts) == 3
+        assert "AXCloseButton" in scripts[2]
+
+    def test_sent_copy_attachment_count_mismatch_raises(
+        self, connector: AppleMailConnector, tmp_path: Path
+    ) -> None:
+        """Dispatch succeeded but the sent copy carries the wrong number
+        of attachments → loud error naming the discrepancy (the mail DID
+        go out; the error must say so)."""
+        scripts, _, result, err = self._drive(
+            connector, tmp_path, outcomes_override={5: "0"},
+        )
+        assert result is None
+        assert isinstance(err, MailAppleScriptError)
+        assert "sent" in str(err).lower()
+        assert len(scripts) == 6
 
 class TestVerifiedSendPrimitives:
     """Phase 0 of PLAN-html-reply-send: every UI action in the send paths

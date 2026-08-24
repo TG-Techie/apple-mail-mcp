@@ -165,3 +165,48 @@ class TestDiscardCompose:
             f'to return (exists window "{subject}") as text'
         ).strip()
         assert still_open == "false"
+
+
+class TestHtmlSendWithAttachments:
+    def test_fresh_html_with_attachments_end_to_end(
+        self, connector: AppleMailConnector, tmp_path
+    ) -> None:
+        """Fresh HTML send with attachments + cc, end to end against real
+        Mail.app: compose via `make new outgoing message` (the mailto
+        window is not scriptable for attachments), AX-verified attach,
+        clipboard-injected HTML, verified send, sent-copy checks for
+        attachment count / cc header / rendered HTML. Cleans up the sent
+        copy."""
+        subject = f"attach-int-{uuid.uuid4().hex[:8]}"
+        f1 = tmp_path / "first.txt"
+        f1.write_text("integration attachment one")
+        f2 = tmp_path / "second.txt"
+        f2.write_text("integration attachment two")
+        try:
+            result = connector._send_html_email(
+                to=["probe@example.com"],
+                cc=["ccprobe@example.com"],
+                bcc=None,
+                subject=subject,
+                body="<p>attachment integration <b>marker-ai</b></p>",
+                from_account=None,
+                attachment_paths=[f1, f2],
+            )
+            assert result == {"draft_id": "", "sent_message_id": ""}
+            assert _sent_count_for_subject(connector, subject) == 1
+            src = _sent_source_for_subject(connector, subject)
+            assert "first.txt" in src
+            assert "second.txt" in src
+            _assert_html_rendered(src, "<b>marker-ai</b>")
+            # cc must be on the wire (it used to be silently dropped).
+            assert "ccprobe@example.com" in src
+            count = connector._run_applescript(
+                f'tell application "Mail" to return (count of mail attachments '
+                f'of (first message of sent mailbox whose subject is "{subject}")) as text'
+            ).strip()
+            assert count == "2"
+        finally:
+            connector._run_applescript(
+                f'tell application "Mail" to delete (every message of sent '
+                f'mailbox whose subject is "{subject}")'
+            )

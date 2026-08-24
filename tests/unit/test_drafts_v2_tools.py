@@ -293,6 +293,130 @@ class TestDraftSendHtml:
     """Tests for the email_send_html MCP tool."""
 
     @pytest.mark.asyncio
+    async def test_attachment_paths_passed_to_connector(
+        self,
+        isolated_drafts: None,
+        mock_mail: MagicMock,
+        tmp_path: Any,
+    ) -> None:
+        """attachment_paths flow through to the connector as Paths."""
+        from pathlib import Path
+
+        from apple_mail_mcp.server import email_send_html
+
+        f = tmp_path / "report.pdf"
+        f.write_bytes(b"%PDF-1.4 fake")
+        mock_mail._send_html_email.return_value = {
+            "draft_id": "", "sent_message_id": ""
+        }
+        result = await email_send_html(
+            to=["jonah@tg-techie.com"],
+            subject="With attachment",
+            body="<p>see attached</p>",
+            attachment_paths=[str(f)],
+        )
+        assert result["success"] is True
+        kwargs = mock_mail._send_html_email.call_args.kwargs
+        assert kwargs["attachment_paths"] == [Path(str(f))]
+
+    @pytest.mark.asyncio
+    async def test_attachment_missing_file_fails_before_connector(
+        self,
+        isolated_drafts: None,
+        mock_mail: MagicMock,
+    ) -> None:
+        from apple_mail_mcp.server import email_send_html
+
+        result = await email_send_html(
+            to=["jonah@tg-techie.com"],
+            subject="x", body="<p>b</p>",
+            attachment_paths=["/nonexistent/nope.pdf"],
+        )
+        assert result["success"] is False
+        assert result["error_type"] == "file_not_found"
+        mock_mail._send_html_email.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_attachment_blocked_extension_fails(
+        self,
+        isolated_drafts: None,
+        mock_mail: MagicMock,
+        tmp_path: Any,
+    ) -> None:
+        """Executable attachments are refused (security checklist)."""
+        from apple_mail_mcp.server import email_send_html
+
+        f = tmp_path / "installer.exe"
+        f.write_bytes(b"MZ")
+        result = await email_send_html(
+            to=["jonah@tg-techie.com"],
+            subject="x", body="<p>b</p>",
+            attachment_paths=[str(f)],
+        )
+        assert result["success"] is False
+        assert result["error_type"] == "validation_error"
+        assert "installer.exe" in result["error"]
+        mock_mail._send_html_email.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_attachment_oversize_fails(
+        self,
+        isolated_drafts: None,
+        mock_mail: MagicMock,
+        tmp_path: Any,
+        monkeypatch: Any,
+    ) -> None:
+        from apple_mail_mcp.server import email_send_html
+
+        f = tmp_path / "big.bin"
+        f.write_bytes(b"x")
+        # Don't actually write 25MB — patch the size check's view of it.
+        real_stat = type(f).stat
+
+        def fake_stat(self, **kw):  # noqa: ANN001, ANN003
+            st = real_stat(self, **kw)
+            if self.name == "big.bin":
+                import os
+                fake = list(st)
+                fake[6] = 26 * 1024 * 1024  # st_size
+                return os.stat_result(fake)
+            return st
+
+        monkeypatch.setattr(type(f), "stat", fake_stat)
+        result = await email_send_html(
+            to=["jonah@tg-techie.com"],
+            subject="x", body="<p>b</p>",
+            attachment_paths=[str(f)],
+        )
+        assert result["success"] is False
+        assert result["error_type"] == "validation_error"
+        assert "25" in result["error"]
+        mock_mail._send_html_email.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_attachments_with_reply_to_unsupported(
+        self,
+        isolated_drafts: None,
+        mock_mail: MagicMock,
+        tmp_path: Any,
+    ) -> None:
+        """reply_to + attachments is explicitly unsupported for now —
+        clear validation error, no connector call, nothing sent."""
+        from apple_mail_mcp.server import email_send_html
+
+        f = tmp_path / "a.txt"
+        f.write_text("x")
+        result = await email_send_html(
+            to=["jonah@tg-techie.com"],
+            body="<p>b</p>",
+            reply_to="12345",
+            attachment_paths=[str(f)],
+        )
+        assert result["success"] is False
+        assert result["error_type"] == "attachments_unsupported"
+        mock_mail._send_html_email.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_email_send_html_calls_connector(
         self,
         isolated_drafts: None,

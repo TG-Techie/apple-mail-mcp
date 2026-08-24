@@ -1025,6 +1025,7 @@ send (the compose window is discarded; nothing partial is sent).
 | `bcc` | array | No | `[]` | BCC recipients. |
 | `from_account` | string | No | null | Mail.app account name or UUID. Null uses Mail's default sender. |
 | `reply_to` | string | No | null | Message id to reply to; enables reply mode. |
+| `attachment_paths` | array | No | `[]` | File paths to attach. **Fresh mode only** (not supported with `reply_to`). Each file must exist, must not carry an executable extension (`.exe`, `.sh`, …), and must be under 25MB. |
 
 **Returns:**
 
@@ -1037,12 +1038,31 @@ send (the compose window is discarded; nothing partial is sent).
 - `outbound_disallowed`: one or more recipients off the allowlist —
   nothing was sent; in reply mode the compose window was discarded.
 - `validation_error`: missing `to`/`subject` in fresh mode.
+- `attachments_unsupported`: `attachment_paths` combined with
+  `reply_to` — nothing was sent.
+- `file_not_found` / `validation_error` (attachments): a listed file is
+  missing, has a blocked extension, or exceeds 25MB — nothing was sent.
 - `applescript_error`: a mechanical read-back failed
   (`SEND_DISABLED`, `SHEET:…`, `POSTCONDITION_TIMEOUT:…`,
-  `NO_COMPOSE_WINDOW:…`, `NO_BODY_AREA`) — the error carries the actual
-  UI state; the message was NOT sent.
+  `NO_COMPOSE_WINDOW:…`, `NO_BODY_AREA`, `ATTACH_MISSING:…`) — the error
+  carries the actual UI state; the message was NOT sent, with ONE
+  exception: an error saying "message WAS sent, but the sent copy
+  shows N of M expected attachments" means dispatch succeeded and the
+  post-send attachment-count check failed — inspect the Sent copy
+  before resending.
 
-**Limitations:** no attachments (use the draft lifecycle); en-US Mail UI
+**Attachment mechanics (fresh mode):** with `attachment_paths`, the
+message is composed via `make new outgoing message` instead of the
+mailto: URL handler (the mailto window is not scriptable for
+attachments — verified live 2026-08-24). Each attachment must be
+mechanically visible in the compose window's AX tree before Send is
+clicked, and the Sent-mailbox copy is checked for the attachment count
+after dispatch. Known trade-off: this compose path wraps the sent body
+in Mail's URLShare scaffolding with an *empty* `blockquote type="cite"`;
+whether iOS Mail renders a (contentless) purple quote bar for it is
+pending the standing one-time iOS visual re-check.
+
+**Limitations:** attachments not supported in reply mode; en-US Mail UI
 labels; sends require Mail.app UI automation permission.
 
 ---

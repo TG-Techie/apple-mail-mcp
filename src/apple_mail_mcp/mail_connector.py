@@ -4654,12 +4654,23 @@ end tell
             MailAppleScriptError: If the compose window's body area is not
                 found (NO_BODY_AREA) or any other non-SENT result.
         """
-        if attachment_paths:
+        if attachment_paths and reply_to is not None:
             raise NotImplementedError(
-                "HTML-send path does not support attachments yet. "
-                "Save a draft via draft_create (attachments work there, "
-                "without send_now) and send it manually from Mail.app, "
-                "or send without attachments."
+                "HTML replies with attachments are not supported yet — "
+                "the reply compose window comes from Mail's `reply` verb "
+                "and its attachment behavior is unverified. Send the "
+                "attachment in a fresh email_send_html message, or save "
+                "a reply draft via draft_create and send manually from "
+                "Mail.app."
+            )
+        if attachment_paths:
+            return self._send_html_new_with_attachments(
+                to=to,
+                cc=cc,
+                bcc=bcc,
+                subject=subject,
+                body=body,
+                attachment_paths=attachment_paths,
             )
 
         if reply_to is not None:
@@ -4676,10 +4687,16 @@ end tell
         # Build mailto: URL with URL-encoded subject and recipients.
         # subject is URL-encoded for the mailto: URL; body is NEVER in the
         # URL (clipboard injection — a URL body would insert the raw HTML
-        # source as literal text).
+        # source as literal text). cc/bcc ride the URL too — they used to
+        # be accepted and silently DROPPED on this fresh path (the mail
+        # went out without them; found 2026-08-24).
         to_str = urllib.parse.quote(",".join(to), safe="@,")
         encoded_subject = urllib.parse.quote(subject, safe="")
         mailto_url = f"mailto:{to_str}?subject={encoded_subject}"
+        if cc:
+            mailto_url += "&cc=" + urllib.parse.quote(",".join(cc), safe=",")
+        if bcc:
+            mailto_url += "&bcc=" + urllib.parse.quote(",".join(bcc), safe=",")
         mailto_url_safe = escape_applescript_string(mailto_url)
 
         # Compose window name = subject ("New Message" when empty) — the
@@ -4708,6 +4725,206 @@ end tell
             body=body,
             place_above_existing=False,
         )
+
+    def _send_html_new_with_attachments(
+        self,
+        *,
+        to: list[str],
+        cc: list[str] | None,
+        bcc: list[str] | None,
+        subject: str,
+        body: str,
+        attachment_paths: list[Path],
+    ) -> dict[str, str]:
+        """Send a fresh HTML email WITH attachments.
+
+        Composes via ``make new outgoing message`` instead of the
+        mailto: URL handler: the mailto window never registers in
+        Mail's ``outgoing messages`` collection, so ``make new
+        attachment`` cannot target it (verified live 2026-08-24). The
+        scriptable compose window accepts attachments; the HTML body
+        still arrives via the shared clipboard-inject machinery —
+        ``content`` is NEVER set (that is the purple-bar mechanism).
+
+        Known trade-off: this compose path wraps the sent body in
+        Mail's URLShare scaffolding with an EMPTY ``<blockquote
+        type="cite">`` (body text sits above it, outside the quote).
+        Whether iOS Mail renders a purple bar for the empty quote is
+        unverified — folded into the standing one-time iOS visual
+        re-check (see ``_send_new_via_eml`` docstring).
+
+        Six osascript invocations: compose(+recipients+attachments) →
+        AX attachment verify (poll; the send is NOT attempted unless
+        every attachment is visible in the compose window) → verified
+        paste → read-back → verified send → sent-copy attachment
+        count. A count mismatch after SENT raises loudly and says the
+        message DID go out.
+        """
+        win_subject = subject if subject else "New Message"
+
+        self._run_applescript(
+            self._build_attach_compose_script(
+                to=to, cc=cc, bcc=bcc, subject=subject,
+                attachment_paths=attachment_paths,
+            )
+        )
+
+        verify = self._run_applescript(
+            self._build_attachment_ax_verify_script(
+                window_name=win_subject,
+                filenames=[Path(a).name for a in attachment_paths],
+            )
+        ).strip()
+        if verify != "ATTACHMENTS_VERIFIED":
+            salvage = self._salvage_compose_to_draft(win_subject)
+            raise MailAppleScriptError(
+                f"html-send with attachments: attachment never appeared "
+                f"in the compose window — {verify!r}; send NOT attempted "
+                f"(compose window: {salvage})"
+            )
+
+        result = self._inject_html_and_send(
+            window_name=win_subject,
+            sent_subject=subject or "",
+            body=body,
+            place_above_existing=True,
+        )
+
+        subject_safe = escape_applescript_string(subject or "")
+        count_out = self._run_applescript(
+            f'tell application "Mail" to return (count of mail attachments '
+            f'of (first message of sent mailbox whose subject is '
+            f'"{subject_safe}")) as text'
+        ).strip()
+        expected = len(attachment_paths)
+        got = int(count_out) if count_out.isdigit() else -1
+        if got != expected:
+            raise MailAppleScriptError(
+                f"html-send with attachments: message WAS sent, but the "
+                f"sent copy shows {count_out} of {expected} expected "
+                f"attachments — inspect the Sent mailbox copy "
+                f"(subject {subject!r}) before resending."
+            )
+        return result
+
+    def _build_attach_compose_script(
+        self,
+        *,
+        to: list[str],
+        cc: list[str] | None,
+        bcc: list[str] | None,
+        subject: str,
+        attachment_paths: list[Path],
+    ) -> str:
+        """AppleScript: scriptable compose window with recipients and
+        attachments. No ``content`` setter (purple-bar mechanism); the
+        body arrives later via clipboard injection."""
+        subject_safe = escape_applescript_string(sanitize_input(subject))
+        recipient_lines: list[str] = []
+        for group, cls in ((to, "to recipient"), (cc or [], "cc recipient"),
+                           (bcc or [], "bcc recipient")):
+            for addr in group:
+                addr_safe = escape_applescript_string(sanitize_input(addr))
+                recipient_lines.append(
+                    f'        make new {cls} at end of {cls}s '
+                    f'with properties {{address:"{addr_safe}"}}'
+                )
+        recipients_block = "\n".join(recipient_lines)
+        # _build_attachment_block validates existence and targets
+        # `theMessage` — same block the draft path uses.
+        attach_block = self._build_attachment_block(attachment_paths)
+        return f"""
+tell application "Mail"
+    set theMessage to make new outgoing message with properties {{subject:"{subject_safe}", visible:true}}
+    tell theMessage
+{recipients_block}
+    end tell
+{attach_block}
+    activate
+end tell
+return "COMPOSED"
+"""
+
+    @staticmethod
+    def _build_attachment_ax_verify_script(
+        *,
+        window_name: str,
+        filenames: list[str],
+    ) -> str:
+        """AppleScript: poll the compose window until every attachment
+        shows up in the body WebArea as an AXButton whose description
+        carries the filename (observed form: "name.ext, N bytes" — live
+        2026-08-24), or time out. Returns "ATTACHMENTS_VERIFIED" or
+        "ATTACH_MISSING:<filename>".
+
+        Walks the same groups → scroll area → AXWebArea path as the
+        paste script and descends recursively from there. NEVER uses
+        ``entire contents`` — it silently returns an empty list on
+        compose windows more often than not (observed live 2026-08-24;
+        one lucky success during exploration, empty on every retry).
+        The WebArea is re-located on every poll: WebKit re-renders
+        invalidate stale element references."""
+        win_safe = escape_applescript_string(window_name)
+        names_safe = ", ".join(
+            f'"{escape_applescript_string(n)}"' for n in filenames
+        )
+        return f"""
+on searchButtons(el, fname, depthLeft)
+    tell application "System Events"
+        try
+            if (role of el) is "AXButton" and ((description of el) as text) contains fname then return true
+        end try
+        if depthLeft > 0 then
+            try
+                repeat with c in UI elements of el
+                    if my searchButtons(c, fname, depthLeft - 1) then return true
+                end repeat
+            end try
+        end if
+        return false
+    end tell
+end searchButtons
+
+tell application "Mail" to activate
+delay 0.3
+set missingName to ""
+repeat with fname in {{{names_safe}}}
+    set foundIt to false
+    repeat 10 times
+        tell application "System Events"
+            tell application process "Mail"
+                if exists window "{win_safe}" then
+                    set bodyArea to missing value
+                    repeat with g in groups of window "{win_safe}"
+                        try
+                            set sa to scroll area 1 of group 1 of g
+                            set waList to (UI elements of sa whose role is "AXWebArea")
+                            if (count of waList) > 0 then
+                                set bodyArea to item 1 of waList
+                                exit repeat
+                            end if
+                        end try
+                    end repeat
+                    if bodyArea is not missing value then
+                        set foundIt to my searchButtons(bodyArea, fname as text, 6)
+                    end if
+                end if
+            end tell
+        end tell
+        if foundIt then exit repeat
+        delay 0.5
+    end repeat
+    if not foundIt then
+        set missingName to fname as text
+        exit repeat
+    end if
+end repeat
+if missingName is "" then
+    return "ATTACHMENTS_VERIFIED"
+else
+    return "ATTACH_MISSING:" & missingName
+end if
+"""
 
     def create_draft(
         self,
