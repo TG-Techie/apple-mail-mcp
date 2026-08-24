@@ -4053,8 +4053,10 @@ class AppleMailConnector:
         if attachment_paths:
             raise NotImplementedError(
                 "mailto-send path does not support attachments. "
-                "Use the standard draft_create / draft_send flow for messages "
-                "with attachments."
+                "Save the draft without send_now and send it manually "
+                "from Mail.app, or send without attachments. (draft_send "
+                "on a fresh draft routes back here — it is NOT a "
+                "workaround; server-layer guards refuse it up front.)"
             )
 
         # Build mailto: URL.  Percent-encode every field so arbitrary text
@@ -4654,9 +4656,10 @@ end tell
         """
         if attachment_paths:
             raise NotImplementedError(
-                "HTML-send path does not support attachments. "
-                "Use the standard draft_create / draft_send flow for messages "
-                "with attachments."
+                "HTML-send path does not support attachments yet. "
+                "Save a draft via draft_create (attachments work there, "
+                "without send_now) and send it manually from Mail.app, "
+                "or send without attachments."
             )
 
         if reply_to is not None:

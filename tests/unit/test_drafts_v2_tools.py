@@ -250,6 +250,44 @@ class TestDraftSend:
         assert result["success"] is False
         mock_mail.delete_draft.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_fresh_draft_with_attachments_blocked_intact(
+        self,
+        isolated_drafts: None,
+        mock_mail: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Regression: fresh-seed drafts with attachments cannot be
+        auto-sent (the mailto: dispatch path carries no attachments).
+        Historically the delete-and-recreate ran anyway: the draft was
+        deleted, then the recreate-send raised NotImplementedError —
+        destroying the draft (real incident: draft ids 1390/1393,
+        2026-08-24). The guard must fire BEFORE any destructive op.
+        """
+        monkeypatch.delenv(
+            "APPLE_MAIL_MCP_SEND_ELICITATION_ALLOWLIST", raising=False
+        )
+        from apple_mail_mcp.server import draft_send
+
+        mock_mail.get_draft_state.return_value = {
+            "draft_id": "1390",
+            "to": ["jonah@tg-techie.com"], "cc": [], "bcc": [],
+            "subject": "Debrief excerpt", "body": "see attached",
+            "in_reply_to": "", "references": "",
+            "attachment_names": ["Debrief_verbatim.txt"],
+        }
+        result = await draft_send(draft_id="1390")
+        assert result["success"] is False
+        assert result["error_type"] == "attachments_unsupported"
+        # The error must steer to paths that actually work, not to the
+        # flow that just failed.
+        assert "Mail.app" in result["error"]
+        # CRITICAL: the draft survives.
+        mock_mail.delete_draft.assert_not_called()
+        mock_mail.create_draft.assert_not_called()
+        # No pointless attachment extraction either.
+        mock_mail.extract_draft_attachments.assert_not_called()
+
 
 class TestDraftSendHtml:
     """Tests for the email_send_html MCP tool."""

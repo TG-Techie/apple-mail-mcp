@@ -2180,6 +2180,44 @@ def _resolve_draft_seed(
     return "new", None, False
 
 
+def _fresh_send_attachment_guard(
+    send_now: bool,
+    seed_kind: str,
+    attachment_paths: list[str] | None,
+    existing_names: list[str],
+) -> dict[str, Any] | None:
+    """Refuse send_now on a fresh-seed draft that would carry attachments.
+
+    Fresh drafts sent immediately dispatch via the mailto: URL path
+    (connector ``_send_new_via_eml``), which cannot carry attachments.
+    Without this guard the delete-and-recreate ran first, so the
+    NotImplementedError from the connector landed AFTER the draft was
+    deleted — destroying it (drafts 1390/1393, 2026-08-24). Must be
+    called BEFORE any destructive op or attachment extraction.
+
+    Returns an error response, or None to proceed.
+    """
+    if not send_now or seed_kind != "new":
+        return None
+    will_have_attachments = (
+        bool(attachment_paths)
+        if attachment_paths is not None
+        else bool(existing_names)
+    )
+    if not will_have_attachments:
+        return None
+    return {
+        "success": False,
+        "error": (
+            "auto-send of a fresh draft with attachments is not "
+            "supported — the mailto: dispatch path cannot carry "
+            "attachments. The draft is unchanged. Open Mail.app and "
+            "press Send manually, or send without attachments."
+        ),
+        "error_type": "attachments_unsupported",
+    }
+
+
 def _resolve_draft_attachments(
     draft_id: str,
     attachment_paths: list[str] | None,
@@ -2694,6 +2732,13 @@ async def update_draft(
         seed_kind, seed_id, reply_all = _resolve_draft_seed(
             draft_id, state, store
         )
+
+        guard_err = _fresh_send_attachment_guard(
+            send_now, seed_kind, attachment_paths,
+            state.get("attachment_names", []) or [],
+        )
+        if guard_err:
+            return guard_err
 
         try:
             final_subject, final_body = _resolve_update_subject_body(

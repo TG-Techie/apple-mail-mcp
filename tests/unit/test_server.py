@@ -2831,6 +2831,35 @@ class TestUpdateDraftTool:
         )
 
     @pytest.mark.asyncio
+    async def test_send_now_fresh_with_attachments_no_data_loss(
+        self,
+        isolated_drafts: Any,
+        mock_mail: MagicMock,
+        mock_logger: MagicMock,
+    ) -> None:
+        """send_now on a fresh-seed draft with attachments must fail
+        BEFORE the delete — never delete-then-raise (that destroyed
+        drafts 1390/1393)."""
+        from apple_mail_mcp.server import update_draft
+
+        mock_mail.get_draft_state.return_value = {
+            "draft_id": "1390",
+            "to": ["alice@example.com"], "cc": [], "bcc": [],
+            "subject": "s", "body": "b",
+            "in_reply_to": "", "references": "",
+            "attachment_names": [],
+        }
+        result = await update_draft(
+            draft_id="1390",
+            attachment_paths=["/tmp/a.txt"],
+            send_now=True,
+        )
+        assert result["success"] is False
+        assert result["error_type"] == "attachments_unsupported"
+        mock_mail.delete_draft.assert_not_called()
+        mock_mail.create_draft.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_update_uses_disk_seed_state(
         self,
         isolated_drafts: Any,
