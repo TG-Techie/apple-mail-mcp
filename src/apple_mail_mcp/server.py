@@ -2126,6 +2126,18 @@ def _draft_action_error(op: str, e: Exception) -> dict[str, Any] | None:
     fall through to a generic ``unknown`` mapping). Centralizing this
     keeps the per-tool exception handling small enough to stay under
     the cyclomatic-complexity threshold."""
+    from .exceptions import OutboundAllowlistUnavailableError
+
+    if isinstance(e, OutboundAllowlistUnavailableError):
+        # The policy itself is unreadable — FAIL CLOSED, distinct
+        # error_type so "fix comms.yaml" is not confused with "edit
+        # recipients".
+        logger.error(f"Outbound allowlist unavailable during {op}: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+            "error_type": "allowlist_unavailable",
+        }
     if isinstance(e, MailOutboundDisallowedError):
         # Policy gate — recipients off the outbound allowlist.
         logger.warning(f"Outbound allowlist blocked {op}: {e}")
@@ -3004,7 +3016,7 @@ async def draft_create(
         ``{"success": True, "draft_id": "<id>"}`` on success.
 
     Example (full lifecycle):
-        >>> r = draft_create(to=["jonah@tg-techie.com"],
+        >>> r = draft_create(to=["alice@example.com"],
         ...                  subject="hi", body="hello")
         >>> r["draft_id"]
         'ABCD'
@@ -3154,6 +3166,7 @@ async def draft_send(
             "error_type": "applescript_error",
         }
 
+    from .exceptions import OutboundAllowlistUnavailableError
     from .outbound_allowlist import disallowed_recipients
 
     all_r = (
@@ -3170,7 +3183,16 @@ async def draft_send(
             ),
             "error_type": "validation_error",
         }
-    bad = disallowed_recipients(all_r)
+    try:
+        bad = disallowed_recipients(all_r)
+    except OutboundAllowlistUnavailableError as e:
+        # FAIL CLOSED, draft intact — the policy itself is unreadable.
+        logger.error("draft_send blocked — allowlist unavailable: %s", e)
+        return {
+            "success": False,
+            "error": str(e) + " Draft is unchanged.",
+            "error_type": "allowlist_unavailable",
+        }
     if bad:
         logger.warning(
             "draft_send pre-validation blocked draft %s — off-list "
@@ -3257,8 +3279,18 @@ def _validate_html_send_request(
             return attach_err
 
     # Hard allowlist policy gate — same as draft_send.
+    from .exceptions import OutboundAllowlistUnavailableError
     from .outbound_allowlist import disallowed_recipients
-    bad = disallowed_recipients(all_recipients)
+    try:
+        bad = disallowed_recipients(all_recipients)
+    except OutboundAllowlistUnavailableError as e:
+        # FAIL CLOSED — the policy itself is unreadable; nothing sent.
+        logger.error("email_send_html blocked — allowlist unavailable: %s", e)
+        return {
+            "success": False,
+            "error": str(e),
+            "error_type": "allowlist_unavailable",
+        }
     if bad:
         logger.warning(
             "email_send_html blocked — off-list recipients: %s", bad

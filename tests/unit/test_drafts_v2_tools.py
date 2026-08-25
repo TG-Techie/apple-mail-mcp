@@ -49,7 +49,7 @@ class TestDraftCreate:
             "draft_id": "ABCD", "sent_message_id": ""
         }
         result = await draft_create(
-            to=["jonah@tg-techie.com"], subject="hi", body="body"
+            to=["alice@example.com"], subject="hi", body="body"
         )
         assert result["success"] is True
         assert result["draft_id"] == "ABCD"
@@ -95,7 +95,7 @@ class TestDraftUpdate:
 
         mock_mail.get_draft_state.return_value = {
             "draft_id": "OLD",
-            "to": ["jonah@tg-techie.com"], "cc": [], "bcc": [],
+            "to": ["alice@example.com"], "cc": [], "bcc": [],
             "subject": "hi", "body": "x",
             "in_reply_to": "", "references": "", "attachment_names": [],
         }
@@ -167,7 +167,7 @@ class TestDraftSend:
 
         mock_mail.get_draft_state.return_value = {
             "draft_id": "ABCD",
-            "to": ["jonah@tg-techie.com"],
+            "to": ["alice@example.com"],
             "cc": ["outsider@other.com"], "bcc": [],
             "subject": "x", "body": "y",
             "in_reply_to": "", "references": "", "attachment_names": [],
@@ -192,7 +192,7 @@ class TestDraftSend:
 
         mock_mail.get_draft_state.return_value = {
             "draft_id": "ABCD",
-            "to": ["jonah@tg-techie.com"], "cc": [], "bcc": [],
+            "to": ["alice@example.com"], "cc": [], "bcc": [],
             "subject": "hi", "body": "x",
             "in_reply_to": "", "references": "", "attachment_names": [],
         }
@@ -271,7 +271,7 @@ class TestDraftSend:
 
         mock_mail.get_draft_state.return_value = {
             "draft_id": "1390",
-            "to": ["jonah@tg-techie.com"], "cc": [], "bcc": [],
+            "to": ["alice@example.com"], "cc": [], "bcc": [],
             "subject": "Debrief excerpt", "body": "see attached",
             "in_reply_to": "", "references": "",
             "attachment_names": ["Debrief_verbatim.txt"],
@@ -287,6 +287,59 @@ class TestDraftSend:
         mock_mail.create_draft.assert_not_called()
         # No pointless attachment extraction either.
         mock_mail.extract_draft_attachments.assert_not_called()
+
+
+class TestAllowlistUnavailableFailClosed:
+    """FAIL CLOSED (owner directive 2026-08-24): with no readable comms
+    config there is NO fallback list — sends are blocked with the
+    distinct allowlist_unavailable error_type, and nothing destructive
+    happens."""
+
+    @pytest.mark.asyncio
+    async def test_draft_send_blocked_draft_intact(
+        self,
+        isolated_drafts: None,
+        mock_mail: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from apple_mail_mcp.server import draft_send
+
+        monkeypatch.setenv(
+            "APPLE_MAIL_MCP_COMMS_CONFIG", "/nonexistent/comms.yaml"
+        )
+        monkeypatch.delenv("MAIL_TEST_MODE", raising=False)
+        mock_mail.get_draft_state.return_value = {
+            "draft_id": "ABCD",
+            "to": ["alice@example.com"], "cc": [], "bcc": [],
+            "subject": "x", "body": "y",
+            "in_reply_to": "", "references": "", "attachment_names": [],
+        }
+        result = await draft_send(draft_id="ABCD")
+        assert result["success"] is False
+        assert result["error_type"] == "allowlist_unavailable"
+        assert "comms config" in result["error"]
+        mock_mail.delete_draft.assert_not_called()
+        mock_mail.create_draft.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_email_send_html_blocked_nothing_sent(
+        self,
+        isolated_drafts: None,
+        mock_mail: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from apple_mail_mcp.server import email_send_html
+
+        monkeypatch.setenv(
+            "APPLE_MAIL_MCP_COMMS_CONFIG", "/nonexistent/comms.yaml"
+        )
+        monkeypatch.delenv("MAIL_TEST_MODE", raising=False)
+        result = await email_send_html(
+            to=["alice@example.com"], subject="s", body="<p>b</p>",
+        )
+        assert result["success"] is False
+        assert result["error_type"] == "allowlist_unavailable"
+        mock_mail._send_html_email.assert_not_called()
 
 
 class TestDraftSendHtml:
@@ -310,7 +363,7 @@ class TestDraftSendHtml:
             "draft_id": "", "sent_message_id": ""
         }
         result = await email_send_html(
-            to=["jonah@tg-techie.com"],
+            to=["alice@example.com"],
             subject="With attachment",
             body="<p>see attached</p>",
             attachment_paths=[str(f)],
@@ -328,7 +381,7 @@ class TestDraftSendHtml:
         from apple_mail_mcp.server import email_send_html
 
         result = await email_send_html(
-            to=["jonah@tg-techie.com"],
+            to=["alice@example.com"],
             subject="x", body="<p>b</p>",
             attachment_paths=["/nonexistent/nope.pdf"],
         )
@@ -349,7 +402,7 @@ class TestDraftSendHtml:
         f = tmp_path / "installer.exe"
         f.write_bytes(b"MZ")
         result = await email_send_html(
-            to=["jonah@tg-techie.com"],
+            to=["alice@example.com"],
             subject="x", body="<p>b</p>",
             attachment_paths=[str(f)],
         )
@@ -384,7 +437,7 @@ class TestDraftSendHtml:
 
         monkeypatch.setattr(type(f), "stat", fake_stat)
         result = await email_send_html(
-            to=["jonah@tg-techie.com"],
+            to=["alice@example.com"],
             subject="x", body="<p>b</p>",
             attachment_paths=[str(f)],
         )
@@ -407,7 +460,7 @@ class TestDraftSendHtml:
         f = tmp_path / "a.txt"
         f.write_text("x")
         result = await email_send_html(
-            to=["jonah@tg-techie.com"],
+            to=["alice@example.com"],
             body="<p>b</p>",
             reply_to="12345",
             attachment_paths=[str(f)],
@@ -429,7 +482,7 @@ class TestDraftSendHtml:
             "draft_id": "", "sent_message_id": ""
         }
         result = await email_send_html(
-            to=["jonah@tg-techie.com"],
+            to=["alice@example.com"],
             subject="Test HTML",
             body="<p>Hello</p>",
         )
@@ -438,7 +491,7 @@ class TestDraftSendHtml:
         assert result["sent_message_id"] == ""
         mock_mail._send_html_email.assert_called_once()
         call_kwargs = mock_mail._send_html_email.call_args.kwargs
-        assert call_kwargs["to"] == ["jonah@tg-techie.com"]
+        assert call_kwargs["to"] == ["alice@example.com"]
         assert call_kwargs["subject"] == "Test HTML"
         assert call_kwargs["body"] == "<p>Hello</p>"
 

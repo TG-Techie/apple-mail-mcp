@@ -6656,7 +6656,7 @@ class TestSendHtmlReply:
 
     _REPLY_META = (
         '{"window": "Re: Probe", "subject": "Re: Probe", '
-        '"to": ["jonah@tg-techie.com"], "cc": []}'
+        '"to": ["alice@example.com"], "cc": []}'
     )
 
     def _run_reply(
@@ -6759,15 +6759,15 @@ class TestSendHtmlReply:
         participant list explicitly; there is no reply_all parameter)."""
         meta = (
             '{"window": "Re: Probe", "subject": "Re: Probe", '
-            '"to": ["jonah@tg-techie.com", "other@tg-techie.com"], "cc": []}'
+            '"to": ["alice@example.com", "bob@example.com"], "cc": []}'
         )
         scripts = self._run_reply(
             connector, meta=meta,
-            to=["jonah@tg-techie.com", "other@tg-techie.com"],
+            to=["alice@example.com", "bob@example.com"],
         )
         script_a = scripts[0]
         assert "delete (every to recipient of replyMsg)" in script_a
-        assert "other@tg-techie.com" in script_a
+        assert "bob@example.com" in script_a
 
     def test_reply_gate_uses_post_override_recipients(
         self, connector: AppleMailConnector

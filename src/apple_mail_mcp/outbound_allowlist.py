@@ -15,24 +15,25 @@ outbound mail dispatch must call ``assert_recipients_allowed_for_send``
 before executing.
 
 ╔══════════════════════════════════════════════════════════════════════╗
-║ POLICY — set by the human repo owner, 2026-05-20.                    ║
+║ POLICY — set by the human repo owner, 2026-05-20; revised 2026-08-24 ║
+║ (hardcoded entries stripped on owner directive).                     ║
 ║                                                                      ║
-║ Entries in USER_EXPLICIT_OUTBOUND_ALLOW_LIST below are the always-on ║
-║ default. ONLY the human repo owner may add, remove, or alter         ║
-║ entries. Agents (including the agent that authored this file) MUST   ║
-║ NOT modify USER_EXPLICIT_OUTBOUND_ALLOW_LIST without explicit        ║
-║ per-change user authorization quoted in the conversation.            ║
-║                                                                      ║
-║ Additional patterns come from the comms config YAML (key:            ║
+║ The comms config YAML is the ONLY allowlist source (key:             ║
 ║ email.allowed_outbound). Path is controlled by                       ║
 ║ APPLE_MAIL_MCP_COMMS_CONFIG                                          ║
-║ (default: ~/iCloud/AgentAccessConfig/comms.yaml). Only Jonah edits   ║
-║ that file; the agent has read-only access.                           ║
+║ (default: ~/iCloud/AgentAccessConfig/comms.yaml). Only the owner     ║
+║ edits that file; agents have read-only access. There are NO          ║
+║ hardcoded policy values in code, and agents MUST NOT introduce any.  ║
 ║                                                                      ║
-║ Test-mode override (MAIL_TEST_MODE=true) lets RFC 2606 reserved test ║
-║ domains (@example.com, .test, .invalid, .localhost) through so the   ║
-║ integration-test harness still functions. Production never sets that ║
-║ env var.                                                             ║
+║ FAIL CLOSED: if the config is missing, unreadable, or malformed,     ║
+║ every send is blocked (OutboundAllowlistUnavailableError) until the  ║
+║ owner fixes the file. There is no fallback list. A readable config   ║
+║ that grants nothing is valid and likewise blocks everything.         ║
+║                                                                      ║
+║ Test-mode carve-out (MAIL_TEST_MODE=true): RFC 2606 reserved test    ║
+║ domains (@example.com, .test, .invalid, .localhost) pass — with or   ║
+║ without a readable config — so the integration-test harness works.   ║
+║ Production never sets that env var.                                  ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
@@ -42,34 +43,28 @@ import fnmatch
 import logging
 import os
 import re
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
 
 import yaml
 
-from .exceptions import MailOutboundDisallowedError
+from .exceptions import (
+    MailOutboundDisallowedError,
+    OutboundAllowlistUnavailableError,
+)
 
 _log = logging.getLogger(__name__)
 
-# ──────────────────────────────────────────────────────────────────────────
-# POLICY VALUE — see policy block above before touching.
-# ──────────────────────────────────────────────────────────────────────────
-USER_EXPLICIT_OUTBOUND_ALLOW_LIST: tuple[str, ...] = (
-    "*@tg-techie.com",
-)
-
 # Env var pointing to the comms config YAML (key: email.allowed_outbound).
 # Defaults to ~/iCloud/AgentAccessConfig/comms.yaml.
-# File is read at call time so Jonah's edits take effect on the next send.
-# On missing/unreadable/invalid file: log a warning and skip (hardcoded
-# list still applies).
+# File is read at call time so owner edits take effect on the next send.
 COMMS_CONFIG_ENV = "APPLE_MAIL_MCP_COMMS_CONFIG"
 _COMMS_CONFIG_DEFAULT = "~/iCloud/AgentAccessConfig/comms.yaml"
 
 _EMAIL_EXTRACT_RE = re.compile(r"<([^>]+)>")
 
 # Mirror security.RESERVED_TEST_* here to avoid a circular import. Keep in
-# sync if those change — there's a ruff/parity test we can add later.
+# sync if those change.
 _RESERVED_TEST_DOMAINS = frozenset({"example.com", "example.net", "example.org"})
 _RESERVED_TEST_TLDS = frozenset({".example", ".test", ".invalid", ".localhost"})
 
@@ -78,9 +73,9 @@ def extract_email(recipient: str) -> str:
     """Pull the bare ``addr@host`` out of a recipient string.
 
     Handles:
-      - ``"jonah@tg-techie.com"`` → ``"jonah@tg-techie.com"``
-      - ``"Jonah Y-M <jonah@tg-techie.com>"`` → ``"jonah@tg-techie.com"``
-      - ``"<jonah@tg-techie.com>"`` → ``"jonah@tg-techie.com"``
+      - ``"alice@example.com"`` → ``"alice@example.com"``
+      - ``"Alice A <alice@example.com>"`` → ``"alice@example.com"``
+      - ``"<alice@example.com>"`` → ``"alice@example.com"``
     Strings without ``<...>`` are returned trimmed/lowercased as-is.
     """
     m = _EMAIL_EXTRACT_RE.search(recipient)
@@ -89,8 +84,9 @@ def extract_email(recipient: str) -> str:
     return recipient.strip().lower()
 
 
-def _load_comms_yaml_patterns() -> list[str]:
-    """Read ``email.allowed_outbound`` patterns from the comms config YAML.
+def allowlist_patterns() -> list[str]:
+    """The outbound allowlist, read from the comms config YAML at call
+    time (sole source — there is no hardcoded list).
 
     Path: ``APPLE_MAIL_MCP_COMMS_CONFIG`` env var, defaulting to
     ``~/iCloud/AgentAccessConfig/comms.yaml``.
@@ -100,49 +96,59 @@ def _load_comms_yaml_patterns() -> list[str]:
 
         email:
           allowed_outbound:
-            - '*@tg-techie.com'
+            - '*@owner-domain.example'
             - 'partner@example.com'
 
-    Returns an empty list (never raises) on any I/O or parse error so
-    the hardcoded allowlist still functions when the file is absent.
+    Raises ``OutboundAllowlistUnavailableError`` (FAIL CLOSED) when the
+    file is missing, unreadable, unparseable, or structurally malformed
+    (non-mapping root, non-mapping ``email`` section, non-list
+    ``allowed_outbound``). A structurally valid config with no ``email``
+    section or no ``allowed_outbound`` key returns ``[]`` — a policy
+    that grants nothing, not a broken one.
     """
     raw_path = os.environ.get(COMMS_CONFIG_ENV, _COMMS_CONFIG_DEFAULT)
     config_path = Path(raw_path).expanduser()
     try:
         with config_path.open() as fh:
             data = yaml.safe_load(fh)
-        if not isinstance(data, dict):
-            _log.warning("comms config %s: expected a YAML mapping, got %r", config_path, type(data))
-            return []
-        email_section = data.get("email", {})
-        if not isinstance(email_section, dict):
-            _log.warning("comms config %s: email section must be a mapping", config_path)
-            return []
-        entries = email_section.get("allowed_outbound", [])
-        if not isinstance(entries, list):
-            _log.warning("comms config %s: email.allowed_outbound must be a list", config_path)
-            return []
-        return [str(e).strip().lower() for e in entries if e]
     except FileNotFoundError:
-        _log.debug("comms config not found at %s — skipping", config_path)
+        raise OutboundAllowlistUnavailableError(
+            f"outbound allowlist unavailable: comms config not found at "
+            f"{config_path} — all sends are blocked until the owner "
+            f"restores it (or fixes {COMMS_CONFIG_ENV})."
+        ) from None
+    except Exception as exc:
+        raise OutboundAllowlistUnavailableError(
+            f"outbound allowlist unavailable: comms config {config_path} "
+            f"unreadable or unparseable ({exc}) — all sends are blocked "
+            f"until the owner fixes it."
+        ) from exc
+
+    if not isinstance(data, dict):
+        raise OutboundAllowlistUnavailableError(
+            f"outbound allowlist unavailable: comms config {config_path} "
+            f"root must be a YAML mapping, got {type(data).__name__} — "
+            f"all sends are blocked until the owner fixes it."
+        )
+    email_section = data.get("email")
+    if email_section is None:
         return []
-    except Exception as exc:  # noqa: BLE001
-        _log.warning("comms config %s unreadable/invalid: %s", config_path, exc)
+    if not isinstance(email_section, dict):
+        raise OutboundAllowlistUnavailableError(
+            f"outbound allowlist unavailable: comms config {config_path} "
+            f"'email' section must be a mapping — all sends are blocked "
+            f"until the owner fixes it."
+        )
+    entries = email_section.get("allowed_outbound")
+    if entries is None:
         return []
-
-
-def allowlist_patterns() -> list[str]:
-    """Merged allowlist at call time (two sources, additive only):
-
-    1. ``USER_EXPLICIT_OUTBOUND_ALLOW_LIST`` — hardcoded, owner-only.
-    2. ``APPLE_MAIL_MCP_COMMS_CONFIG`` YAML → ``email.allowed_outbound`` list.
-
-    Source 2 ADDs patterns; it cannot remove hardcoded entries.
-    Resolved at call time so file edits take effect on the next send.
-    """
-    patterns = [p.lower() for p in USER_EXPLICIT_OUTBOUND_ALLOW_LIST]
-    patterns.extend(_load_comms_yaml_patterns())
-    return patterns
+    if not isinstance(entries, list):
+        raise OutboundAllowlistUnavailableError(
+            f"outbound allowlist unavailable: comms config {config_path} "
+            f"email.allowed_outbound must be a list — all sends are "
+            f"blocked until the owner fixes it."
+        )
+    return [str(e).strip().lower() for e in entries if e]
 
 
 def _is_test_mode() -> bool:
@@ -169,10 +175,22 @@ def _matches_any(addr: str, patterns: Iterable[str]) -> bool:
 def disallowed_recipients(recipients: list[str]) -> list[str]:
     """Return the subset of ``recipients`` whose extracted email is NOT on
     the allowlist. Under MAIL_TEST_MODE=true, RFC 2606 reserved test
-    domains are considered allowed (test-mode override).
+    domains are considered allowed (test-mode override), and an
+    unavailable config degrades to an empty pattern set (reserved
+    domains only). Outside test mode an unavailable config raises
+    ``OutboundAllowlistUnavailableError`` — FAIL CLOSED.
     """
-    patterns = allowlist_patterns()
     test_mode = _is_test_mode()
+    try:
+        patterns = allowlist_patterns()
+    except OutboundAllowlistUnavailableError:
+        if not test_mode:
+            raise
+        _log.warning(
+            "comms config unavailable under MAIL_TEST_MODE — only RFC "
+            "2606 reserved test domains are sendable."
+        )
+        patterns = []
     bad: list[str] = []
     for r in recipients:
         addr = extract_email(r)
@@ -184,12 +202,18 @@ def disallowed_recipients(recipients: list[str]) -> list[str]:
 
 
 def all_recipients_allowed(recipients: list[str]) -> bool:
-    """True iff ``recipients`` is non-empty AND every recipient is allowlisted.
-    Fail-closed on empty input.
+    """True iff ``recipients`` is non-empty AND every recipient is
+    allowlisted. Fail-closed on empty input AND on an unavailable
+    config — this is only the elicitation-bypass UX check, so "policy
+    unreadable" simply means "no bypass" here; the HARD gate
+    (``assert_recipients_allowed_for_send``) is the one that raises.
     """
     if not recipients:
         return False
-    return not disallowed_recipients(recipients)
+    try:
+        return not disallowed_recipients(recipients)
+    except OutboundAllowlistUnavailableError:
+        return False
 
 
 def assert_recipients_allowed_for_send(
@@ -207,6 +231,10 @@ def assert_recipients_allowed_for_send(
         validate at this layer. Caller must pass explicit recipients.
       - All recipient groups are empty (no one to send to).
       - Any recipient (across to/cc/bcc) is not on the allowlist.
+
+    Raises ``OutboundAllowlistUnavailableError`` (a subclass) when the
+    comms config cannot be read — FAIL CLOSED, no sends while the
+    policy is unreadable (test-mode carve-out aside).
 
     Returns None silently when every recipient is on the allowlist.
     """

@@ -11,11 +11,31 @@ class MailError(Exception):
 
 class MailOutboundDisallowedError(MailError):
     """Outbound send blocked: one or more recipients are not on the
-    USER_EXPLICIT_OUTBOUND_ALLOW_LIST (or augmenting env var).
+    outbound allowlist (comms config YAML → ``email.allowed_outbound``,
+    path via ``APPLE_MAIL_MCP_COMMS_CONFIG``).
 
     Raised by ``outbound_allowlist.assert_recipients_allowed_for_send``
     at the actual-send call site in ``mail_connector.create_draft`` —
     the policy enforcement perimeter for outbound mail.
+    """
+
+    pass
+
+
+class OutboundAllowlistUnavailableError(MailOutboundDisallowedError):
+    """The outbound allowlist POLICY ITSELF could not be read: the comms
+    config YAML is missing, unreadable, unparseable, or malformed.
+
+    FAIL CLOSED (owner directive, 2026-08-24): no sends while the policy
+    is unreadable — there is no hardcoded fallback list. Distinct from
+    the parent so callers can tell "recipient off-list" (edit recipients)
+    from "config broken" (fix the comms.yaml) — but still a subclass, so
+    every existing policy-gate handler catches it.
+
+    Carve-out: under ``MAIL_TEST_MODE=true`` the recipient-checking
+    functions tolerate an unavailable config and allow only RFC 2606
+    reserved test domains, so the integration harness works on machines
+    with no comms.yaml.
     """
 
     pass
