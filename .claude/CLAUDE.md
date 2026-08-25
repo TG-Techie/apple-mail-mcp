@@ -115,6 +115,44 @@ surface.
 
 **Integration test safety:** When running tests via `server.py` tools, set `MAIL_TEST_MODE=true` and `MAIL_TEST_ACCOUNT=<test account name>`. The safety gate blocks destructive operations on non-test accounts and blocks sends to non-reserved recipient domains (must be @example.com, .test, .invalid, .localhost, etc.). See `check_test_mode_safety` in [src/apple_mail_mcp/security.py](src/apple_mail_mcp/security.py).
 
+## Comms Methodology (operator-set, 2026-08-24)
+
+How agents working in this repo communicate. Fleet-wide doctrine, recorded
+here so it survives restarts and compactions; each project keeps its own
+copy (imessage-mcp: CLAUDE.md + docs/EPISTEMICS.md; here: this section).
+
+**Chat (iMessage / cross-session messages):**
+- Sign every iMessage send: `~ <agent-name>` as the last line (the imsg
+  proxy appends it automatically when caller identity self-discovers;
+  never send unsigned).
+- Itemize when there is more than one point; each item self-contained.
+- Plain, technical, precise, concise — full sentences, never telegraphic
+  fragments. One recommendation or question per message, not the full
+  option space.
+- Lead with the result. No preamble, no recap, no hedging buried in a
+  footer.
+- Phone-scannable length — if it scrolls on a phone screen, split or trim.
+- Reply in the same channel a message arrived on.
+- If a real answer will take more than a moment, send "on it" first, then
+  the full reply — never go silent.
+- In a shared channel, don't reply unless addressed to you.
+
+**Epistemics:**
+- Ground every claim in a real, checked source — live system state, actual
+  test output, the file on disk, the sent-mail copy. Never assert from
+  training data or presumption.
+- Fail loudly, fail closed. No silent fallbacks, no degraded modes that
+  look like success (see the outbound allowlist: unreadable config blocks
+  all sends with a distinct error, by design).
+- Surface unknowns and unverified items prominently — never as a footer
+  that reads as polish.
+
+**Email:** governed by the agent-email-discretion skill
+(`~/iCloud/AgentAccessSync/skills/`): mandatory signature block with
+runtime identifiers, allowlist gates, failure-event logging, draft caps.
+Email is a delivery tool, not a comms channel — errors and questions go
+to chat.
+
 ## Branch Convention
 
 `{type}/issue-{num}-{description}` — e.g., `feature/issue-42-thread-support`, `fix/issue-99-timeout`
