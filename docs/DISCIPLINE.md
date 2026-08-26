@@ -55,6 +55,25 @@ Requested by Jonah after I twice misjudged who a thread message was for.
   the thread, Jonah didn't see my conclusion; acknowledge before long
   work.
 
+## MCP context exposure (Jonah, 2026-08-26; relayed by dusky-thorn)
+
+Directives on how much text an MCP server puts into agents' context.
+
+- Mind what instruction/tool-description text the server exposes to
+  agents that have NOT been directed to use it — the concern generalizes
+  beyond any one MCP.
+- Keep the base `instructions` block small. Tool search covers tool
+  descriptions on demand; the base block is what every connected session
+  always pays for. (Claude Code also silently truncates it at 2KB.)
+- A per-session proxy's instructions must not be a separate
+  hand-maintained text — proxy the daemon's own, appended JIT /
+  non-cached at connection time, so a daemon update never leaves the
+  proxy serving stale instructions or a stale version.
+
+Grounded findings under these (2KB truncation, instructions never
+deferred, initialize-handshake freshness bound) live with provenance in
+imessage-mcp `docs/DECISION-LOG.md` — reference, not copied here.
+
 ## Email (this project)
 
 Outbound email is governed by the agent-email-discretion skill
