@@ -39,6 +39,8 @@ Requested by Jonah after I twice misjudged who a thread message was for.
   whoever Jonah was mid-conversation with. When genuinely ambiguous, ask
   ("was that for me?") rather than acting — acting on a misread creates
   duplicate work someone must walk back.
+- Nothing in the thread is broadcast-to-all unless Jonah says
+  "everyone".
 - One agent per task: when Jonah assigns coordination to one agent,
   others stay out even if they could help. If better placed, say so to
   the assigned agent out-of-band; don't just start.
