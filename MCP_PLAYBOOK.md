@@ -68,35 +68,6 @@ def main() -> None:
 {project-name} = "{package}.server:main"
 ```
 
-### The `instructions` block is a capped, always-loaded surface
-
-`instructions` is delivered in full to **every** connecting session at the
-`initialize` handshake, before any tool is chosen. It is never deferred (a
-client's tool-search can withhold tool *descriptions* until an agent reaches
-for them, but not this block), and Claude Code **truncates it at 2KB, silently,
-at a byte offset** — the tail is dropped mid-word with no error
-(`code.claude.com/docs/en/mcp`; verified in the vendored SDK:
-`mcp/server/lowlevel/server.py`, `mcp/server/session.py`). So:
-
-- **Write it as a "when and why to use this server" hint, not a manual.** Keep
-  only what a first-touch, undirected agent needs before picking a tool: scope,
-  cross-tool invariants, hard constraints. Everything a specific tool already
-  documents belongs on that tool's own (deferrable) description.
-- **Front-load the critical content and measure the delivered bytes**
-  (`len(instructions.encode("utf-8"))`) — including any preamble a proxy
-  concatenates in front. Presuming it fits is how the tail gets cut.
-- **A "move to the tool docstring" only counts if *every* affected tool
-  restates it.** Before deleting a shared caveat (addressing, provenance) from
-  the block, confirm each tool that returns the field or takes the parameter
-  carries it locally — otherwise it is a silent loss, not a move.
-
-**Companion, for a per-session stdio proxy:** the proxy keeps only its one
-proxy-specific paragraph and, at startup, fetches the daemon's instructions
-from the MCP `initialize` result and appends them verbatim — never a
-hand-maintained second copy that drifts. Unreachable daemon = loud startup
-failure, never a silent fallback to stale text. (Reference implementation:
-imessage-mcp `proxy.py` `_fetch_daemon_instructions`.)
-
 ### Tool Registration Pattern
 
 ```python
