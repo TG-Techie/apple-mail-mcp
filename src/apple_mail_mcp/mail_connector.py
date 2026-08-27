@@ -235,6 +235,97 @@ def _bulk_repeat_block(
     )
 
 
+# Attachment-record properties, in emitted order:
+#   (AppleScript property expression, JSON key, AppleScript variable,
+#    AppleScript literal used as the on-failure default)
+# Each is read under its OWN try block -- see _attachment_walk_block.
+_ATTACHMENT_PROPS: tuple[tuple[str, str, str, str], ...] = (
+    ("name of att", "name", "attName", '""'),
+    ("MIME type of att", "mime_type", "attMime", '""'),
+    ("file size of att", "size", "attSize", "0"),
+    ("downloaded of att", "downloaded", "attDown", "false"),
+)
+
+
+def _attachment_walk_block(
+    *,
+    message_var: str,
+    warnings_var: str,
+    indent: int,
+    list_var: str = "attList",
+) -> str:
+    """Emit the AppleScript that walks ``mail attachments of <message_var>``
+    and builds one record per attachment.
+
+    TWO layers of guard, for two DIFFERENT observed failures:
+
+    1. **Per-property guard (inner).** Every property is read into its own
+       variable under its own ``try``; the record is assembled from those
+       variables. Observed 2026-08-27 against Agents' iCloud INBOX
+       messages 1463-1466: ``MIME type of att`` raises
+       errAEEventNotHandled (-10000) while ``name`` / ``file size`` /
+       ``downloaded`` of the SAME attachment read cleanly. Because the
+       record used to be built from four inline property reads in one
+       expression, that single bad property aborted the whole walk and a
+       perfectly saveable PDF surfaced as "no attachments". Probe output
+       and re-check commands: docs/research/attachment-property-10000.md.
+
+    2. **Whole-walk guard (outer).** ``mail attachments of <msg>`` can
+       itself raise -10000 on some inline-image multipart layouts. That
+       guard predates this one and is preserved, including its exact
+       warning wording.
+
+    On-failure defaults are empty/zero -- never a guess. A MIME type is
+    deliberately NOT inferred from the filename extension: the record
+    reports what Mail.app actually returned, and the warning says why it
+    is blank.
+
+    Args:
+        message_var: AppleScript variable holding the message.
+        warnings_var: AppleScript variable holding the warnings list.
+            Must already be initialized by the caller.
+        indent: Leading spaces for the emitted block.
+        list_var: AppleScript variable to build; initialized here.
+
+    Returns:
+        AppleScript fragment ready to interpolate.
+    """
+    pad = " " * indent
+    lines: list[str] = []
+    lines.append(f"{pad}set {list_var} to {{}}")
+    lines.append(f"{pad}try")
+    lines.append(f"{pad}    repeat with att in mail attachments of {message_var}")
+    for prop_expr, _key, var, default in _ATTACHMENT_PROPS:
+        prop_label = prop_expr.replace(" of att", "")
+        lines.append(f"{pad}        set {var} to {default}")
+        lines.append(f"{pad}        try")
+        lines.append(f"{pad}            set {var} to ({prop_expr})")
+        lines.append(f"{pad}        on error errMsg number errNum")
+        lines.append(
+            f"{pad}            set end of {warnings_var} to "
+            f'("attachment property {prop_label} unreadable for message " & '
+            f"(id of {message_var} as text) & \": \" & errMsg & "
+            f'" (error " & errNum & ")")'
+        )
+        lines.append(f"{pad}        end try")
+    record_fields = ", ".join(
+        f"|{key}|:{var}" for _e, key, var, _d in _ATTACHMENT_PROPS
+    )
+    lines.append(f"{pad}        set attRecord to {{{record_fields}}}")
+    lines.append(f"{pad}        set end of {list_var} to attRecord")
+    lines.append(f"{pad}    end repeat")
+    lines.append(f"{pad}on error errMsg number errNum")
+    lines.append(f"{pad}    set {list_var} to {{}}")
+    lines.append(
+        f"{pad}    set end of {warnings_var} to "
+        f'("attachment enumeration failed for message " & '
+        f"(id of {message_var} as text) & \": \" & errMsg & "
+        f'" (error " & errNum & ")")'
+    )
+    lines.append(f"{pad}end try")
+    return "\n".join(lines)
+
+
 class AppleMailConnector:
     """Interface to Apple Mail via AppleScript."""
 
@@ -1436,17 +1527,9 @@ class AppleMailConnector:
         # ``on_warning`` so the public ``search_messages`` lifts them
         # into the response ``warnings`` field. NO SILENT ERRORS.
         if include_attachments:
-            attachments_clause = '''
-                    set attList to {}
-                    try
-                        repeat with att in mail attachments of msg
-                            set attRecord to {|name|:(name of att), |mime_type|:(MIME type of att), |size|:(file size of att), |downloaded|:(downloaded of att)}
-                            set end of attList to attRecord
-                        end repeat
-                    on error errMsg number errNum
-                        set attList to {}
-                        set end of warnList to ("attachment enumeration failed for message " & (id of msg as text) & ": " & errMsg & " (error " & errNum & ")")
-                    end try'''
+            attachments_clause = "\n" + _attachment_walk_block(
+                message_var="msg", warnings_var="warnList", indent=20
+            )
             attachments_field = ", |attachments|:attList"
         else:
             attachments_clause = ""
@@ -1650,6 +1733,10 @@ class AppleMailConnector:
             )
             id_where = f'whose message id is "{bracketed_safe}"'
 
+        att_walk = _attachment_walk_block(
+            message_var="foundMsg", warnings_var="attWarnings", indent=12
+        )
+
         tell_body = f'''
         tell application "Mail"
             set foundMsg to missing value
@@ -1667,17 +1754,8 @@ class AppleMailConnector:
                 error "Can't get message: not found"
             end if
 
-            set attList to {{}}
             set attWarnings to {{}}
-            try
-                repeat with att in mail attachments of foundMsg
-                    set attRecord to {{|name|:(name of att), |mime_type|:(MIME type of att), |size|:(file size of att), |downloaded|:(downloaded of att)}}
-                    set end of attList to attRecord
-                end repeat
-            on error errMsg number errNum
-                set attList to {{}}
-                set end of attWarnings to ("attachment enumeration failed for message " & (id of foundMsg as text) & ": " & errMsg & " (error " & errNum & ")")
-            end try
+{att_walk}
 
             set resultData to {{|attachments|:attList, |warnings|:attWarnings}}
         end tell
@@ -2627,11 +2705,11 @@ class AppleMailConnector:
 
         Two-pass implementation. Pass 1 delegates metadata enumeration
         to :meth:`_enumerate_attachments_for_message` — the single
-        owner of the inline-image -10000 guard. If the helper returns
-        a non-empty warnings list (i.e. enumeration was degraded by
-        Mail.app), the call returns ``(0, warnings)`` immediately;
-        nothing can be saved because we have no references. Pass 2
-        runs a separate AppleScript that re-locates the message and
+        owner of the -10000 guards. If that returns no attachments the
+        call returns ``(0, warnings)`` immediately; without references
+        there is nothing to save. Warnings alone do NOT stop the save:
+        a per-property warning still leaves a saveable attachment. Pass
+        2 runs a separate AppleScript that re-locates the message and
         saves the requested attachments by 1-based index, using the
         helper's count to bound ``attachment_indices``.
 
@@ -2649,9 +2727,10 @@ class AppleMailConnector:
             ``saved_count`` is the number of files written.
 
             ``warnings`` is a list of strings describing degradation
-            (empty on the success path). When non-empty,
-            ``saved_count`` will be 0 — the enumeration could not
-            give us references to save.
+            (empty on the success path). It can be non-empty WITH a
+            non-zero ``saved_count``: a property-level warning degrades
+            the metadata, not the file. ``saved_count`` is 0 with
+            warnings only when enumeration yielded no references.
 
         Raises:
             FileNotFoundError: save_directory doesn't exist.
@@ -2674,15 +2753,19 @@ class AppleMailConnector:
         except (RuntimeError, OSError) as e:
             raise ValueError(f"Invalid save directory: {e}") from e
 
-        # Pass 1: helper owns the -10000 guard. Bail with warnings if
-        # enumeration was degraded — nothing to save without references.
+        # Pass 1: helper owns both -10000 guards. Bail only when the walk
+        # produced NO references — that is the whole-walk failure, where
+        # there is genuinely nothing to save. A per-property warning (e.g.
+        # an unreadable MIME type) still yields a saveable attachment, so
+        # it must NOT block the save; it rides along in the return value.
+        # Verified live 2026-08-27 against iCloud INBOX 1463/1465/1466:
+        # MIME type raised -10000 while the files saved intact at their
+        # reported sizes. See docs/research/attachment-property-10000.md.
         attachments, warnings = self._enumerate_attachments_for_message(
             message_id
         )
-        if warnings:
-            return 0, warnings
         if not attachments:
-            return 0, []
+            return 0, warnings
 
         # Resolve which indices to save. Filter to the actual range so
         # the second AppleScript never references items past the end.
@@ -2694,7 +2777,7 @@ class AppleMailConnector:
                 i for i in attachment_indices if 0 <= i < n
             ]
         if not selected_zero_based:
-            return 0, []
+            return 0, warnings
 
         # Pass 2: save by 1-based index in a fresh AppleScript. The
         # helper already proved `mail attachments of msg` doesn't
@@ -2711,7 +2794,14 @@ class AppleMailConnector:
 
         indices_str = ", ".join(str(i + 1) for i in selected_zero_based)
 
-        script = f"""
+        # Pass 2 emits JSON {saved, warnings} rather than a bare count.
+        # Every failure gets an on-error branch: the previous unqualified
+        # `try` swallowed save errors whole, so a total failure returned
+        # (0, []) — "no files, no reason". Destination is built with
+        # `POSIX file` per the project's AppleScript convention; a bare
+        # string path raised -10000 under /private/tmp when probed
+        # 2026-08-27 (see docs/research/attachment-property-10000.md).
+        tell_body = f'''
         tell application "Mail"
             set foundMsg to missing value
             repeat with acc in accounts
@@ -2728,23 +2818,36 @@ class AppleMailConnector:
                 error "Can't get message: not found"
             end if
 
+            set saveWarnings to {{}}
             set attRefs to items {{{indices_str}}} of mail attachments of foundMsg
             set saveCount to 0
+            set attIdx to 0
             repeat with att in attRefs
+                set attIdx to attIdx + 1
+                set attName to ("attachment-" & attIdx)
                 try
-                    set attName to name of att
-                    save att in ("{dir_safe}/" & attName)
+                    set attName to (name of att)
+                on error errMsg number errNum
+                    set end of saveWarnings to ("attachment name unreadable for message " & (id of foundMsg as text) & " attachment " & attIdx & ", saved as '" & attName & "': " & errMsg & " (error " & errNum & ")")
+                end try
+                try
+                    save att in (POSIX file ("{dir_safe}/" & attName))
                     set saveCount to saveCount + 1
+                on error errMsg number errNum
+                    set end of saveWarnings to ("attachment save failed for '" & attName & "' of message " & (id of foundMsg as text) & ": " & errMsg & " (error " & errNum & ")")
                 end try
             end repeat
 
-            return saveCount
+            set resultData to {{|saved|:saveCount, |warnings|:saveWarnings}}
         end tell
-        """
+        '''
 
+        script = _wrap_as_json_script(tell_body, timeout=self.timeout)
         result = self._run_applescript(script)
-        saved = int(result) if result.isdigit() else 0
-        return saved, []
+        parsed = cast(dict[str, Any], parse_applescript_json(result))
+        saved = int(parsed.get("saved") or 0)
+        save_warnings = cast(list[str], parsed.get("warnings") or [])
+        return saved, warnings + save_warnings
 
     def move_messages(
         self,

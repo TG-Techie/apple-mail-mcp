@@ -176,7 +176,10 @@ INVOCATION_CASES: list[tuple[str, dict[str, Any], str, Any]] = [
         "save_attachments",
         {"message_id": "msg-1", "save_directory": _TMP_DIR},
         "save_attachments",
-        0,
+        # The connector returns (saved_count, warnings) — a bare int here
+        # made server.py raise "cannot unpack non-iterable int object",
+        # so this case asserted nothing about the tool.
+        (0, []),
     ),
     (
         "create_mailbox",

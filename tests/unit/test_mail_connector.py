@@ -1,6 +1,7 @@
 """Unit tests for mail connector."""
 
 import logging
+import tempfile
 import time
 import warnings
 from pathlib import Path
@@ -4531,7 +4532,7 @@ class TestWhoseIdQuoting:
         mock_run.side_effect = [
             '{"attachments":[{"name":"a.pdf","mime_type":"application/pdf",'
             '"size":1,"downloaded":true}],"warnings":[]}',
-            "1",
+            '{"saved":1,"warnings":[]}',
         ]
         # save_attachments takes a Path (uses .exists()).
         import tempfile
@@ -4544,6 +4545,210 @@ class TestWhoseIdQuoting:
         assert all(
             f'whose message id is "<{uuid_id}>"' in s for s in scripts
         ), f"expected quoted id in every script: {scripts}"
+
+
+class TestAttachmentPropertyGuards:
+    """One unreadable attachment PROPERTY must not kill the whole walk.
+
+    Real-world case (2026-08-27, iCloud INBOX messages 1463-1466): the
+    ``MIME type`` property of a PDF attachment raises errAEEventNotHandled
+    (-10000) while name/file size/downloaded all read cleanly. The old
+    enumeration built its record with all four property reads in ONE
+    expression, so the single bad property aborted the walk, tripped the
+    whole-walk -10000 guard, and search/get/save all degraded to
+    "attachment enumeration failed" — blocking retrieval of perfectly
+    saveable files.
+
+    Invariant pinned here: every attachment-record property is read into
+    its own variable under its own try block (record built from the
+    variables), in BOTH script generators — the shared
+    ``_enumerate_attachments_for_message`` helper and the
+    ``_search_messages_applescript`` include_attachments clause.
+    """
+
+    @pytest.fixture
+    def connector(self) -> AppleMailConnector:
+        return AppleMailConnector(timeout=30)
+
+    def _assert_per_property_guards(self, script: str) -> None:
+        # Record must be built from pre-read variables...
+        assert "|mime_type|:attMime" in script
+        assert "|name|:attName" in script
+        assert "|size|:attSize" in script
+        assert "|downloaded|:attDown" in script
+        # ...never from inline property reads (the one-expression form
+        # that lets a single bad property abort the walk).
+        assert "|mime_type|:(MIME type of att)" not in script
+        assert "|name|:(name of att)" not in script
+        # Each fragile read sits under its own try.
+        assert "set attMime to (MIME type of att)" in script
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_enumerate_helper_guards_each_property(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        mock_run.return_value = '{"attachments":[],"warnings":[]}'
+        connector._enumerate_attachments_for_message("1463")
+        self._assert_per_property_guards(mock_run.call_args[0][0])
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_search_clause_guards_each_property(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        mock_run.return_value = '{"messages":[],"warnings":[]}'
+        connector._search_messages_applescript(
+            "Test Account", include_attachments=True
+        )
+        self._assert_per_property_guards(mock_run.call_args[0][0])
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_property_failure_surfaces_as_warning_not_empty_walk(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        """A degraded record (empty mime_type + warning) passes through —
+        the Python side must not drop it or mistake it for a failure."""
+        mock_run.return_value = (
+            '{"attachments":[{"name":"3D RATIONALITY.pdf","mime_type":"",'
+            '"size":4216772,"downloaded":true}],'
+            '"warnings":["attachment property MIME type unreadable for '
+            "message 1463 attachment '3D RATIONALITY.pdf': ... (error "
+            '-10000)"]}'
+        )
+        attachments, warnings = connector._enumerate_attachments_for_message(
+            "1463"
+        )
+        assert attachments == [
+            {
+                "name": "3D RATIONALITY.pdf",
+                "mime_type": "",
+                "size": 4216772,
+                "downloaded": True,
+            }
+        ]
+        assert len(warnings) == 1
+        assert "MIME type" in warnings[0]
+
+    @patch.object(AppleMailConnector, "_enumerate_attachments_for_message")
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_save_proceeds_when_a_property_warned_but_files_exist(
+        self,
+        mock_run: MagicMock,
+        mock_enum: MagicMock,
+        connector: AppleMailConnector,
+    ) -> None:
+        """A property-level warning must NOT block the save.
+
+        ``save_attachments`` used to bail on ANY warning
+        (``if warnings: return 0, warnings``) — correct back when the only
+        possible warning was the whole-walk failure, where the list really
+        is empty. A per-property warning leaves a perfectly saveable
+        attachment in the list, and Mail.app saves it fine (verified live
+        2026-08-27 on iCloud INBOX 1463/1465/1466 — the files came out
+        byte-for-byte at their reported sizes). Bail on "no attachments",
+        never on "a property was blank".
+        """
+        warning = (
+            "attachment property MIME type unreadable for message 1463: "
+            "Mail got an error: AppleEvent handler failed. (error -10000)"
+        )
+        mock_enum.return_value = (
+            [
+                {
+                    "name": "3D RATIONALITY.pdf",
+                    "mime_type": "",
+                    "size": 4216772,
+                    "downloaded": True,
+                }
+            ],
+            [warning],
+        )
+        mock_run.return_value = '{"saved":1,"warnings":[]}'
+        with tempfile.TemporaryDirectory() as td:
+            saved, warnings = connector.save_attachments("1463", Path(td))
+        assert saved == 1, "the save pass must run despite the warning"
+        assert warnings == [warning], "the warning must still be surfaced"
+        assert mock_run.called, "pass 2 (the actual save) never ran"
+
+    @patch.object(AppleMailConnector, "_enumerate_attachments_for_message")
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_save_still_bails_when_whole_walk_failed(
+        self,
+        mock_run: MagicMock,
+        mock_enum: MagicMock,
+        connector: AppleMailConnector,
+    ) -> None:
+        """Whole-walk failure => no references => nothing to save, and the
+        warning is still returned to the caller."""
+        warning = (
+            "attachment enumeration failed for message 1463: Mail got an "
+            "error: AppleEvent handler failed. (error -10000)"
+        )
+        mock_enum.return_value = ([], [warning])
+        with tempfile.TemporaryDirectory() as td:
+            saved, warnings = connector.save_attachments("1463", Path(td))
+        assert saved == 0
+        assert warnings == [warning]
+        assert not mock_run.called, "must not attempt a save with no refs"
+
+    @patch.object(AppleMailConnector, "_enumerate_attachments_for_message")
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_save_pass2_uses_posix_file_reference(
+        self,
+        mock_run: MagicMock,
+        mock_enum: MagicMock,
+        connector: AppleMailConnector,
+    ) -> None:
+        """Pass 2 must build the destination with ``POSIX file``.
+
+        CLAUDE.md: "Use POSIX file references (POSIX file "/path/to/file")
+        in AppleScript." The bare-string form violated that. Probed live
+        2026-08-27 with the same attachment saved both ways: the bare
+        string raised -10000 under /private/tmp ("To view or change
+        permissions...") while POSIX file succeeded; under ~/Downloads
+        BOTH succeeded. So the bare string is not universally broken —
+        it is strictly more fragile, and POSIX file is the form that
+        worked everywhere probed.
+        """
+        mock_enum.return_value = (
+            [{"name": "a.pdf", "mime_type": "", "size": 1, "downloaded": True}],
+            [],
+        )
+        mock_run.return_value = '{"saved":1,"warnings":[]}'
+        with tempfile.TemporaryDirectory() as td:
+            connector.save_attachments("1463", Path(td))
+        script = mock_run.call_args[0][0]
+        assert "POSIX file" in script, "pass 2 must use a POSIX file ref"
+
+    @patch.object(AppleMailConnector, "_enumerate_attachments_for_message")
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_save_surfaces_per_attachment_failure_not_a_silent_zero(
+        self,
+        mock_run: MagicMock,
+        mock_enum: MagicMock,
+        connector: AppleMailConnector,
+    ) -> None:
+        """A failed save must produce a WARNING, never a bare 0.
+
+        Pass 2 wrapped each save in an unqualified ``try`` with no
+        on-error branch, so a failure decremented nothing and vanished:
+        the caller got ``(0, [])`` — "no files, no reason". That is the
+        silent-failure mode this project forbids, and it cost a real
+        debugging cycle on 2026-08-27.
+        """
+        mock_enum.return_value = (
+            [{"name": "a.pdf", "mime_type": "", "size": 1, "downloaded": True}],
+            [],
+        )
+        mock_run.return_value = (
+            '{"saved":0,"warnings":["attachment save failed for '
+            "'a.pdf' of message 1463: Mail got an error: ... (error "
+            '-10000)"]}'
+        )
+        with tempfile.TemporaryDirectory() as td:
+            saved, warnings = connector.save_attachments("1463", Path(td))
+        assert saved == 0
+        assert len(warnings) == 1, "a failed save must explain itself"
+        assert "save failed" in warnings[0]
 
 
 class TestWrapAsJsonScript:

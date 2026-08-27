@@ -79,7 +79,11 @@ class TestGetAttachments:
         mock_run.return_value = '{"attachments":[],"warnings":[]}'
         connector.get_attachments("12345")
         script = mock_run.call_args[0][0]
-        assert "|name|:(name of att)" in script
+        # The VALUE is now a pre-read variable (each property is read
+        # under its own try — see _attachment_walk_block); the KEY must
+        # still be pipe-quoted, which is what this guard is about.
+        assert "|name|:attName" in script
+        assert ", name:" not in script
 
     @patch.object(AppleMailConnector, "_run_applescript")
     def test_get_attachments_script_quotes_size_key(
@@ -93,8 +97,8 @@ class TestGetAttachments:
         mock_run.return_value = '{"attachments":[],"warnings":[]}'
         connector.get_attachments("msg-1")
         script = mock_run.call_args[0][0]
-        assert "|size|:(file size of att)" in script
-        assert ", size:(file size of att)" not in script
+        assert "|size|:attSize" in script
+        assert ", size:" not in script
 
 
 class TestSaveAttachments:
@@ -113,14 +117,15 @@ class TestSaveAttachments:
 
         Two-pass contract: pass 1 enumerates metadata (record with
         ``attachments``/``warnings``), pass 2 saves by 1-based index and
-        returns the saved count. ``save_attachments`` returns
-        ``(count, warnings)``.
+        returns a record with ``saved``/``warnings`` (JSON, so a failed
+        save reports WHY instead of silently counting 0).
+        ``save_attachments`` returns ``(count, warnings)``.
         """
         mock_run.side_effect = [
             '{"attachments":[{"name":"document.pdf",'
             '"mime_type":"application/pdf","size":1000,"downloaded":true}],'
             '"warnings":[]}',
-            "1",
+            '{"saved":1,"warnings":[]}',
         ]
 
         result = connector.save_attachments(
@@ -146,7 +151,7 @@ class TestSaveAttachments:
             '{"name":"b.pdf","mime_type":"application/pdf","size":2,"downloaded":true},'
             '{"name":"c.pdf","mime_type":"application/pdf","size":3,"downloaded":true}'
             '],"warnings":[]}',
-            "3",
+            '{"saved":3,"warnings":[]}',
         ]
 
         result = connector.save_attachments(

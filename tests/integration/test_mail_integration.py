@@ -1523,3 +1523,123 @@ class TestFindMessageByMessageIdIntegration:
             pass
         finally:
             connector.delete_draft(draft_id)
+
+
+class TestAttachmentPropertyGuardIntegration:
+    """Real-Mail.app coverage for the per-property attachment guard.
+
+    Unit tests mock ``_run_applescript`` and therefore cannot catch an
+    AppleScript bug — that is exactly how the -10000 MIME type failure
+    survived. These assert machine-INDEPENDENT invariants: we do not
+    assume any particular property fails here (on the machine where this
+    was written, 140/140 attachments had an unreadable MIME type; another
+    machine may have none). What must hold everywhere is that an
+    unreadable property degrades ONE FIELD and is reported, never costing
+    us the attachment.
+
+    Evidence and probes: docs/research/attachment-property-10000.md
+    """
+
+    def _first_message_with_attachments(
+        self, connector: AppleMailConnector, test_account: str
+    ) -> str | None:
+        matches = connector.search_messages(
+            account=test_account, mailbox="INBOX", has_attachment=True, limit=1
+        )
+        return str(matches[0]["id"]) if matches else None
+
+    def test_attachments_survive_an_unreadable_property(
+        self, connector: AppleMailConnector, test_account: str
+    ) -> None:
+        """A message Mail reports as having attachments must enumerate to a
+        non-empty list, with a readable name per record."""
+        msg_id = self._first_message_with_attachments(connector, test_account)
+        if msg_id is None:
+            pytest.skip("test inbox has no messages with attachments")
+
+        attachments, warnings = connector._enumerate_attachments_for_message(
+            msg_id
+        )
+
+        assert attachments, (
+            f"message {msg_id} is attachment-bearing per Mail's own filter "
+            f"but enumerated to an empty list; warnings={warnings}"
+        )
+        for att in attachments:
+            assert set(att.keys()) >= {
+                "name", "mime_type", "size", "downloaded"
+            }
+            assert att["name"], "attachment name must not be blank"
+
+        # Any degradation must name the property it lost — never a bare
+        # 'enumeration failed' that discards the whole walk.
+        for w in warnings:
+            assert "attachment property" in w, (
+                f"whole-walk failure resurfaced on {msg_id}: {w}"
+            )
+
+    def test_save_succeeds_despite_property_warnings(
+        self, connector: AppleMailConnector, test_account: str, tmp_path: Path
+    ) -> None:
+        """Files must land on disk even when a property read failed, and the
+        reported count must match what is actually written."""
+        msg_id = self._first_message_with_attachments(connector, test_account)
+        if msg_id is None:
+            pytest.skip("test inbox has no messages with attachments")
+
+        attachments, _ = connector._enumerate_attachments_for_message(msg_id)
+        # Without this the whole test is vacuous: a broken enumeration
+        # returns [] and every count assertion below becomes 0 == 0.
+        assert attachments, "enumeration returned nothing to save"
+        saved, warnings = connector.save_attachments(msg_id, tmp_path)
+
+        on_disk = [p for p in tmp_path.iterdir() if p.is_file()]
+        assert saved == len(attachments), (
+            f"expected to save all {len(attachments)} attachments of "
+            f"{msg_id}, saved {saved}; warnings={warnings}"
+        )
+        assert len(on_disk) == saved, (
+            f"reported {saved} saved but {len(on_disk)} files on disk — the "
+            f"count must reflect reality"
+        )
+        # Sizes must match the enumerated metadata (proves we saved the
+        # real payload, not an empty placeholder).
+        by_name = {p.name: p.stat().st_size for p in on_disk}
+        for att in attachments:
+            if att["name"] in by_name and att["size"]:
+                assert by_name[att["name"]] == att["size"], (
+                    f"{att['name']}: on-disk {by_name[att['name']]} != "
+                    f"reported {att['size']}"
+                )
+
+    def test_failed_save_reports_a_reason(
+        self, connector: AppleMailConnector, test_account: str, tmp_path: Path
+    ) -> None:
+        """A save that fails must say WHY, never return a bare 0.
+
+        Pass 2 used to wrap each save in an unqualified ``try`` with no
+        on-error branch, so a total failure surfaced as ``(0, [])`` — no
+        files and no reason. Uses a real, EXISTING but read-only
+        directory so the failure happens inside Mail's save, past the
+        directory-validation gate.
+        """
+        msg_id = self._first_message_with_attachments(connector, test_account)
+        if msg_id is None:
+            pytest.skip("test inbox has no messages with attachments")
+
+        attachments, _ = connector._enumerate_attachments_for_message(msg_id)
+        assert attachments, "enumeration returned nothing to save"
+
+        readonly = tmp_path / "readonly"
+        readonly.mkdir()
+        readonly.chmod(0o555)
+        try:
+            saved, warnings = connector.save_attachments(msg_id, readonly)
+        finally:
+            readonly.chmod(0o755)
+
+        assert saved == 0, "nothing should be written to a read-only dir"
+        assert warnings, "a failed save must explain itself, never a bare 0"
+        assert any("save failed" in w for w in warnings), (
+            f"expected a save-failure warning naming the cause, got {warnings}"
+        )
