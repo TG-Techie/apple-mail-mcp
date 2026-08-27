@@ -55,6 +55,26 @@ Requested by Jonah after I twice misjudged who a thread message was for.
   the thread, Jonah didn't see my conclusion; acknowledge before long
   work.
 
+## Epistemics — record the SOT, not conclusions
+
+Standing doctrine, applies to all work here. Canonical text (Jonah's own
+words, verbatim, plus labeled derivations): imessage-mcp
+`docs/EPISTEMICS.md`. In short:
+
+- Record sources of truth and real results; a conclusion is many-to-one
+  over realities, so a later reader cannot invert it back to what was
+  observed. Derivation is cheap; lost SOT is unrecoverable.
+- Never presume — check what the thing IS. Read the docs, probe the live
+  system, then assert correctness and fail loudly.
+- A probe that found nothing records "probe saw nothing", never "ruled
+  out". A causal explanation stays a labeled derivation even after the
+  fix appears to work.
+- Conclusions may be recorded only adjacent to their evidence, labeled.
+
+Worked example in this repo: `docs/research/attachment-property-10000.md`
+(observations with re-check commands first; derivations labeled, last,
+including two explicitly marked UNVERIFIED).
+
 ## MCP context exposure (Jonah, 2026-08-26; relayed by dusky-thorn)
 
 Directives on how much text an MCP server puts into agents' context.
