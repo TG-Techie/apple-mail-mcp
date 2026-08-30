@@ -4,8 +4,11 @@ Project-specific discipline only. The general rules are fleet-wide and
 live in one place:
 
 - `~/AgentAccessEnv/fleet-config/operating-values.md` — how work is done
-  (never presume/check, fail loudly, engineer structurally, scope and
-  standing changes).
+  (fail loudly, engineer structurally, scope and standing changes).
+- `~/AgentAccessEnv/fleet-config/epistemics.md` — how you know what you
+  claim, and how you record it (never presume/check, observation over
+  conclusion, labeled derivations), with Jonah's 2026-08-23 verbatim
+  words.
 - `~/AgentAccessEnv/fleet-config/communication.md` — how it is spoken
   about (the two reader regimes, message shape, cadence, channels, asks,
   signals).
@@ -65,10 +68,12 @@ imessage-mcp `docs/DECISION-LOG.md`.
 
 ## Epistemics, worked example in this repo
 
-The doctrine is `operating-values.md` § "Never presume; check" (record
-the observation not the conclusion; a probe that finds nothing means
-"nothing found", never "ruled out"; label derivations). Canonical long
-form with Jonah's verbatim words: imessage-mcp `docs/EPISTEMICS.md`.
+The doctrine is `epistemics.md` (record the observation not the
+conclusion; a probe that finds nothing means "nothing found", never
+"ruled out"; label derivations). It moved there from
+`operating-values.md` in the 2026-08-30 three-way split. The raw record
+its verbatim quotes were first written down in is imessage-mcp
+`docs/EPISTEMICS.md`.
 
 Held to that standard here: `docs/research/attachment-property-10000.md`
 — observations with re-check commands first, derivations labeled last,
