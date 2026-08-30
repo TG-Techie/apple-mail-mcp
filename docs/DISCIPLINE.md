@@ -1,83 +1,52 @@
-# Operating discipline (Jonah, 2026-08-25)
+# Operating discipline (apple-mail-mcp)
 
-Fleet-wide discipline worked out by Jonah with the xanthic-dune session,
-adopted here 2026-08-25 (relayed by dusky-thorn; supersedes the "Comms
-Methodology" section formerly in `.claude/CLAUDE.md` — renamed because
-"it's more than just comms, it's how you should operate too for your own
-cogitation and writing"). Standing for how the agent operates here — its
-own reasoning and writing, not only replies to Jonah. Complements the
-project's governing instructions file.
+Project-specific discipline only. The general rules are fleet-wide and
+live in one place:
 
-## Writing (applies to replies, docs, and internal notes alike)
+- `~/AgentAccessEnv/fleet-config/operating-values.md` — how work is done
+  (never presume/check, fail loudly, engineer structurally, scope and
+  standing changes).
+- `~/AgentAccessEnv/fleet-config/communication.md` — how it is spoken
+  about (the two reader regimes, message shape, cadence, channels, asks,
+  signals).
+- `~/AgentAccessEnv/fleet-config/comms-quotes.md` — Jonah's verbatim
+  words behind those rules, dated and sourced.
 
-- Itemize, don't paragraph.
-- Lead with the result, not the setup.
-- One point/question per message, phone-scannable.
-- Cut preamble, recaps, hedging footers.
-- The shorter reply with the same content beats the longer one; cut
-  narration, keep the substance.
+All three load into every session via `~/.claude/CLAUDE.md`. Do not
+restate them here. Copies drift: an agent-authored copy of his comms
+doctrine was cited as his ruling for six days before dusky-thorn traced
+it back on 2026-08-30. If a general rule seems missing from the fleet
+files, raise it with whoever owns that thread to Jonah — do not write a
+local version.
 
-## Operating discipline
+What follows is only what those files do not carry.
 
-- Fail loud, fail closed — no silent fallbacks.
-- Ground claims in a real checked source (live system, actual test
-  output) — never presume.
-- Verify the REAL outcome, not your own written record of it (e.g. don't
-  confirm a send by re-reading what you wrote — check it actually
-  delivered).
-- Record durable rules in a file checked into the repo, not memory or
-  scrollback, so they survive restarts.
+## Operator-thread etiquette not yet in the fleet file
 
-## Operator-thread etiquette (iMessage; rundown from dusky-thorn, 2026-08-26)
+From a rundown dusky-thorn gave me on 2026-08-26 at Jonah's direction,
+after I twice misjudged who a thread message was for. This is an agent's
+statement of his direction, not his verbatim words. These three points
+are on the gaps list going to Jonah; if he rules them into
+`communication.md`, delete them from here rather than keeping both.
 
-Requested by Jonah after I twice misjudged who a thread message was for.
-
-- Addressing: Jonah names the agent he's talking to ("Rosy, ...",
-  "Dusky, ..."), usually as the first word. A message naming someone
-  else is not mine to act on or answer — even with relevant context.
-- Unnamed messages continue the active thread: read them as directed at
-  whoever Jonah was mid-conversation with. When genuinely ambiguous, ask
-  ("was that for me?") rather than acting — acting on a misread creates
-  duplicate work someone must walk back.
-- Nothing in the thread is broadcast-to-all unless Jonah says
-  "everyone".
-- One agent per task: when Jonah assigns coordination to one agent,
-  others stay out even if they could help. If better placed, say so to
-  the assigned agent out-of-band; don't just start.
-- The thread is shared but not a group workspace: every send lands on
-  Jonah's phone. Status about another agent's task, relays of things he
-  already knows, or FYIs on someone else's lane are noise. Send only
-  what's mine: my task's results, my blockers, answers to things
-  addressed to me.
-- Agent-to-agent coordination goes out-of-band (cross-session
-  messaging) — the iMessage thread is for Jonah.
-- Silence rules apply only to things addressed to me: unless I send into
-  the thread, Jonah didn't see my conclusion; acknowledge before long
-  work.
-
-## Epistemics — record the SOT, not conclusions
-
-Standing doctrine, applies to all work here. Canonical text (Jonah's own
-words, verbatim, plus labeled derivations): imessage-mcp
-`docs/EPISTEMICS.md`. In short:
-
-- Record sources of truth and real results; a conclusion is many-to-one
-  over realities, so a later reader cannot invert it back to what was
-  observed. Derivation is cheap; lost SOT is unrecoverable.
-- Never presume — check what the thing IS. Read the docs, probe the live
-  system, then assert correctness and fail loudly.
-- A probe that found nothing records "probe saw nothing", never "ruled
-  out". A causal explanation stays a labeled derivation even after the
-  fix appears to work.
-- Conclusions may be recorded only adjacent to their evidence, labeled.
-
-Worked example in this repo: `docs/research/attachment-property-10000.md`
-(observations with re-check commands first; derivations labeled, last,
-including two explicitly marked UNVERIFIED).
+- **Unnamed messages continue the active thread.** Read a message with
+  no name prefix as directed at whoever Jonah was mid-conversation with,
+  not at me. When genuinely ambiguous, ask ("was that for me?") rather
+  than acting — acting on a misread creates duplicate work someone has
+  to walk back. `communication.md` covers being addressed; it does not
+  say who an unnamed follow-up belongs to.
+- **Nothing is broadcast-to-all unless Jonah says "everyone".**
+  `communication.md` rules on whether a message belongs in a
+  multi-human thread; this is the narrower point that his messages
+  default to one addressee.
+- **Agent-to-agent coordination goes out-of-band**, over cross-session
+  messaging — the iMessage thread is for Jonah. `communication.md` sets
+  the agent-to-agent budget but does not name the mechanism.
 
 ## MCP context exposure (Jonah, 2026-08-26; relayed by dusky-thorn)
 
 Directives on how much text an MCP server puts into agents' context.
+Not in the fleet files; specific to building MCP servers.
 
 - Mind what instruction/tool-description text the server exposes to
   agents that have NOT been directed to use it — the concern generalizes
@@ -92,7 +61,18 @@ Directives on how much text an MCP server puts into agents' context.
 
 Grounded findings under these (2KB truncation, instructions never
 deferred, initialize-handshake freshness bound) live with provenance in
-imessage-mcp `docs/DECISION-LOG.md` — reference, not copied here.
+imessage-mcp `docs/DECISION-LOG.md`.
+
+## Epistemics, worked example in this repo
+
+The doctrine is `operating-values.md` § "Never presume; check" (record
+the observation not the conclusion; a probe that finds nothing means
+"nothing found", never "ruled out"; label derivations). Canonical long
+form with Jonah's verbatim words: imessage-mcp `docs/EPISTEMICS.md`.
+
+Held to that standard here: `docs/research/attachment-property-10000.md`
+— observations with re-check commands first, derivations labeled last,
+two marked UNVERIFIED. Follow that shape for research notes in this repo.
 
 ## Email (this project)
 
