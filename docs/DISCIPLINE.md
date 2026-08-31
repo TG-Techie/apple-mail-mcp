@@ -3,19 +3,21 @@
 Project-specific discipline only. The general rules are fleet-wide and
 live in one place:
 
-- `~/AgentAccessEnv/fleet-config/operating-values.md` — how work is done
-  (fail loudly, engineer structurally, scope and standing changes).
-- `~/AgentAccessEnv/fleet-config/epistemics.md` — how you know what you
-  claim, and how you record it (never presume/check, observation over
-  conclusion, labeled derivations), with Jonah's 2026-08-23 verbatim
-  words.
-- `~/AgentAccessEnv/fleet-config/communication.md` — how it is spoken
-  about: the checks to run on a message before it leaves, then cadence,
-  channels, asks, signals, and the inverted budget for agent-to-agent
-  messages. Rewritten 2026-08-31; read it from disk rather than from
-  memory of an earlier version.
-- `~/AgentAccessEnv/fleet-config/authorization.md` — what requires
-  Jonah's approval, and how a standing change is granted and recorded.
+- `~/AgentAccessEnv/fleet-config/operating-values.md` — for how the work
+  is done.
+- `~/AgentAccessEnv/fleet-config/epistemics.md` — for how you know what
+  you claim, and how you record it so the next agent can check it.
+- `~/AgentAccessEnv/fleet-config/communication.md` — for how any of it
+  is spoken about, to Jonah or to another agent.
+- `~/AgentAccessEnv/fleet-config/authorization.md` — for what needs
+  Jonah's approval before you do it.
+
+Each line above says what its file is FOR, deliberately, and not what it
+currently contains. A purpose survives a rewrite; a summary of contents
+rots silently while the path keeps resolving, so it reads as current
+when it is not. Three files in this fleet described a moved or rewritten
+target on 2026-08-31 alone, this one among them. Read the target from
+disk before citing what it says.
 
 Those four are @-imported into every session by `~/.claude/CLAUDE.md`.
 Two companions sit beside them in the same directory and deliberately do
