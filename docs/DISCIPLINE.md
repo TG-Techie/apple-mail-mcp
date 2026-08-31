@@ -12,13 +12,18 @@ live in one place:
 - `~/AgentAccessEnv/fleet-config/communication.md` — how it is spoken
   about (the two reader regimes, message shape, cadence, channels, asks,
   signals).
-- `~/AgentAccessEnv/fleet-config/comms-quotes.md` — Jonah's verbatim
-  words behind those rules, dated and sourced.
+- `~/AgentAccessEnv/fleet-config/authorization.md` — what requires
+  Jonah's approval, and how a standing change is granted and recorded.
 
-All three load into every session via `~/.claude/CLAUDE.md`. Do not
-restate them here. Copies drift: an agent-authored copy of his comms
-doctrine was cited as his ruling for six days before dusky-thorn traced
-it back on 2026-08-30. If a general rule seems missing from the fleet
+Those four are @-imported into every session by `~/.claude/CLAUDE.md`.
+Two companions sit beside them in the same directory and deliberately do
+NOT load, so they cost no context: `comms-quotes.md`, Jonah's verbatim
+words behind the comms rules, dated and sourced; and
+`open-questions.md`. Read those from disk when you need them.
+
+Do not restate any of them here. Copies drift: an agent-authored copy
+of his comms doctrine was cited as his ruling for six days before
+dusky-thorn traced it back on 2026-08-30. If a general rule seems missing from the fleet
 files, raise it with whoever owns that thread to Jonah — do not write a
 local version.
 
