@@ -42,10 +42,40 @@ after a fleet-wide doctrine cleanup he had already said cost more of his
 time than he wanted to spend. Homing them in `communication.md` or
 `epistemics.md` is a standing change and needs his approval, which means
 reopening that thread; the only cost of leaving them local is that other
-projects cannot see them. Not worth another round today. Drafted
-wordings for all three, should anyone reopen it, are in the 2026-08-31
-exchange with tidal-quail and recorded on their side. If they are ever
-homed, delete them from here rather than keeping both.
+projects cannot see them. Not worth another round today. If they
+are ever homed, delete them from here rather than keeping both — and go
+in with the wordings below rather than rewriting them.
+
+**Drafts, if the question is reopened.** Written 2026-08-31, never put
+to Jonah, never approved. They are drafts, not doctrine, and carry no
+authority until he rules on them; nothing may cite them as his.
+
+- For `communication.md` § Channels, replacing the existing
+  courtesy-not-protocol sentence so both halves of the rule sit in one
+  paragraph: "Being addressed is often implied by context — the operator
+  prefixes a name when he remembers, as a courtesy, not a protocol. The
+  absence of a prefix is therefore not an opening: an unprefixed message
+  continues the exchange it arrives in, addressed to whoever was last
+  named in it. When that leaves it genuinely ambiguous, ask in one line
+  rather than acting. Acting on a misread costs two agents' work and
+  someone has to walk it back."
+- For the same section, after the multi-human paragraph: "A message in a
+  shared thread is addressed to one agent unless the operator says
+  'everyone'. Default quiet covers whether to speak; this covers whether
+  it was aimed at you. Reading a general remark as a general summons
+  puts three agents on one task."
+- For `epistemics.md`, as the reporting half of nothing-found: "State
+  the zero. A check that ran and found nothing is a result: report it as
+  one — 'no open contributor PRs', not silence. Silence is
+  indistinguishable from not having looked, and it is read as the
+  second. This is the reporting half of 'a probe that finds nothing
+  means nothing found, never ruled out': the first governs what you may
+  conclude, this governs what you owe the reader."
+
+The explicit-zero rule also lives as a procedure step in
+`.claude/commands/merge-and-status.md:36` and `:48`. That stays there
+regardless — it is an instruction inside a procedure, not a doctrine
+copy.
 
 - **Unnamed messages continue the active thread.** Read a message with
   no name prefix as directed at whoever Jonah was mid-conversation with,
