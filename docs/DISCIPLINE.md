@@ -10,8 +10,10 @@ live in one place:
   conclusion, labeled derivations), with Jonah's 2026-08-23 verbatim
   words.
 - `~/AgentAccessEnv/fleet-config/communication.md` — how it is spoken
-  about (the two reader regimes, message shape, cadence, channels, asks,
-  signals).
+  about: the checks to run on a message before it leaves, then cadence,
+  channels, asks, signals, and the inverted budget for agent-to-agent
+  messages. Rewritten 2026-08-31; read it from disk rather than from
+  memory of an earlier version.
 - `~/AgentAccessEnv/fleet-config/authorization.md` — what requires
   Jonah's approval, and how a standing change is granted and recorded.
 
@@ -23,9 +25,8 @@ words behind the comms rules, dated and sourced; and
 
 Do not restate any of them here. Copies drift: an agent-authored copy
 of his comms doctrine was cited as his ruling for six days before
-dusky-thorn traced it back on 2026-08-30. If a general rule seems missing from the fleet
-files, raise it with whoever owns that thread to Jonah — do not write a
-local version.
+dusky-thorn traced it back on 2026-08-30. If a general rule seems
+missing from the fleet files, raise it — do not write a local version.
 
 What follows is only what those files do not carry.
 
@@ -33,9 +34,18 @@ What follows is only what those files do not carry.
 
 From a rundown dusky-thorn gave me on 2026-08-26 at Jonah's direction,
 after I twice misjudged who a thread message was for. This is an agent's
-statement of his direction, not his verbatim words. These three points
-are on the gaps list going to Jonah; if he rules them into
-`communication.md`, delete them from here rather than keeping both.
+statement of his direction, not his verbatim words.
+
+These stay here by decision, not by default. Jonah put them to this
+project on 2026-08-31 — "Rosy are their buisness leave them to them" —
+after a fleet-wide doctrine cleanup he had already said cost more of his
+time than he wanted to spend. Homing them in `communication.md` or
+`epistemics.md` is a standing change and needs his approval, which means
+reopening that thread; the only cost of leaving them local is that other
+projects cannot see them. Not worth another round today. Drafted
+wordings for all three, should anyone reopen it, are in the 2026-08-31
+exchange with tidal-quail and recorded on their side. If they are ever
+homed, delete them from here rather than keeping both.
 
 - **Unnamed messages continue the active thread.** Read a message with
   no name prefix as directed at whoever Jonah was mid-conversation with,
