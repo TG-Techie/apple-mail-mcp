@@ -81,6 +81,14 @@ _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # AppleScript fallback against a mailbox where IMAP would help.
 _SLOW_SEARCH_THRESHOLD_SEC = 5.0
 
+# One-character body seed for scriptable compose windows. An EMPTY
+# `make new outgoing message` body has a WebArea that refuses keyboard
+# focus outright (observed live 2026-09-05 — see
+# _build_attach_compose_script). Any content fixes it, so this is the
+# least invasive content there is: a single space, which survives into
+# the sent body as one invisible character.
+_BODY_SEED = " "
+
 
 # MCP-tool field name → Mail.app AppleScript `rule type` enum identifier.
 # Verified against Mail.app's running rules: 'from header', 'subject header',
@@ -4290,6 +4298,18 @@ class AppleMailConnector:
         """
         body_safe = escape_applescript_string(sanitize_input(body))
         win_safe = escape_applescript_string(window_name)
+        # Caret to the start, so the paste lands ABOVE whatever the
+        # window already holds: Mail's auto-quoted original on a reply,
+        # and the one-space body seed on the attachments path.
+        #
+        # Do NOT try to remove that seed by editing around the paste.
+        # Three placements were measured on 2026-09-05 and all three
+        # were wrong: select-all (cmd+a) took the ATTACHMENTS with it and
+        # sent 0 of 2, because Mail keeps them in the body; a backspace
+        # at the very end deleted an attachment and sent 1 of 2; and a
+        # forward-delete either side of the paste left the seed in the
+        # sent HTML anyway. A single space is invisible in the rendered
+        # body, so it is left alone.
         caret_block = (
             "key code 126 using command down\n            delay 0.2"
             if place_above_existing
@@ -4920,8 +4940,32 @@ end tell
         attachment_paths: list[Path],
     ) -> str:
         """AppleScript: scriptable compose window with recipients and
-        attachments. No ``content`` setter (purple-bar mechanism); the
-        body arrives later via clipboard injection."""
+        attachments. The real body arrives later via clipboard injection.
+
+        ``content`` is set to a one-character seed, and that is
+        load-bearing rather than cosmetic. Observed live 2026-09-05: a
+        compose window made by ``make new outgoing message`` with an
+        EMPTY body has a WebArea that will not accept keyboard focus by
+        any route — ``set focused``, ``click``, a real coordinate click
+        inside its own bounds, and Tab from the subject field all leave
+        ``AXFocusedUIElement`` at ``missing value``, so the paste step
+        failed with PASTE_FOCUS_FAILED and the only attachment-capable
+        send path was dead. Setting any content makes the same WebArea
+        focus on the first try. A mailto-made window never had the
+        problem, which is why plain HTML sends kept working.
+
+        The seed is a single space and is deliberately left in place.
+        Removing it is not worth what it costs: cmd+a selects the
+        attachments too and the paste then destroys them (measured: 0 of
+        2 sent), a backspace at the end of the body deletes an
+        attachment (1 of 2), and a forward-delete either side of the
+        paste does not remove it at all. One space renders as nothing.
+
+        This method previously avoided the ``content`` setter because it
+        is what introduces Mail's URLShare quote scaffolding. That
+        scaffolding is present either way in this path and is tracked as
+        the standing iOS purple-bar re-check; the seed does not change
+        it."""
         subject_safe = escape_applescript_string(sanitize_input(subject))
         recipient_lines: list[str] = []
         for group, cls in ((to, "to recipient"), (cc or [], "cc recipient"),
@@ -4938,7 +4982,7 @@ end tell
         attach_block = self._build_attachment_block(attachment_paths)
         return f"""
 tell application "Mail"
-    set theMessage to make new outgoing message with properties {{subject:"{subject_safe}", visible:true}}
+    set theMessage to make new outgoing message with properties {{subject:"{subject_safe}", visible:true, content:"{_BODY_SEED}"}}
     tell theMessage
 {recipients_block}
     end tell

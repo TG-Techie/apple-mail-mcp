@@ -4751,6 +4751,97 @@ class TestAttachmentPropertyGuards:
         assert "save failed" in warnings[0]
 
 
+class TestAttachmentComposeBodySeed:
+    """The attachments compose path must seed the body with one space.
+
+    Observed live 2026-09-05: a compose window made by `make new
+    outgoing message` with an EMPTY body has a WebArea that refuses
+    keyboard focus by every route tried — `set focused`, `click`, a real
+    coordinate click inside its own bounds, and Tab from the subject
+    field all left AXFocusedUIElement at `missing value`. The paste step
+    then failed with PASTE_FOCUS_FAILED, which killed the only
+    attachment-capable send path (reported by crisp-kelp, three
+    identical failures). Any body content makes the same WebArea focus
+    on the first try. A mailto-made window was never affected, which is
+    why plain HTML sends kept working throughout.
+
+    The seed stays in the body on purpose. Every attempt to strip it was
+    measured worse than leaving it, and those measurements are what
+    these tests pin.
+    """
+
+    @pytest.fixture
+    def connector(self) -> AppleMailConnector:
+        return AppleMailConnector(timeout=30)
+
+    def test_compose_script_seeds_the_body_with_a_space(
+        self, connector: AppleMailConnector
+    ) -> None:
+        script = connector._build_attach_compose_script(
+            to=["a@example.com"], cc=None, bcc=None, subject="S",
+            attachment_paths=[],
+        )
+        assert 'content:" "' in script, (
+            "an empty body makes the WebArea unfocusable; seed it with a "
+            "space, which renders as nothing if it survives"
+        )
+
+    def test_paste_never_selects_all(
+        self, connector: AppleMailConnector
+    ) -> None:
+        """cmd+a would take the attachments with it.
+
+        Mail keeps attachments in the body, so a select-all paste
+        replaces them: measured live as 0 of 2 attachments sent, against
+        four earlier runs of the same test at 2 of 2.
+        """
+        script = connector._build_paste_script(
+            window_name="S", body="<p>hi</p>",
+            place_above_existing=True, undo_first=False,
+        )
+        assert 'keystroke "a" using command down' not in script
+
+    def test_paste_does_not_edit_around_the_seed(
+        self, connector: AppleMailConnector
+    ) -> None:
+        """No backspace and no forward-delete anywhere in the paste.
+
+        A backspace at the end of the body deleted an attachment (1 of 2
+        sent); a forward-delete either side of the paste did not remove
+        the seed at all. Both measured 2026-09-05.
+        """
+        script = connector._build_paste_script(
+            window_name="S", body="<p>hi</p>",
+            place_above_existing=True, undo_first=False,
+        )
+        assert "key code 51" not in script, "backspace deletes an attachment"
+        assert "key code 117" not in script, "forward-delete does not work"
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_attachments_path_emits_a_seeded_compose(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        """End to end through the real method, not just the builder."""
+        mock_run.side_effect = [
+            "COMPOSED",
+            "ATTACHMENTS_VERIFIED",
+            "PASTED_UNVERIFIED",
+            "hello",
+            "SENT",
+            "1",
+        ]
+        with tempfile.NamedTemporaryFile(suffix=".pdf") as tf:
+            connector._send_html_new_with_attachments(
+                to=["a@example.com"], cc=None, bcc=None,
+                subject="S", body="<p>hello</p>",
+                attachment_paths=[Path(tf.name)],
+            )
+        scripts = [c[0][0] for c in mock_run.call_args_list]
+        assert 'content:" "' in scripts[0]
+        paste = next(s for s in scripts if "public.html" in s)
+        assert 'keystroke "a" using command down' not in paste
+
+
 class TestWrapAsJsonScript:
     def test_wrapper_contains_framework_directive(self) -> None:
         script = _wrap_as_json_script(

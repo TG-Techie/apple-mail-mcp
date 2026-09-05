@@ -61,7 +61,22 @@ if ! RADON_JSON=$("${RADON[@]}" cc "$SRC_DIR" -n D -j 2>&1); then
     exit 1
 fi
 
-FAILURES=$(printf '%s' "$RADON_JSON" | python3 -c "
+# Resolve python the same way radon is resolved above. A bare `python3`
+# is whatever happens to be first on PATH, and on 2026-09-05 that was a
+# ~/.tg/bin/python3 left dangling by a Python framework upgrade: the gate
+# died with a dyld "Library not loaded" error instead of checking
+# anything. Same failure this script already had with a bare `radon`.
+if command -v uv &> /dev/null && uv run python --version &> /dev/null; then
+    PYTHON=(uv run python)
+elif command -v python3 &> /dev/null && python3 --version &> /dev/null; then
+    PYTHON=(python3)
+else
+    echo "Error: no working python found to parse the radon report." >&2
+    echo "Tried 'uv run python' and 'python3'." >&2
+    exit 1
+fi
+
+FAILURES=$(printf '%s' "$RADON_JSON" | "${PYTHON[@]}" -c "
 import json, sys
 
 THRESHOLD = $THRESHOLD
