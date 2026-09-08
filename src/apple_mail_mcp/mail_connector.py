@@ -7,15 +7,10 @@ import logging
 import os
 import re
 import subprocess
-import tempfile
 import time
 import urllib.parse
 import warnings
 from collections.abc import Callable
-from email.encoders import encode_base64 as _email_encode_base64
-from email.mime.base import MIMEBase as _MIMEBase
-from email.mime.multipart import MIMEMultipart as _MIMEMultipart
-from email.mime.text import MIMEText as _MIMEText
 from datetime import date as _date
 from datetime import timedelta as _timedelta
 from pathlib import Path
@@ -46,6 +41,7 @@ from .keychain import get_imap_password
 from .outbound_allowlist import assert_recipients_allowed_for_send
 from .utils import (
     applescript_account_clause,
+    applescript_iso_date_statements,
     escape_applescript_string,
     get_flag_index,
     parse_applescript_json,
@@ -1413,6 +1409,7 @@ class AppleMailConnector:
         # times per-message-property-fetch — typically dominated by the
         # first few hundred recent messages, which Mail caches locally.
         filter_checks: list[str] = []
+        date_setup: list[str] = []
 
         if sender_contains:
             sender_safe = escape_applescript_string(sanitize_input(sender_contains))
@@ -1447,9 +1444,12 @@ class AppleMailConnector:
                 raise ValueError(
                     f"date_from must be ISO 8601 YYYY-MM-DD, got: {date_from!r}"
                 )
+            date_setup.append(
+                applescript_iso_date_statements("dateFromCutoff", date_from)
+            )
             filter_checks.append(
-                f'if (date received of msg) < (date "{date_from}") '
-                f'then set includeThis to false'
+                'if (date received of msg) < dateFromCutoff '
+                'then set includeThis to false'
             )
 
         if date_to is not None:
@@ -1462,9 +1462,12 @@ class AppleMailConnector:
             next_day = (
                 _date.fromisoformat(date_to) + _timedelta(days=1)
             ).isoformat()
+            date_setup.append(
+                applescript_iso_date_statements("dateToCutoff", next_day)
+            )
             filter_checks.append(
-                f'if (date received of msg) >= (date "{next_day}") '
-                f'then set includeThis to false'
+                'if (date received of msg) >= dateToCutoff '
+                'then set includeThis to false'
             )
 
         if has_attachment is True:
@@ -1506,6 +1509,16 @@ class AppleMailConnector:
 
         # Render filter checks each on their own line, indented for the loop.
         filter_block = "\n                ".join(filter_checks) if filter_checks else ""
+
+        # Date cutoffs are built ONCE, before the loop, as AppleScript date
+        # objects. They cannot be inlined as `date "YYYY-MM-DD"` literals —
+        # see applescript_iso_date_statements for why that silently yields
+        # the year 12169.
+        date_setup_block = (
+            "\n            ".join("\n".join(date_setup).splitlines())
+            if date_setup
+            else ""
+        )
 
         # Per-match limit short-circuits the loop. With no limit, we collect
         # everything (newest-first) — same observable behavior as before
@@ -1550,6 +1563,7 @@ class AppleMailConnector:
             set msgs to messages of mailboxRef
             set total to count of msgs
 
+            {date_setup_block}
             set resultData to {{}}
             set warnList to {{}}
             set matchCount to 0

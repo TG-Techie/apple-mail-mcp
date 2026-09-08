@@ -107,36 +107,49 @@ def format_applescript_list(items: list[str]) -> str:
     return "{" + ", ".join(escaped_items) + "}"
 
 
-def parse_date_filter(date_str: str) -> str:
-    """
-    Convert human-readable date to AppleScript date expression.
+def applescript_iso_date_statements(var_name: str, iso_date: str) -> str:
+    """AppleScript statements binding ``var_name`` to midnight on ``iso_date``.
+
+    AppleScript's ``date`` coercion does NOT parse ISO 8601, and it does
+    not fail when handed one. Verified on macOS 26.5::
+
+        $ osascript -e 'return (date "2026-09-01") as text'
+        Monday, October 9, 12169 at 00:00:00
+        $ osascript -e 'return (date "1999-12-31") as text'
+        Wednesday, July 12, 12197 at 00:00:00
+
+    Every real message date is earlier than the year 12169, so a
+    ``<`` comparison against such a value is always true and a ``>=``
+    comparison is always false. That is how ``date_from`` came to
+    exclude every message while ``date_to`` excluded none, both in
+    silence, from 2026-04-21 until this was found on 2026-09-07.
+
+    The literal-string form is also locale-dependent even when it does
+    parse (``date "9/1/2026"`` reads differently under other regional
+    settings), so the day is built by assignment instead.
+
+    ``day`` is set to 1 before ``year`` and ``month`` deliberately: if
+    today is the 31st and the target month has 30 days, setting the
+    month first rolls the date into the following month.
 
     Args:
-        date_str: Date string like "7 days ago", "2024-01-01", "last week"
+        var_name: AppleScript variable to bind.
+        iso_date: Date as ``YYYY-MM-DD``. Caller validates the format.
 
     Returns:
-        AppleScript date expression
+        Newline-separated statements, no trailing newline, unindented.
     """
-    # Handle relative dates
-    pattern = r"(\d+)\s+(day|week|month|year)s?\s+ago"
-    match = re.match(pattern, date_str.lower())
-
-    if match:
-        amount = int(match.group(1))
-        unit = match.group(2)
-        return f"(current date) - ({amount} * {unit}s)"
-
-    # Handle "last X"
-    if date_str.lower().startswith("last "):
-        unit = date_str[5:].strip().rstrip("s") + "s"
-        return f"(current date) - (1 * {unit})"
-
-    # Handle ISO dates (YYYY-MM-DD)
-    if re.match(r"\d{4}-\d{2}-\d{2}", date_str):
-        return f'date "{date_str}"'
-
-    # Default: return as is
-    return f'date "{date_str}"'
+    year, month, day = (int(part) for part in iso_date.split("-"))
+    return "\n".join(
+        [
+            f"set {var_name} to current date",
+            f"set day of {var_name} to 1",
+            f"set year of {var_name} to {year}",
+            f"set month of {var_name} to {month}",
+            f"set day of {var_name} to {day}",
+            f"set time of {var_name} to 0",
+        ]
+    )
 
 
 def validate_email(email: str) -> bool:

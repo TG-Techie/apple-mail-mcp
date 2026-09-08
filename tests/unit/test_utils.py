@@ -7,6 +7,7 @@ import pytest
 from apple_mail_mcp.exceptions import MailAppleScriptError
 from apple_mail_mcp.utils import (
     applescript_account_clause,
+    applescript_iso_date_statements,
     escape_applescript_string,
     format_applescript_list,
     get_flag_index,
@@ -15,7 +16,6 @@ from apple_mail_mcp.utils import (
     normalize_subject,
     parse_applescript_json,
     parse_applescript_list,
-    parse_date_filter,
     parse_rfc822_ids,
     sanitize_input,
     validate_email,
@@ -83,24 +83,46 @@ class TestFormatAppleScriptList:
         assert result == '{"hello \\"world\\""}'
 
 
-class TestParseDateFilter:
-    """Tests for parse_date_filter."""
+class TestApplescriptIsoDateStatements:
+    """Tests for applescript_iso_date_statements.
 
-    def test_days_ago(self) -> None:
-        result = parse_date_filter("7 days ago")
-        assert result == "(current date) - (7 * days)"
+    Replaces TestParseDateFilter, whose ``test_iso_date`` asserted
+    ``date "2024-01-15"`` — the exact broken idiom. AppleScript reads
+    that as the year 12167, so the assertion locked in the defect.
+    """
 
-    def test_weeks_ago(self) -> None:
-        result = parse_date_filter("2 weeks ago")
-        assert result == "(current date) - (2 * weeks)"
+    def test_binds_the_named_variable(self) -> None:
+        out = applescript_iso_date_statements("cutoff", "2026-09-01")
+        assert out.startswith("set cutoff to current date")
+        assert out.count("cutoff") == 6
 
-    def test_last_week(self) -> None:
-        result = parse_date_filter("last week")
-        assert result == "(current date) - (1 * weeks)"
+    def test_sets_each_component_as_an_integer(self) -> None:
+        out = applescript_iso_date_statements("c", "2026-09-01")
+        assert "set year of c to 2026" in out
+        assert "set month of c to 9" in out
+        assert "set day of c to 1" in out
+        assert "set time of c to 0" in out
 
-    def test_iso_date(self) -> None:
-        result = parse_date_filter("2024-01-15")
-        assert result == 'date "2024-01-15"'
+    def test_strips_leading_zeros_so_applescript_gets_integers(self) -> None:
+        """`set month of c to 09` is a syntax error in AppleScript."""
+        out = applescript_iso_date_statements("c", "2026-01-05")
+        assert "set month of c to 09" not in out
+        assert "set day of c to 05" not in out
+        assert "set month of c to 1" in out
+
+    def test_day_is_reset_to_one_before_month_is_set(self) -> None:
+        """Setting month first rolls over when today is the 31st and the
+        target month is shorter. The reset must come first."""
+        out = applescript_iso_date_statements("c", "2026-02-28")
+        lines = out.splitlines()
+        assert lines.index("set day of c to 1") < lines.index(
+            "set month of c to 2"
+        )
+
+    def test_never_emits_a_date_string_literal(self) -> None:
+        """The whole point: no `date "..."` coercion anywhere."""
+        out = applescript_iso_date_statements("c", "2026-09-01")
+        assert 'date "' not in out
 
 
 class TestValidateEmail:

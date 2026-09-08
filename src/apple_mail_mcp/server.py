@@ -4,6 +4,7 @@ FastMCP server for Apple Mail integration.
 
 import argparse
 import atexit
+import datetime as _dt
 import logging
 import tempfile
 from collections.abc import Callable
@@ -34,9 +35,9 @@ from .exceptions import (
     MailUnsupportedGmailSystemLabelError,
     MailUnsupportedRuleActionError,
 )
-from .outbound_allowlist import all_recipients_allowed
 from .imap_connector import ImapConnectionPool
 from .mail_connector import AppleMailConnector
+from .outbound_allowlist import all_recipients_allowed
 from .security import (
     check_rate_limit,
     check_test_mode_safety,
@@ -656,6 +657,29 @@ def _resolve_id_list_to_messages(
     return out
 
 
+def _received_day(raw: object) -> str | None:
+    """``YYYY-MM-DD`` for a Mail ``date_received`` string, or None.
+
+    Mail renders dates as ``Monday, September 7, 2026 at 18:29:25``.
+    Comparing that string against an ISO bound is not a date comparison
+    at all — ``"M"`` sorts after ``"2"``, so ``date_received < "2026-09-01"``
+    was false for every message and the bound never excluded anything.
+    Found alongside the AppleScript ``date "..."`` defect on 2026-09-07;
+    this one was read from the code, not reproduced live.
+    """
+    if not isinstance(raw, str) or not raw:
+        return None
+    for fmt in ("%A, %B %d, %Y at %H:%M:%S", "%A, %B %d, %Y at %H:%M:%S %p"):
+        try:
+            return _dt.datetime.strptime(raw, fmt).date().isoformat()
+        except ValueError:
+            continue
+    # Already ISO-shaped (other producers of this field).
+    if len(raw) >= 10 and raw[4] == "-" and raw[7] == "-":
+        return raw[:10]
+    return None
+
+
 def _apply_search_filters(
     messages: list[dict[str, Any]],
     sender_contains: str | None,
@@ -698,10 +722,16 @@ def _apply_search_filters(
             return False
         if is_flagged is not None and bool(m.get("flagged")) != is_flagged:
             return False
-        if date_from is not None and str(m.get("date_received", "")) < date_from:
-            return False
-        if date_to is not None and str(m.get("date_received", "")) > date_to:
-            return False
+        if date_from is not None or date_to is not None:
+            day = _received_day(m.get("date_received"))
+            # An unparseable date is not evidence the message is out of
+            # range. Keep it and let the caller see it, rather than
+            # silently dropping mail because Mail phrased a date oddly.
+            if day is not None:
+                if date_from is not None and day < date_from:
+                    return False
+                if date_to is not None and day > date_to:
+                    return False
         if has_attachment is not None and bool(
             m.get("has_attachment")
         ) != has_attachment:

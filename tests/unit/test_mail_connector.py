@@ -3231,16 +3231,30 @@ class TestAppleMailConnector:
             "Gmail", "INBOX", date_from="2026-04-01", date_to="2026-04-15"
         )
         script = mock_run.call_args[0][0]
-        # The IF expressions are the inverse of the inclusion condition: skip if BEFORE
-        # date_from, skip if ON-OR-AFTER date_to+1.
-        assert (
-            'if (date received of msg) < (date "2026-04-01") then set includeThis to false'
-            in script
+        # Cutoffs are built once, before the loop, by assignment. They are
+        # NOT `date "YYYY-MM-DD"` literals: AppleScript reads that as the
+        # year 12169 without erroring, which made date_from exclude every
+        # message and date_to exclude none. See
+        # applescript_iso_date_statements and docs/research/applescript-
+        # date-coercion.md.
+        assert 'date "' not in script, (
+            "a date string literal is back in the search script; AppleScript "
+            "does not parse ISO 8601 and does not fail on it"
         )
-        # date_to gets +1 day so the full day is inclusive
+        assert "set year of dateFromCutoff to 2026" in script
+        assert "set month of dateFromCutoff to 4" in script
+        assert "set day of dateFromCutoff to 1" in script
+        # date_to gets +1 day so the full day is inclusive.
+        assert "set day of dateToCutoff to 16" in script
+        # The IF expressions are the inverse of the inclusion condition: skip
+        # if BEFORE date_from, skip if ON-OR-AFTER date_to+1.
         assert (
-            'if (date received of msg) >= (date "2026-04-16") then set includeThis to false'
-            in script
+            "if (date received of msg) < dateFromCutoff "
+            "then set includeThis to false" in script
+        )
+        assert (
+            "if (date received of msg) >= dateToCutoff "
+            "then set includeThis to false" in script
         )
 
     @patch.object(AppleMailConnector, "_run_applescript")

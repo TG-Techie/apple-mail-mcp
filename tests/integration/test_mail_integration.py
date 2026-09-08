@@ -12,6 +12,7 @@ These tests require:
 Run with: MAIL_TEST_MODE=true MAIL_TEST_ACCOUNT=TestAccount pytest --run-integration
 """
 
+import datetime as _dt
 from pathlib import Path
 
 import pytest
@@ -1642,4 +1643,98 @@ class TestAttachmentPropertyGuardIntegration:
         assert warnings, "a failed save must explain itself, never a bare 0"
         assert any("save failed" in w for w in warnings), (
             f"expected a save-failure warning naming the cause, got {warnings}"
+        )
+
+
+@pytest.mark.integration
+class TestDateFilterAppleScriptPath:
+    """``date_from`` / ``date_to`` on the AppleScript search path.
+
+    Regression tests for the ISO-coercion defect. AppleScript's ``date``
+    coercion does not parse ISO 8601 and does not fail on it:
+
+        osascript -e 'return (date "2026-09-01") as text'
+        Monday, October 9, 12169 at 00:00:00
+
+    Every real message is earlier than the year 12169, so
+    ``date_from`` excluded everything (always zero rows) and
+    ``date_to`` excluded nothing (a silent no-op). Both were silent.
+
+    These call ``_search_messages_applescript`` directly rather than
+    ``search_messages`` on purpose: ``search_messages`` tries IMAP first,
+    and on an account with an IMAP opt-in the correct IMAP ``SINCE``
+    would mask the AppleScript defect entirely.
+
+    Unit tests mock ``_run_applescript`` and structurally cannot see any
+    of this, which is why the AppleScript branch stayed broken from
+    2026-04-21 while the IMAP branch was tested and correct.
+    """
+
+    def test_far_past_date_from_does_not_empty_the_result(
+        self, connector: AppleMailConnector, test_account: str
+    ) -> None:
+        """A cutoff before all mail must change nothing. It returned zero."""
+        baseline = connector._search_messages_applescript(
+            account=test_account, mailbox="INBOX", limit=5
+        )
+        assert baseline, "need a non-empty INBOX for this test to mean anything"
+
+        filtered = connector._search_messages_applescript(
+            account=test_account, mailbox="INBOX", limit=5,
+            date_from="2000-01-01",
+        )
+        assert len(filtered) == len(baseline), (
+            f"date_from=2000-01-01 must not exclude mail newer than 2000; "
+            f"got {len(filtered)} rows against a baseline of {len(baseline)}"
+        )
+
+    def test_far_past_date_to_excludes_everything(
+        self, connector: AppleMailConnector, test_account: str
+    ) -> None:
+        """The mirror defect: date_to excluded nothing at all."""
+        baseline = connector._search_messages_applescript(
+            account=test_account, mailbox="INBOX", limit=5
+        )
+        assert baseline, "need a non-empty INBOX for this test to mean anything"
+
+        filtered = connector._search_messages_applescript(
+            account=test_account, mailbox="INBOX", limit=5,
+            date_to="2000-01-01",
+        )
+        assert filtered == [], (
+            f"date_to=2000-01-01 must exclude mail newer than 2000; "
+            f"got {len(filtered)} rows"
+        )
+
+    def test_a_row_survives_its_own_date_as_both_bounds(
+        self, connector: AppleMailConnector, test_account: str
+    ) -> None:
+        """Both bounds are inclusive, checked against a message the search
+        itself returned rather than against an assumption about ordering."""
+        baseline = connector._search_messages_applescript(
+            account=test_account, mailbox="INBOX", limit=5
+        )
+        assert baseline, "need a non-empty INBOX for this test to mean anything"
+
+        raw = str(baseline[0]["date_received"])
+        try:
+            parsed = _dt.datetime.strptime(raw, "%A, %B %d, %Y at %H:%M:%S")
+        except ValueError:
+            pytest.skip(f"unrecognised Mail date format: {raw!r}")
+        day = parsed.date().isoformat()
+
+        from_rows = connector._search_messages_applescript(
+            account=test_account, mailbox="INBOX", limit=50, date_from=day,
+        )
+        assert any(r["id"] == baseline[0]["id"] for r in from_rows), (
+            f"message {baseline[0]['id']} is dated {day}; date_from={day} "
+            f"is inclusive and must still return it"
+        )
+
+        to_rows = connector._search_messages_applescript(
+            account=test_account, mailbox="INBOX", limit=50, date_to=day,
+        )
+        assert any(r["id"] == baseline[0]["id"] for r in to_rows), (
+            f"message {baseline[0]['id']} is dated {day}; date_to={day} "
+            f"covers the whole of that day and must still return it"
         )
