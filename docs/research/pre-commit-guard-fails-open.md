@@ -69,6 +69,12 @@ actually got through. `git reflog show main` answers it exactly,
 because it records *how* `main` moved: `commit:` is a commit made
 directly on `main`, `merge <branch>: Fast-forward` came from a branch.
 
+**Worth keeping as a technique.** A fast-forward merge and a direct
+commit are indistinguishable in `git log` — same shape, one parent, no
+merge commit — so the log cannot answer this question at all. The
+reflog can, because it records the operation rather than the result.
+Its limit is that it is local to one clone and expires.
+
 Since the guard was introduced in `2a69048` on 2026-04-04, the reflog
 for this clone shows **18 commits made directly on `main`** and 5
 arrivals via a branch. Every one of the 18 is authored by the agent
@@ -90,6 +96,36 @@ almost every change has taken. Committing to `main` was not an
 occasional slip past a working guard; it was the norm, and the guard
 was silent throughout.
 
+## Observation 6 — the pattern, not the hook, is what repeats
+
+Two questions here. Whether this hook is copied into sibling projects,
+and whether the same matching appears elsewhere in it.
+
+**It is not copied.** Searching `~/AgentAccessEnv` and
+`~/AgentAccessFleet` for the guard's message and for
+`git rev-parse --abbrev-ref HEAD` finds it only in this repository.
+`apple-passwords-mcp`, `imessage-mcp` and `reminders-mcp` have no
+`scripts/hooks/` and no `PreToolUse` branch guard of any kind. So this
+is one project's defect, not a fleet-wide illusion of protection — a
+sibling project with no guard at least does not believe it has one.
+
+**The same anchoring repeats three times inside this project**, which
+is where it does generalise:
+
+    pre_bash.sh:13    grep -qE "^git commit"    branch protection
+    pre_bash.sh:38    grep -qE "^git tag"       tag-workflow enforcement
+    post_bash.sh:10   grep -qE "^git push"      CI watch after push
+
+The tag check was probed the same way and behaves identically:
+
+    git tag v9.9.9              -> exit=2  refused
+    cd . && git tag v9.9.9      -> exit=0  ALLOWED
+    echo x && git tag v9.9.9    -> exit=0  ALLOWED
+
+The `git push` one is a `PostToolUse` monitor rather than a guard, so
+its failure is quieter still: on a push it does not match, the CI watch
+simply never runs and nothing says so. Read from the code, not probed.
+
 ## Derivations, mine
 
 - **This is a guard that fails open**, in the sense the test notes in
@@ -104,6 +140,10 @@ was silent throughout.
   thoroughly addresses Observation 2; resolving the branch from the
   commit's target repository addresses Observation 3. Doing only the
   first would make it block unrelated repositories more often.
+- **The defect is in the idiom, not in the one check.** Three checks
+  across two files were written the same way, so fixing only the
+  branch guard would leave two behind. Whoever fixes this should fix
+  the matching once and apply it to all three.
 - **That the 18 direct commits went through `Bash` with the hook
   active is a derivation, not an observation.** It rests on the author identity
   being the agent one and the hook being registered for all `Bash`
@@ -125,9 +165,9 @@ cannot parse the payload.
 
 ## Gaps, deliberately named
 
-- Only the branch-protection check was probed. The same file carries a
-  tag-creation check with the same `^`-anchored matching, and that one
-  was not tested.
+- The `git push` CI watch in `post_bash.sh` was read from the code and
+  not probed. Its failure mode is a monitor that silently does not run,
+  which is harder to notice than a guard that silently does not guard.
 - The converse of Observation 3 — a commit to this repository's `main`
   from a working directory elsewhere — was reasoned from the code, not
   run.
