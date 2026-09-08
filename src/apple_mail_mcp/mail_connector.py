@@ -1520,9 +1520,16 @@ class AppleMailConnector:
             else ""
         )
 
-        # Per-match limit short-circuits the loop. With no limit, we collect
-        # everything (newest-first) — same observable behavior as before
-        # except for ordering (was oldest-first).
+        # Per-match limit short-circuits the loop, so the ITERATION order
+        # decides which N messages a limited search returns, not just the
+        # order they come back in.
+        #
+        # Mail returns `messages of mailbox` newest-first: item 1 is the
+        # newest message and item (count) is the oldest. This loop used to
+        # run `from total to 1 by -1`, walking that list backwards — oldest
+        # to newest — so `limit=N` short-circuited on the N OLDEST messages
+        # while the comment here claimed newest-first. Reading the code did
+        # not catch that; measuring it did. Iterate forward.
         effective_limit = str(limit) if limit else "999999999"
 
         # Per-message filter checks AND attachment iteration are now
@@ -1567,7 +1574,7 @@ class AppleMailConnector:
             set resultData to {{}}
             set warnList to {{}}
             set matchCount to 0
-            repeat with i from total to 1 by -1
+            repeat with i from 1 to total
                 if matchCount >= {effective_limit} then exit repeat
                 set msg to item i of msgs
                 set includeThis to true

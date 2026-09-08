@@ -1738,3 +1738,81 @@ class TestDateFilterAppleScriptPath:
             f"message {baseline[0]['id']} is dated {day}; date_to={day} "
             f"covers the whole of that day and must still return it"
         )
+
+
+@pytest.mark.integration
+class TestSearchResultOrdering:
+    """``limit=N`` must return the N newest messages, not the N oldest.
+
+    Mail returns ``messages of mailbox`` newest-first. The search loop
+    iterated it backwards (``from total to 1 by -1``), which walks
+    oldest to newest, so ``limit=N`` short-circuited on the N OLDEST
+    messages in the mailbox. A caller probing recent mail got the
+    oldest instead, with nothing to indicate it.
+
+    The code comment claimed "newest-first" while doing the opposite,
+    which is why reading it did not find this. Only measuring did.
+    """
+
+    def _mailbox_bounds(
+        self, connector: AppleMailConnector, account: str
+    ) -> tuple[str, str]:
+        """(first, last) ``date received`` of ``messages of mailbox``."""
+        raw = connector._run_applescript(
+            f'tell application "Mail"\n'
+            f'  set ms to messages of mailbox "INBOX" of account "{account}"\n'
+            f'  return (date received of item 1 of ms as text) & "|" & '
+            f'(date received of item (count of ms) of ms as text)\n'
+            f'end tell'
+        ).strip()
+        first, last = raw.split("|")
+        return first, last
+
+    def test_limit_returns_the_newest_not_the_oldest(
+        self, connector: AppleMailConnector, test_account: str
+    ) -> None:
+        first_raw, last_raw = self._mailbox_bounds(connector, test_account)
+        fmt = "%A, %B %d, %Y at %H:%M:%S"
+        try:
+            newest = _dt.datetime.strptime(first_raw, fmt)
+            oldest = _dt.datetime.strptime(last_raw, fmt)
+        except ValueError:
+            pytest.skip(f"unrecognised Mail date format: {first_raw!r}")
+        if newest == oldest:
+            pytest.skip("mailbox has no date spread to distinguish ends")
+
+        rows = connector._search_messages_applescript(
+            account=test_account, mailbox="INBOX", limit=5
+        )
+        assert rows, "need a non-empty INBOX for this test to mean anything"
+
+        got = _dt.datetime.strptime(str(rows[0]["date_received"]), fmt)
+        midpoint = oldest + (newest - oldest) / 2
+        assert got > midpoint, (
+            f"limit=5 returned {got} first, which is in the older half of a "
+            f"mailbox spanning {oldest} to {newest}; the newest messages "
+            f"were expected"
+        )
+
+    def test_results_are_in_descending_date_order(
+        self, connector: AppleMailConnector, test_account: str
+    ) -> None:
+        """Newest-first is the documented contract, so the rows must be
+        ordered, not merely drawn from the newest end."""
+        rows = connector._search_messages_applescript(
+            account=test_account, mailbox="INBOX", limit=10
+        )
+        assert len(rows) >= 2, "need at least two rows to check ordering"
+
+        fmt = "%A, %B %d, %Y at %H:%M:%S"
+        try:
+            dates = [
+                _dt.datetime.strptime(str(r["date_received"]), fmt)
+                for r in rows
+            ]
+        except ValueError:
+            pytest.skip("unrecognised Mail date format")
+
+        assert dates == sorted(dates, reverse=True), (
+            f"rows must be newest-first; got {[d.isoformat() for d in dates]}"
+        )

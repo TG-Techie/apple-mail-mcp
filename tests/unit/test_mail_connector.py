@@ -3163,8 +3163,14 @@ class TestAppleMailConnector:
         # Limit is enforced by accumulating matches and exiting the repeat
         # when matchCount reaches the bound.
         assert "if matchCount >= 10 then exit repeat" in call_args
-        # Reverse iteration (newest first).
-        assert "repeat with i from total to 1 by -1" in call_args
+        # Forward iteration. Mail returns `messages of mailbox`
+        # newest-first, so walking it forward yields newest-first and a
+        # limited search short-circuits on the NEWEST messages. The
+        # previous `from total to 1 by -1` walked it backwards and made
+        # limit=N return the N oldest, while the comment beside it
+        # claimed newest-first.
+        assert "repeat with i from 1 to total" in call_args
+        assert "repeat with i from total to 1 by -1" not in call_args
         # No `whose` clause anywhere.
         assert "whose" not in call_args
 

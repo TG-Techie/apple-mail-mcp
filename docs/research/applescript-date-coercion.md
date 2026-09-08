@@ -110,7 +110,7 @@ because on an account with an IMAP opt-in the correct IMAP path would
 mask the defect entirely. They are not redundant with the unit tests
 and cannot be replaced by them.
 
-## Still open — ordering, same origin
+## Fixed alongside — ordering, same origin
 
 Confirmed 2026-07-20, still true 2026-09-07, **not fixed**:
 
@@ -125,10 +125,20 @@ messages. Measured on a several-hundred-message INBOX: `limit=5`
 returned five messages from nearly four months earlier.
 
 `815fc31` is titled "drop `whose` clause for reverse iteration" and its
-comment claims "newest-first". The comment is wrong about the
-direction. Left alone here because it is a separate defect with its own
-behaviour change, and fixing it uninvited is out of this change's blast
-radius.
+comment claimed "newest-first" while the loop did the opposite. Reading
+the code did not catch that, because the comment asserted the intended
+behaviour rather than the actual one. Only measuring caught it.
+
+Fixed on its own branch by iterating forward (`from 1 to total`), with
+two integration tests: one that the first row falls in the newer half
+of the mailbox's date span, one that rows are in descending date order.
+Both fail against the previous code.
+
+**Named assumption:** the fix relies on Mail returning `messages of
+mailbox` newest-first, which is observed on this machine and not
+documented by Apple. The descending-order test is what would catch it
+if that ever stops holding — it asserts the property rather than the
+iteration direction.
 
 ## Gaps, deliberately named
 
