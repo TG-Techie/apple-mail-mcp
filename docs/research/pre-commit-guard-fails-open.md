@@ -9,6 +9,20 @@ independent problems: it misses the most common way commits are
 actually written, and it fires on repositories it has nothing to do
 with. Both are silent.
 
+**Scope, before the numbers below are read as an alarm.** This is one
+repository's defect. The guard exists nowhere else in the fleet
+(Observation 6), and the sibling projects have no branch guard at all —
+which is the better failure, because a project with no guard does not
+believe it has one. **The harm here was never the missing protection.
+It was the false belief in it, and that belief lives in exactly one
+repository.** A reader arriving at "18 commits went through the gap"
+should not reach for a fleet-wide conclusion.
+
+**If you are picking this up to fix it, the conclusion is that the
+defect is in the idiom and not in any one check.** Three checks across
+two files share one anchoring bug. Fixing the branch guard alone leaves
+two behind and looks like a fix.
+
 ## Observation 1 — what it does
 
 The check, verbatim:
@@ -150,6 +164,27 @@ simply never runs and nothing says so. Read from the code, not probed.
   commands. A commit made in a terminal outside the agent harness would
   look identical here and the hook would never have run at all.
 
+## A monitor that fails open leaves nothing to find
+
+Not specific to this hook, and the reason the `git push` case is worse
+than the two guards even though it permits nothing.
+
+A **guard** that fails open lets something through, and the something
+is an artifact. A commit exists, it is in the reflog, it can be counted
+after the fact — which is exactly how Observation 5 was possible at
+all.
+
+A **monitor** that fails open produces nothing. `post_bash.sh` watches
+CI after a push; when its match misses, no watch runs, no record says a
+watch did not run, and there is no artifact to audit later. The absence
+of a CI report is indistinguishable from a CI report nobody read.
+
+So the two failures are not the same size. The guard's failure is
+recoverable because it leaves evidence. The monitor's failure is
+invisible in both directions, and the only way to find it is to read
+the matching logic — which is how it was found here, rather than by
+noticing anything wrong.
+
 ## Not fixed here, deliberately
 
 Tightening it changes what is refused for every session working in this
@@ -158,16 +193,19 @@ current behaviour. That is a behaviour change to a shared guard rather
 than a defect fix in isolation, so it wants its own decision rather
 than being folded into a note about it.
 
-Shape of the fix, if it is taken up: match `git commit` anywhere in the
-command rather than at a line start, resolve the branch with `git -C`
-against the path the commit actually targets, and fail closed when `jq`
-cannot parse the payload.
+Shape of the fix, if it is taken up. **Fix the matching once and apply
+it to all three checks** — the branch guard, the tag guard and the CI
+watch — because the defect is in the idiom rather than in any one of
+them. Then: match the verb anywhere in the command rather than at a
+line start, resolve the branch with `git -C` against the path the
+commit actually targets, and fail closed when `jq` cannot parse the
+payload.
 
 ## Gaps, deliberately named
 
 - The `git push` CI watch in `post_bash.sh` was read from the code and
-  not probed. Its failure mode is a monitor that silently does not run,
-  which is harder to notice than a guard that silently does not guard.
+  not probed. See "A monitor that fails open" above for why that one is
+  the worst of the three.
 - The converse of Observation 3 — a commit to this repository's `main`
   from a working directory elsewhere — was reasoned from the code, not
   run.
