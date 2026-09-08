@@ -62,6 +62,34 @@ The hook parses its payload with `jq` and does not check the result. On
 a payload `jq` rejects, it emits a parse error and returns `exit=0`.
 Whatever the command was, it runs.
 
+## Observation 5 — the gap was used, and it is the normal path
+
+The question the rest of this note does not answer is whether anything
+actually got through. `git reflog show main` answers it exactly,
+because it records *how* `main` moved: `commit:` is a commit made
+directly on `main`, `merge <branch>: Fast-forward` came from a branch.
+
+Since the guard was introduced in `2a69048` on 2026-04-04, the reflog
+for this clone shows **18 commits made directly on `main`** and 5
+arrivals via a branch. Every one of the 18 is authored by the agent
+identity, and the guard is registered in `.claude/settings.json` as a
+`PreToolUse` hook matching `Bash`, so it was active for all of them.
+
+Direct to `main`, in order: `0c1ebc5`, `4482003`, `8d71397`, `3ab94b3`,
+`026ad73`, `32a43ab`, `c2b2936`, `7e9e46f`, `c51851a`, `e774be4`,
+`4ee06e7`, `80839f4`, `7becce1`, `b8f57de`, `911a2ea`, `0176e88`, and
+two more on 2026-09-07 that were rewritten out of history the same
+evening and now exist only in the reflog.
+
+**Two of them are code, not documentation:** `7e9e46f` and `0176e88`,
+both connector fixes.
+
+So the guard has refused a commit roughly as often as this repository
+has used a feature branch, and the path it exists to prevent is the one
+almost every change has taken. Committing to `main` was not an
+occasional slip past a working guard; it was the norm, and the guard
+was silent throughout.
+
 ## Derivations, mine
 
 - **This is a guard that fails open**, in the sense the test notes in
@@ -76,6 +104,11 @@ Whatever the command was, it runs.
   thoroughly addresses Observation 2; resolving the branch from the
   commit's target repository addresses Observation 3. Doing only the
   first would make it block unrelated repositories more often.
+- **That the 18 direct commits went through `Bash` with the hook
+  active is a derivation, not an observation.** It rests on the author identity
+  being the agent one and the hook being registered for all `Bash`
+  commands. A commit made in a terminal outside the agent harness would
+  look identical here and the hook would never have run at all.
 
 ## Not fixed here, deliberately
 
@@ -98,7 +131,13 @@ cannot parse the payload.
 - The converse of Observation 3 — a commit to this repository's `main`
   from a working directory elsewhere — was reasoned from the code, not
   run.
-- Whether any commit has actually reached `main` through the gap is not
-  established. Nothing here audits the history for it.
+- **The reflog is local to this clone and starts at the 2026-05-20
+  clone, with a reset to `main-scrubbed` on 2026-08-23.** Anything
+  before that cannot be classified this way, and commits made in
+  another clone are invisible to it. The count of 18 is a floor.
+- Nothing here establishes which of the 18 would have been *refused* by
+  a working guard rather than legitimately allowed. `32a43ab` is a
+  revert and several are single-file documentation edits; a stricter
+  guard might reasonably have permitted some of them anyway.
 
 Recorded 2026-09-07.
