@@ -4567,6 +4567,98 @@ class TestWhoseIdQuoting:
         ), f"expected quoted id in every script: {scripts}"
 
 
+class TestSaveAttachmentsPathTraversal:
+    """Pass 2 must not compose its destination from the attachment's own
+    declared name.
+
+    That name comes from the message's MIME headers, so it is controlled
+    by the sender. The old script built ``"<dir>/" & attName`` from
+    ``name of att``; AppleScript's ``POSIX file`` does not normalise the
+    string and the filesystem resolves it at write time, so a name
+    containing ``..`` writes outside ``save_directory`` — probed
+    2026-09-09, see ``safe_attachment_filename``.
+
+    The fix is structural rather than a filter bolted onto the old shape:
+    Python already has every name from pass 1, so it sanitizes them and
+    hands the safe names to pass 2. The invariant pinned here is that the
+    generated AppleScript never derives the path from ``name of att``.
+    """
+
+    @pytest.fixture
+    def connector(self) -> AppleMailConnector:
+        return AppleMailConnector(timeout=30)
+
+    def _run_with_name(
+        self, connector: AppleMailConnector, mock_run: MagicMock, name: str
+    ) -> str:
+        """Enumerate one attachment called ``name``; return pass 2's script."""
+        import json
+        import tempfile
+        from pathlib import Path
+
+        mock_run.side_effect = [
+            json.dumps(
+                {
+                    "attachments": [
+                        {
+                            "name": name,
+                            "mime_type": "application/pdf",
+                            "size": 1,
+                            "downloaded": True,
+                        }
+                    ],
+                    "warnings": [],
+                }
+            ),
+            '{"saved":1,"warnings":[]}',
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            connector.save_attachments("12345", Path(td))
+        return mock_run.call_args_list[1][0][0]
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_pass_two_does_not_build_the_path_from_name_of_att(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        script = self._run_with_name(connector, mock_run, "report.pdf")
+        assert "set attName to (name of att)" not in script, (
+            "pass 2 still reads the destination filename from Mail; the "
+            "name is attacker-controlled and must come from Python"
+        )
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_traversing_name_is_reduced_before_it_reaches_the_script(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        script = self._run_with_name(connector, mock_run, "../../escaped.txt")
+        assert "../../escaped.txt" not in script
+        assert "escaped.txt" in script
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_absolute_name_is_reduced_before_it_reaches_the_script(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        script = self._run_with_name(connector, mock_run, "/etc/passwd")
+        assert "/etc/passwd" not in script
+        assert "passwd" in script
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_ordinary_name_survives_intact(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        script = self._run_with_name(connector, mock_run, "Q3 report.pdf")
+        assert "Q3 report.pdf" in script
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_quotes_in_a_name_are_escaped_not_dropped(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        # A name is untrusted text going into an AppleScript string
+        # literal; it must be escaped like every other user input.
+        script = self._run_with_name(connector, mock_run, 'say "hi".pdf')
+        assert '\\"hi\\"' in script or '\\"' in script
+
+
 class TestAttachmentPropertyGuards:
     """One unreadable attachment PROPERTY must not kill the whole walk.
 

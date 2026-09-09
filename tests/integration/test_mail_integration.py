@@ -1613,6 +1613,58 @@ class TestAttachmentPropertyGuardIntegration:
                     f"reported {att['size']}"
                 )
 
+    def test_saved_files_stay_inside_the_target_directory(
+        self, connector: AppleMailConnector, test_account: str, tmp_path: Path
+    ) -> None:
+        """Nothing may be written outside ``save_directory``.
+
+        Pass 2 used to build its destination inside AppleScript as
+        ``"<dir>/" & name of att``. That name comes from the message's own
+        MIME headers, so the sender controls it, and ``POSIX file`` does
+        not normalise the string — the filesystem resolves it at write
+        time, so ``..`` escapes the directory. The destination filename is
+        now decided in Python and passed in as data.
+
+        This asserts the containment invariant against real Mail and a
+        real save. It does NOT prove the traversal is unreachable, because
+        it uses whatever names the inbox happens to carry rather than a
+        crafted hostile one — see the limitation recorded in
+        docs/research/attachment-property-10000.md. What it does catch is
+        the whole class of regression where the saved path stops being a
+        direct child of the requested directory.
+        """
+        msg_id = self._first_message_with_attachments(connector, test_account)
+        if msg_id is None:
+            pytest.skip("test inbox has no messages with attachments")
+
+        # Save into a subdirectory so an escape has somewhere visible to
+        # land: anything written to `sentinel_root` is outside the target.
+        sentinel_root = tmp_path
+        target = sentinel_root / "target"
+        target.mkdir()
+
+        attachments, _ = connector._enumerate_attachments_for_message(msg_id)
+        assert attachments, "enumeration returned nothing to save"
+        saved, warnings = connector.save_attachments(msg_id, target)
+
+        strays = [
+            p for p in sentinel_root.iterdir() if p.resolve() != target.resolve()
+        ]
+        assert not strays, (
+            f"save_attachments wrote outside its target directory: "
+            f"{[str(p) for p in strays]}; warnings={warnings}"
+        )
+
+        for path in target.rglob("*"):
+            assert path.parent.resolve() == target.resolve(), (
+                f"{path} is not a direct child of {target} — a name with a "
+                f"separator reached the destination path"
+            )
+        assert saved == len(list(target.iterdir())), (
+            f"reported {saved} saved but {len(list(target.iterdir()))} files "
+            f"in {target}"
+        )
+
     def test_failed_save_reports_a_reason(
         self, connector: AppleMailConnector, test_account: str, tmp_path: Path
     ) -> None:

@@ -45,6 +45,7 @@ from .utils import (
     escape_applescript_string,
     get_flag_index,
     parse_applescript_json,
+    safe_attachment_filename,
     sanitize_input,
     validate_email,
 )
@@ -2823,6 +2824,32 @@ class AppleMailConnector:
 
         indices_str = ", ".join(str(i + 1) for i in selected_zero_based)
 
+        # The destination filename is decided HERE, in Python, and passed
+        # into the script as data. It is never derived inside AppleScript
+        # from `name of att`.
+        #
+        # An attachment's name comes from the message's own MIME headers,
+        # so the sender controls it. The previous script built
+        # `"<dir>/" & name of att`; `POSIX file` does not normalise the
+        # string and the filesystem resolves it at write time, so a name
+        # containing `..` wrote outside `save_directory`. Probed
+        # 2026-09-09 — see `safe_attachment_filename` for the transcript.
+        #
+        # Pass 1 already returned every name, so nothing extra is read
+        # from Mail to do this. It also subsumes the old in-script
+        # `attachment-N` fallback: an unreadable name arrives here as a
+        # non-string and takes the same fallback, and pass 1 has already
+        # emitted its own warning about it.
+        safe_names = [
+            safe_attachment_filename(
+                attachments[i].get("name"), f"attachment-{i + 1}"
+            )
+            for i in selected_zero_based
+        ]
+        safe_names_literal = ", ".join(
+            f'"{escape_applescript_string(n)}"' for n in safe_names
+        )
+
         # Pass 2 emits JSON {saved, warnings} rather than a bare count.
         # Every failure gets an on-error branch: the previous unqualified
         # `try` swallowed save errors whole, so a total failure returned
@@ -2848,17 +2875,13 @@ class AppleMailConnector:
             end if
 
             set saveWarnings to {{}}
+            set safeNames to {{{safe_names_literal}}}
             set attRefs to items {{{indices_str}}} of mail attachments of foundMsg
             set saveCount to 0
             set attIdx to 0
             repeat with att in attRefs
                 set attIdx to attIdx + 1
-                set attName to ("attachment-" & attIdx)
-                try
-                    set attName to (name of att)
-                on error errMsg number errNum
-                    set end of saveWarnings to ("attachment name unreadable for message " & (id of foundMsg as text) & " attachment " & attIdx & ", saved as '" & attName & "': " & errMsg & " (error " & errNum & ")")
-                end try
+                set attName to item attIdx of safeNames
                 try
                     save att in (POSIX file ("{dir_safe}/" & attName))
                     set saveCount to saveCount + 1

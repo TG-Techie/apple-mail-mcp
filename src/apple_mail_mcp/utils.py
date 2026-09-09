@@ -487,3 +487,54 @@ def walk_thread_graph(
             break
 
     return accepted
+
+
+def safe_attachment_filename(raw: object, fallback: str) -> str:
+    """Reduce an attachment's declared name to a bare, safe filename.
+
+    An attachment's name comes from the message's own MIME headers and is
+    therefore controlled by whoever sent the mail. It must never reach a
+    path expression.
+
+    Pass 2 of ``save_attachments`` previously built its destination inside
+    AppleScript as ``"<dir>/" & name of att``. ``POSIX file`` does not
+    normalise the string it is given, and the filesystem resolves the
+    result at write time, so a name containing ``..`` writes outside the
+    requested directory. Probed 2026-09-09 in a scratch directory::
+
+        set targetPath to ("<scratch>/safe/inner/" & "../../escaped.txt")
+        set fh to open for access (POSIX file targetPath) with write permission
+
+    left a file at ``<scratch>/escaped.txt``, two directories above the
+    intended one.
+
+    Whether Mail.app itself ever hands back a name containing ``..`` or a
+    separator is NOT established — checking it needs a crafted message.
+    That is precisely why this exists: the previous code depended on an
+    undocumented upstream sanitization it never verified.
+
+    Everything up to and including the last separator is discarded, so no
+    directory component survives. Names that leave nothing usable — empty,
+    whitespace, ``.``, ``..``, or a trailing separator — fall back.
+
+    Args:
+        raw: The declared name, from Mail.app. Any type; non-strings fall
+            back, so a ``missing value`` coerced to ``None`` is safe.
+        fallback: Name to use when ``raw`` yields nothing usable. Callers
+            pass a positional stand-in such as ``"attachment-3"``.
+
+    Returns:
+        A filename containing no path separator and never ``.`` or ``..``.
+    """
+    if not isinstance(raw, str):
+        return fallback
+
+    # Take the basename under both separators. Windows-style backslashes
+    # are not path separators on macOS, but a name carrying one is hostile
+    # input rather than a filename, so it is split too.
+    candidate = raw.replace("\\", "/").rsplit("/", 1)[-1].strip()
+
+    if not candidate or candidate in {".", ".."}:
+        return fallback
+
+    return candidate

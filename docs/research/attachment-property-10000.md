@@ -129,10 +129,48 @@ Saved via `POSIX file` before any code change, sizes matching Observation 2:
    explanation for the whole-walk -10000 may have been this same MIME
    type failure misattributed — the surfaced warning string is identical.
    Not tested; recorded so nobody treats the old explanation as settled.
-6. UNVERIFIED, flagged not fixed: pass 2 builds the destination as
-   `"<dir>/" & attName` from the attachment's own name. A name containing
-   `/` or `..` would write outside `save_directory`. Not probed (would
-   need a crafted message); pre-existing, untouched by this change.
+6. FIXED 2026-09-09. Was: pass 2 builds the destination as
+   `"<dir>/" & attName` from the attachment's own name, so a name
+   containing `/` or `..` would write outside `save_directory`.
+
+   **The mechanism is now probed rather than assumed.** In a scratch
+   directory:
+
+       set targetPath to ("<scratch>/safe/inner/" & "../../escaped.txt")
+       set fh to open for access (POSIX file targetPath) with write permission
+       write "traversed" to fh
+       close access fh
+
+   left a file at `<scratch>/escaped.txt` — two directories above the
+   intended one. `POSIX file` does not normalise the string it is given;
+   the filesystem resolves it at write time.
+
+   **Fix is structural, not a filter.** Pass 1 already returns every
+   attachment name to Python, so Python now sanitizes each one with
+   `safe_attachment_filename` (utils.py) and passes the safe names into
+   pass 2 as data. The AppleScript no longer derives the destination from
+   `name of att` at all, which also subsumes the old in-script
+   `attachment-N` fallback.
+
+   **What is still NOT established, and the fix does not depend on it:**
+   whether Mail.app's `name of att` ever returns a string containing `..`
+   or a separator. Determining that needs a crafted message; the routes
+   are a real send (blocked by the Claude Code classifier — see
+   `mail-test-mode-unknown-at-runtime.md`) or importing a message into the
+   live mailbox, which is a state change not worth making for a probe.
+
+   The defect being fixed is therefore not "this is exploitable today".
+   It is that the code depended on an undocumented upstream sanitization
+   it never checked, in a property an external sender controls.
+
+   **Coverage, stated honestly.** The unit tests in
+   `TestSaveAttachmentsPathTraversal` are discriminating: they were RED
+   against the old script and GREEN after. The integration test
+   `test_saved_files_stay_inside_the_target_directory` asserts containment
+   against real Mail but would also have passed against the old code,
+   because it uses whatever names the inbox happens to carry rather than a
+   hostile one. It guards against regression of the class, not against the
+   original defect.
 
 ## Re-check commands
 

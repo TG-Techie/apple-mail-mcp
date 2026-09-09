@@ -17,6 +17,7 @@ from apple_mail_mcp.utils import (
     parse_applescript_json,
     parse_applescript_list,
     parse_rfc822_ids,
+    safe_attachment_filename,
     sanitize_input,
     validate_email,
     walk_thread_graph,
@@ -460,3 +461,72 @@ class TestGetFlagIndex:
         assert get_flag_index("RED") == 0
         assert get_flag_index("Red") == 0
         assert get_flag_index("oRaNgE") == 1
+
+
+class TestSafeAttachmentFilename:
+    """An attachment's name comes from the message's own MIME headers, so
+    it is attacker-controlled. Pass 2 of save_attachments used to build
+    its destination as ``"<dir>/" & name of att`` inside AppleScript,
+    which writes wherever the name points.
+
+    Verified 2026-09-09 in a scratch directory: AppleScript's
+    ``POSIX file`` does not normalise the string, and the filesystem
+    resolves it at write time. Writing to
+    ``<scratch>/safe/inner/../../escaped.txt`` produced a file at
+    ``<scratch>/escaped.txt``, two directories above the target.
+    """
+
+    def test_plain_name_is_unchanged(self) -> None:
+        assert safe_attachment_filename("report.pdf", "attachment-1") == "report.pdf"
+
+    def test_parent_traversal_is_rejected(self) -> None:
+        assert (
+            safe_attachment_filename("../../escaped.txt", "attachment-1")
+            == "escaped.txt"
+        )
+
+    def test_absolute_path_is_reduced_to_its_basename(self) -> None:
+        assert (
+            safe_attachment_filename("/etc/passwd", "attachment-1") == "passwd"
+        )
+
+    def test_nested_path_is_reduced_to_its_basename(self) -> None:
+        assert (
+            safe_attachment_filename("a/b/c/payload.sh", "attachment-1")
+            == "payload.sh"
+        )
+
+    def test_bare_dot_dot_falls_back(self) -> None:
+        assert safe_attachment_filename("..", "attachment-3") == "attachment-3"
+
+    def test_bare_dot_falls_back(self) -> None:
+        assert safe_attachment_filename(".", "attachment-3") == "attachment-3"
+
+    def test_empty_name_falls_back(self) -> None:
+        assert safe_attachment_filename("", "attachment-2") == "attachment-2"
+
+    def test_whitespace_only_name_falls_back(self) -> None:
+        assert safe_attachment_filename("   ", "attachment-2") == "attachment-2"
+
+    def test_trailing_slash_falls_back(self) -> None:
+        # "evil/" has no basename once the directory part is stripped.
+        assert safe_attachment_filename("evil/", "attachment-4") == "attachment-4"
+
+    def test_none_falls_back(self) -> None:
+        assert safe_attachment_filename(None, "attachment-5") == "attachment-5"
+
+    def test_result_never_contains_a_separator_or_traversal(self) -> None:
+        hostile = [
+            "../../../../etc/passwd",
+            "..",
+            "../",
+            "/absolute/evil",
+            "dir/../../escape",
+            "..\\windows\\style",
+            "⁄fraction-slash.txt",
+        ]
+        for raw in hostile:
+            out = safe_attachment_filename(raw, "attachment-1")
+            assert "/" not in out, f"{raw!r} produced {out!r}"
+            assert out not in {"..", "."}, f"{raw!r} produced {out!r}"
+            assert out.strip() != "", f"{raw!r} produced {out!r}"
