@@ -308,9 +308,34 @@ will do, and reading state from the hook's environment instead of the command's.
 
 ### Still not fixed, and still deliberately
 
-Unchanged from the framing at the top of this document: this hook is shared by every session
-working in this repository, and tightening or loosening it changes what is refused for all of
-them.
+**Whose file this is, established 2026-09-09 rather than assumed.** The hook is this
+repository's own file and nobody else's. `scripts/hooks/pre_bash.sh` is referenced from
+`.claude/settings.json` here and from no configuration outside this repo; a search of
+`~/AgentAccessEnv` and `~/AgentAccessFleet` finds no other copy of it (the other directories
+named `hooks` are `node_modules`, virtualenvs and control-pane snapshots). Its entire history is
+three commits, all here: `55659b5`, `8d57a72`, `2a69048`.
+
+That matters because an earlier reading of this section treated the guard as somebody else's
+work to leave alone. It is not. The fleet rule about not editing inside another agent's work
+does not apply, and neither does the doctrine about Claude's own configuration files — that
+covers the global settings JSON, any `.claude/settings.json` or `settings.local.json`, and any
+`.mcp.json`. `pre_bash.sh` is none of those. Editing it is ordinary work in this repository.
+
+**The constraint that does apply is blast radius, not ownership.** This hook runs for every
+session whose project is this repository, and it is the permission surface those sessions work
+against. A guard that starts matching far more commands is a live change to what an agent here
+can do without a prompt, in sessions nobody is watching at the time. Fixing the matching alone
+would be the worst version of it: the guard would fire correctly on many more commands while
+still reading the wrong repository's branch, turning something wrong quietly into something
+wrong loudly, in other people's repositories.
+
+So it stays unfixed pending Jonah's call — raised with him rather than decided here, and not
+batched with anything else, because the failure mode of getting it wrong is an agent blocked or
+unblocked somewhere neither of us is looking. plush-kelp has an open, unanswered question with
+him on the same defect one level up: config-guard Bash rules that match command text rather than
+command effect. The measured evidence here — `git add . && git commit -m ...` walking past
+`grep -qE "^git commit"` — is the concrete instance that question lacked, so the two go to him
+together.
 
 **Correction, 2026-09-09.** An earlier version of this section said all three checks share both
 the `^`-anchored matching and the ambient-cwd assumption. Only the first half is true, and the
