@@ -359,3 +359,71 @@ rather than leave a tidy overstatement standing.
 What landed the blocked SOP commit was satisfying the guard rather than bypassing it: this
 project moved to a feature branch, and the commit in the other repository then went through.
 Nothing about that commit changed, only this project's `HEAD`.
+
+## Observation 8 — fixed, and what the fix cost to get right
+
+Fixed 2026-09-09. Both directions, together, as one change: `scripts/hooks/git_command_scan.py`
+plus a rewritten `scripts/hooks/pre_bash.sh`.
+
+### What changed
+
+The hook no longer greps the command text. It asks a parser two questions — **which git
+subcommands does this command line run, and in which directory does each one run** — and makes
+its decision from the answers. The branch guard now applies only when the target repository is
+this one, and the tag guard likewise.
+
+### Acceptance, old against new, measured
+
+Every row is the two hooks run against the same JSON input, exit code only.
+
+| command | old | new |
+|---|---|---|
+| `git add . && git commit -m "x"` | 0 | 2 |
+| `git add -A; git commit` | 0 | 2 |
+| `GIT_EDITOR=true git commit --amend` | 0 | 2 |
+| `git commit -m "x"` | 2 | 2 |
+| `git tag v1.0.0` | 2 | 2 |
+| `ls -la && echo hi` | 0 | 0 |
+| `echo "git commit -m x"` | 0 | 0 |
+| multi-line: `cd <sop repo>` then `git commit` at line start | **2** | **0** |
+
+The first three rows are the fail-open defect closing. The last row is the fail-closed defect
+closing, and it is the exact command shape that blocked a commit into the SOP repository earlier
+in the day: `grep` is line-oriented, so `^git commit` matched a line inside a multi-line command
+whose working directory was a different repository entirely.
+
+Rows 4 to 7 matter as much: unchanged behaviour where behaviour should not change, including no
+new false positive on a string that merely mentions the command.
+
+### Two things found only by doing it
+
+**The interpreter on the hook's PATH is broken.** `python3` there resolves to
+`~/.tg/bin/python3`, which links against a Homebrew Python 3.14 framework that no longer exists
+and dies with a dyld error, exit 134. The first version of this hook called plain `python3`,
+could not analyse anything, and — because it correctly refuses rather than guessing when the
+scan fails — refused every Bash call in the session until it was reverted. The hook now resolves
+an interpreter it has verified will run, preferring `/usr/bin/python3`, and the scanner is kept
+compatible with 3.9 for that reason.
+
+**Commit messages are heredocs, and they quote commands.** Several commits in this repository
+have bodies containing the literal words `git commit`, written while documenting this very
+defect. A parser that treated every line as a command would read a message *describing* a
+command as *running* one. The scanner strips heredoc bodies before parsing.
+
+### The lockout, recorded because it is the general lesson
+
+Installing the untested hook made every Bash call fail. The recovery was not clever: the file
+tools are not gated by a Bash hook, so `pre_bash.sh` was restored with Write, and the work then
+continued with the new hook staged at a different filename and tested by feeding it JSON
+directly — old and new side by side — until the table above was green.
+
+**Never install a guard you have not run against inputs whose answers you already know.** A
+guard is the one kind of code that can prevent you from fixing it. The staged-file-plus-known-
+answers method costs a few minutes and removes that whole class of problem.
+
+### Still open
+
+`post_bash.sh:10` still matches `^git push` and carries the same fail-open defect. It is a
+monitor rather than a guard — failing open loses a CI watch rather than admitting a bad commit —
+so it is left for a separate change rather than bundled into a guard rewrite that had already
+locked the session once.
