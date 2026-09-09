@@ -82,27 +82,71 @@ fi
 # CHECK: Prevent commits to main, in THIS repository
 # ===================================================
 check_no_commits_to_main() {
-    local sub dir degraded target_repo branch
+    local sub dir degraded btarget target_repo branch
 
-    while IFS=$'\t' read -r sub dir degraded; do
-        [ "${sub:-}" = "commit" ] || continue
+    # The branch this repository will be on when a commit runs — not the
+    # branch it is on now.
+    #
+    # A PreToolUse hook decides before ANY of the command runs, so live
+    # git state is the state before the call. Measured 2026-09-09:
+    # `git checkout -q main && ... && git commit --allow-empty -m x`,
+    # issued from a feature branch, was allowed by this guard and by the
+    # one it replaced, because both asked HEAD and HEAD still said
+    # "feature branch". An empty commit landed on main.
+    #
+    # So the branch is tracked forward through the command instead:
+    # start from HEAD, and update on every checkout/switch this call
+    # makes in this repository, before deciding about any commit.
+    branch=$(git -C "$THIS_REPO" rev-parse --abbrev-ref HEAD 2>/dev/null)
 
+    while IFS=$'\t' read -r sub dir degraded btarget; do
         target_repo=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)
 
         # Another repository, or nothing we can resolve: not ours.
         [ -n "$target_repo" ] || continue
         [ "$target_repo" = "$THIS_REPO" ] || continue
 
-        branch=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null)
+        # A branch change earlier in the same call moves the target.
+        if [ "${sub:-}" = "checkout" ] || [ "${sub:-}" = "switch" ]; then
+            case "${btarget:-}" in
+                "")
+                    # Changes no branch at all: `git checkout -- path`,
+                    # or a bare checkout. Leave the tracked branch alone
+                    # rather than refusing, or every `git checkout --
+                    # file && git commit` becomes a false positive.
+                    ;;
+                \$*)
+                    # An unexpanded variable. Cannot tell where this
+                    # lands, and it could be main. Fail closed.
+                    branch="__unknown__"
+                    ;;
+                *)
+                    branch="$btarget"
+                    ;;
+            esac
+            continue
+        fi
+
+        [ "${sub:-}" = "commit" ] || continue
 
         # Release branches may commit directly.
         [[ "$branch" =~ ^release/ ]] && continue
+
+        if [ "$branch" = "__unknown__" ]; then
+            echo "This call changes branch and then commits, and the guard cannot tell which branch the commit lands on." >&2
+            echo "Split it: change branch in one call, commit in the next." >&2
+            echo "Note: this refusal discards the ENTIRE Bash call, including any file edits in it." >&2
+            return 2
+        fi
 
         if [ "$branch" = "main" ] || [ "$branch" = "master" ]; then
             if echo "$COMMAND" | grep -qiE "hotfix|emergency"; then
                 continue
             fi
             echo "Cannot commit directly to $branch in $target_repo. Create a feature branch first." >&2
+            if [ -n "${btarget:-}" ] || echo "$SCAN_OUTPUT" | grep -qE $'^(checkout|switch)\t'; then
+                echo "(This call switches to $branch before committing; the branch you are on now is not the one that matters.)" >&2
+            fi
             if [ "${degraded:-0}" = "1" ]; then
                 echo "(The command could not be parsed cleanly; this refusal came from a conservative fallback scan.)" >&2
             fi
@@ -118,9 +162,9 @@ check_no_commits_to_main() {
 # CHECK: Enforce wrapper script for tag creation
 # ===================================================
 check_tag_creation_workflow() {
-    local sub dir degraded target_repo
+    local sub dir degraded btarget target_repo
 
-    while IFS=$'\t' read -r sub dir degraded; do
+    while IFS=$'\t' read -r sub dir degraded btarget; do
         [ "${sub:-}" = "tag" ] || continue
 
         # Same scoping rule: only this repository's tags.

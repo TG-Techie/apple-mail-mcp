@@ -232,3 +232,69 @@ class TestHeredocBodiesAreDataNotCommands:
             "a commit into the SOP repo must be attributed to the SOP repo, "
             "not to this project — that is the second defect"
         )
+
+
+class TestBranchChangesInTheSameCall:
+    """A PreToolUse hook decides before any of the command runs, so live
+    git state is the state BEFORE the call, not at the moment each piece
+    of it executes.
+
+    Measured 2026-09-09, against the rewritten hook and equally against
+    the one it replaced: ``git checkout main && git commit -m x``, issued
+    from a feature branch, was allowed. The guard read the feature branch
+    because that is what HEAD was when it was asked. An empty commit
+    landed on main.
+
+    So a guard cannot ask "what branch am I on"; it has to ask "what
+    branch will this command be on when it commits". ``branch_target``
+    carries the answer for the invocations that change it.
+    """
+
+    def test_plain_checkout_reports_its_target(self) -> None:
+        out = scan_git_commands("git checkout main && git commit -m x", BASE)
+        checkout = [i for i in out if i.subcommand == "checkout"][0]
+        assert checkout.branch_target == "main"
+
+    def test_checkout_dash_b_reports_the_new_branch(self) -> None:
+        out = scan_git_commands("git checkout -b feature/x && git commit -m y", BASE)
+        checkout = [i for i in out if i.subcommand == "checkout"][0]
+        assert checkout.branch_target == "feature/x"
+
+    def test_switch_reports_its_target(self) -> None:
+        out = scan_git_commands("git switch main", BASE)
+        assert out[0].branch_target == "main"
+
+    def test_switch_dash_c_reports_the_new_branch(self) -> None:
+        out = scan_git_commands("git switch -c feature/y", BASE)
+        assert out[0].branch_target == "feature/y"
+
+    def test_checkout_of_a_path_changes_no_branch(self) -> None:
+        out = scan_git_commands("git checkout -- src/file.py", BASE)
+        assert out[0].branch_target is None
+
+    def test_checkout_with_quiet_flag_still_finds_the_branch(self) -> None:
+        out = scan_git_commands("git checkout -q main", BASE)
+        assert out[0].branch_target == "main"
+
+    def test_checkout_dash_b_with_quiet_flag(self) -> None:
+        out = scan_git_commands("git checkout -q -b feature/z", BASE)
+        assert out[0].branch_target == "feature/z"
+
+    def test_non_branch_subcommands_have_no_target(self) -> None:
+        out = scan_git_commands("git commit -m x", BASE)
+        assert out[0].branch_target is None
+
+    def test_the_exact_sequence_that_slipped_through(self) -> None:
+        # Reproduces the measured escape: checkout to main, then commit,
+        # in one call, from a feature branch.
+        out = scan_git_commands(
+            "git checkout -q main && git merge --ff-only x -q && "
+            "git commit --allow-empty -m 'oops'",
+            BASE,
+        )
+        subs = [i.subcommand for i in out]
+        assert subs == ["checkout", "merge", "commit"]
+        assert out[0].branch_target == "main", (
+            "the guard must be able to see that this call lands on main "
+            "before the commit runs"
+        )

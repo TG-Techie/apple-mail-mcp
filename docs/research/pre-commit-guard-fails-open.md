@@ -427,3 +427,70 @@ answers method costs a few minutes and removes that whole class of problem.
 monitor rather than a guard — failing open loses a CI watch rather than admitting a bad commit —
 so it is left for a separate change rather than bundled into a guard rewrite that had already
 locked the session once.
+
+## Observation 9 — the guard read HEAD, and HEAD is not where the commit lands
+
+Found 2026-09-09, minutes after Observation 8 shipped, by running the new guard against an
+input whose answer was known. It is the same class as everything else here and it survived the
+rewrite, so it is worth its own entry.
+
+### The escape
+
+    git checkout -q main && git merge --ff-only <branch> -q && git push origin main
+    git commit --allow-empty -m "this must be refused"
+
+Issued from a feature branch, this was **allowed**, and an empty commit landed on `main`. It was
+reverted with `git reset --soft HEAD~1` before it reached the remote.
+
+### Why, and why the rewrite did not fix it
+
+A `PreToolUse` hook decides before **any** of the command runs. So `git rev-parse --abbrev-ref
+HEAD` inside the hook reports the branch as it was *before* the call — and the call's own
+`git checkout main` has not happened yet. The guard asked "what branch am I on", got "a feature
+branch", and allowed a commit that would land on main.
+
+The old hook had this too; it is not a regression introduced by Observation 8. Both versions
+asked the same wrong question. The rewrite replaced text-matching with effect-matching and left
+the state question untouched, which is a good illustration that fixing one axis of a defect does
+not audit the others.
+
+### The fix
+
+The branch is now tracked **forward through the command** rather than read once. The scanner
+reports, for each `checkout`/`switch`, the branch that invocation moves HEAD to; the hook starts
+from the current branch and applies each change in order before deciding about any commit that
+follows.
+
+Three cases, deliberately distinguished, because collapsing them produces either a hole or a
+false positive:
+
+| in the command | tracked branch becomes | why |
+|---|---|---|
+| `git checkout main`, `git switch main` | `main` | determinable |
+| `git checkout -- path`, bare `git checkout` | unchanged | changes no branch; refusing here would break `git checkout -- f && git commit` |
+| `git checkout $BRANCH` | unknown → refuse | could be main; fail closed |
+
+### Acceptance, measured against the installed hook
+
+| command (from a feature branch) | exit |
+|---|---|
+| `git checkout -q main && git commit --allow-empty -m x` | 2 |
+| `git switch main && git commit -m x` | 2 |
+| `git checkout $BRANCH && git commit -m x` | 2 |
+| `git checkout -b feature/new && git commit -m x` | 0 |
+| `git checkout -- src/file.py && git commit -m x` | 0 |
+| `git add . && git commit -m x` | 0 |
+| `cd <sop repo> && git commit -m x` | 0 |
+| `ls -la` | 0 |
+
+### The lesson, which is not about git
+
+**A guard that reads live state is reading the state before the call, not the state the guarded
+action will see.** Anything a command does to itself — changing directory, changing branch,
+creating the file it then checks — is invisible to a pre-execution check unless the check models
+it. This generalises to any pre-flight validation: the world it inspects is the world before,
+and the action runs in the world after.
+
+It was found only by running the guard against a case whose answer was known independently.
+Nothing in the unit tests would have caught it, because the unit tests test the parser, and the
+parser was right — the hook was asking it the wrong question.

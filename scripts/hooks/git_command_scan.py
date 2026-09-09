@@ -62,11 +62,24 @@ class GitInvocation:
             this result came from the fallback scan. A caller must not
             treat a degraded result as a reliable reading of the
             command — only as "something that looks like this ran".
+        branch_target: For ``checkout`` and ``switch``, the branch this
+            invocation moves HEAD to. ``None`` for every other
+            subcommand, and for a checkout that touches paths rather
+            than branches.
+
+            This exists because a PreToolUse hook decides before any of
+            the command runs, so live git state is the state *before*
+            the call. ``git checkout main && git commit`` issued from a
+            feature branch reads as "on a feature branch" and is allowed;
+            measured 2026-09-09, and an empty commit landed on main. A
+            guard has to ask what branch the command will be on when it
+            commits, not what branch it is on now.
     """
 
     subcommand: str
     directory: str
     degraded: bool = False
+    branch_target: str | None = None
 
 
 def _resolve(base: str, target: str) -> str:
@@ -108,14 +121,49 @@ def _strip_env_assignments(words: list[str]) -> list[str]:
     return words[i:]
 
 
-def _subcommand_and_dir(words: list[str], cwd: str) -> tuple[str, str] | None:
-    """Extract the subcommand and effective directory from one git argv."""
+_BRANCH_CHANGING = {"checkout", "switch"}
+
+# Flags on checkout/switch that take the new branch name as their value.
+_NEW_BRANCH_FLAGS = {"-b", "-B", "-c", "-C"}
+
+
+def _branch_target(subcommand: str, rest: list[str]) -> str | None:
+    """The branch a checkout/switch moves HEAD to, if determinable.
+
+    ``rest`` is everything after the subcommand. Returns None when the
+    invocation changes no branch — ``git checkout -- path``, or a
+    checkout with no ref at all.
+    """
+    if subcommand not in _BRANCH_CHANGING:
+        return None
+
+    i = 0
+    while i < len(rest):
+        word = rest[i]
+        if word == "--":
+            # Everything after this is paths, not refs.
+            return None
+        if word in _NEW_BRANCH_FLAGS:
+            if i + 1 < len(rest):
+                return rest[i + 1]
+            return None
+        if word.startswith("-"):
+            i += 1
+            continue
+        return word
+    return None
+
+
+def _subcommand_and_dir(
+    words: list[str], cwd: str
+) -> tuple[str, str, str | None] | None:
+    """Extract the subcommand, effective directory and branch target."""
     directory = cwd
     i = 1  # words[0] is git itself
     while i < len(words):
         word = words[i]
         if not word.startswith("-"):
-            return word, directory
+            return word, directory, _branch_target(word, words[i + 1 :])
         if word == "-C" and i + 1 < len(words):
             directory = _resolve(directory, words[i + 1])
             i += 2
@@ -221,8 +269,12 @@ def scan_git_commands(command: str, base_dir: str) -> list[GitInvocation]:
 
             result = _subcommand_and_dir(stripped, cwd)
             if result is not None:
-                subcommand, directory = result
-                invocations.append(GitInvocation(subcommand, directory))
+                subcommand, directory, branch_target = result
+                invocations.append(
+                    GitInvocation(
+                        subcommand, directory, branch_target=branch_target
+                    )
+                )
 
     return invocations
 
@@ -234,8 +286,9 @@ def _main(argv: list[str]) -> int:
 
         git_command_scan.py [--format=tsv] <base_dir>   # command on stdin
 
-    Prints one ``<subcommand>\\t<directory>\\t<degraded>`` line per git
-    invocation, where ``degraded`` is 1 or 0.
+    Prints one ``<subcommand>\\t<directory>\\t<degraded>\\t<branch_target>``
+    line per git invocation, where ``degraded`` is 1 or 0 and
+    ``branch_target`` is empty unless the invocation moves HEAD.
 
     Empty stdout means the command runs no git commands. That is a real
     answer and is deliberately distinct from a non-zero exit, which means
@@ -256,7 +309,10 @@ def _main(argv: list[str]) -> int:
     command = sys.stdin.read()
 
     for inv in scan_git_commands(command, base_dir):
-        print(f"{inv.subcommand}\t{inv.directory}\t{1 if inv.degraded else 0}")
+        print(
+            f"{inv.subcommand}\t{inv.directory}\t"
+            f"{1 if inv.degraded else 0}\t{inv.branch_target or ''}"
+        )
     return 0
 
 
