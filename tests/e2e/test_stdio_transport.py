@@ -22,38 +22,10 @@ import pytest
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+from .expected_tools import EXPECTED_TOOLS
+
 pytestmark = pytest.mark.e2e
 
-EXPECTED_TOOLS = {
-    # Discovery
-    "list_accounts",
-    "list_mailboxes",
-    "list_rules",
-    "search_messages",
-    "get_messages",
-    "get_thread",
-    # Drafts lifecycle (#134)
-    "create_draft",
-    "update_draft",
-    "delete_draft",
-    # Mutations
-    "update_message",
-    "save_attachments",
-    "create_mailbox",
-    "update_mailbox",
-    "delete_mailbox",
-    "delete_messages",
-    # Rule CRUD (#63)
-    "create_rule",
-    "update_rule",
-    "delete_rule",
-    # Templates (#30)
-    "list_templates",
-    "get_template",
-    "save_template",
-    "delete_template",
-    "render_template",
-}
 
 # Per #50 acceptance: test must complete within 15 seconds.
 HANDSHAKE_TIMEOUT_SECONDS = 15.0

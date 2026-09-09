@@ -19,38 +19,10 @@ import pytest
 
 from apple_mail_mcp import server
 
+from .expected_tools import EXPECTED_TOOLS, NO_INVOCATION_CASE
+
 pytestmark = pytest.mark.e2e
 
-EXPECTED_TOOLS = {
-    # Discovery
-    "list_accounts",
-    "list_mailboxes",
-    "list_rules",
-    "search_messages",
-    "get_messages",
-    "get_thread",
-    # Drafts lifecycle (#134)
-    "create_draft",
-    "update_draft",
-    "delete_draft",
-    # Mutations
-    "update_message",
-    "save_attachments",
-    "create_mailbox",
-    "update_mailbox",
-    "delete_mailbox",
-    "delete_messages",
-    # Rule CRUD (#63)
-    "create_rule",
-    "update_rule",
-    "delete_rule",
-    # Templates (#30)
-    "list_templates",
-    "get_template",
-    "save_template",
-    "delete_template",
-    "render_template",
-}
 
 
 @pytest.fixture(autouse=True)
@@ -87,7 +59,7 @@ class TestToolRegistration:
         "tool_name,expected_required",
         [
             ("update_message", {"message_ids"}),
-            ("delete_draft", {"draft_id"}),
+            ("draft_delete", {"draft_id"}),
         ],
     )
     async def test_tool_schema_required_fields(
@@ -155,13 +127,13 @@ INVOCATION_CASES: list[tuple[str, dict[str, Any], str, Any]] = [
           "date_received": "Mon", "read_status": True, "flagged": False}],
     ),
     (
-        "create_draft",
+        "draft_create",
         {"to": ["a@example.com"], "subject": "s", "body": "b"},
         "create_draft",
         {"draft_id": "draft-1", "sent_message_id": ""},
     ),
     (
-        "delete_draft",
+        "draft_delete",
         {"draft_id": "draft-1"},
         "delete_draft",
         True,
@@ -192,12 +164,6 @@ INVOCATION_CASES: list[tuple[str, dict[str, Any], str, Any]] = [
         {"account": "TestAccount", "name": "Old", "new_name": "New"},
         "update_mailbox",
         True,
-    ),
-    (
-        "delete_mailbox",
-        {"account": "TestAccount", "name": "Empty"},
-        "delete_mailbox",
-        0,
     ),
     (
         "delete_messages",
@@ -249,3 +215,135 @@ class TestToolInvocation:
         assert result.structured_content["success"] is True
         assert "error" not in result.structured_content
         getattr(mock_mail, connector_method).assert_called_once()
+
+
+def _tool_names_in_invocation_cases() -> set[str]:
+    return {case[0] for case in INVOCATION_CASES}
+
+
+class TestInvocationCoverage:
+    """Every registered tool is either invoked here or exempted by name.
+
+    Without this, adding a tool leaves a silent hole and renaming one
+    leaves a stale row. d36adc2 renamed the four draft tools and the e2e
+    suite went red for months because nothing tied the two together.
+    """
+
+    async def test_every_tool_has_an_invocation_case(self) -> None:
+        tools = await server.mcp.list_tools()
+        registered = {t.name for t in tools}
+        accounted = _tool_names_in_invocation_cases() | NO_INVOCATION_CASE
+        assert not registered - accounted, (
+            "registered tools with no invocation case and no exemption: "
+            f"{sorted(registered - accounted)}"
+        )
+
+    async def test_no_case_names_an_unregistered_tool(self) -> None:
+        tools = await server.mcp.list_tools()
+        registered = {t.name for t in tools}
+        named = _tool_names_in_invocation_cases() | NO_INVOCATION_CASE
+        assert not named - registered, (
+            "invocation cases or exemptions name tools that are not "
+            f"registered: {sorted(named - registered)}"
+        )
+
+
+class TestConfirmationGate:
+    """delete_mailbox must not proceed without an accepting client.
+
+    mcp.call_tool injects a Context whose elicitation capability is not
+    backed by a real client, so the gate is exercised exactly as it is
+    against a client that cannot elicit. Pre-#226 this path silently
+    proceeded, which is the bypass the assertion pins down.
+    """
+
+    async def test_delete_mailbox_blocks_without_confirmation(self, mock_mail: MagicMock) -> None:
+        result = await server.mcp.call_tool(
+            "delete_mailbox", {"account": "TestAccount", "name": "Empty"}
+        )
+
+        body = result.structured_content
+        assert body is not None
+        assert body["success"] is False
+        assert body["error_type"] == "confirmation_required"
+        mock_mail.delete_mailbox.assert_not_called()
+
+
+class TestOutboundAllowlistGate:
+    """The send tools refuse an off-list recipient before touching Mail.
+
+    These run against the real outbound allowlist deliberately: the gate
+    is the behaviour worth asserting at the MCP layer, and asserting it
+    needs no address on the list and sends nothing. The recipient below
+    is an RFC 2606 reserved domain, which is not an allowlisted
+    destination.
+    """
+
+    OFF_LIST = "not-on-the-allowlist@example.invalid"
+
+    async def test_email_send_html_blocks_off_list_recipient(self, mock_mail: MagicMock) -> None:
+        result = await server.mcp.call_tool(
+            "email_send_html",
+            {"to": [self.OFF_LIST], "subject": "s", "body": "<p>b</p>"},
+        )
+
+        body = result.structured_content
+        assert body is not None
+        assert body["success"] is False
+        assert body["error_type"] in {
+            "outbound_disallowed",
+            "allowlist_unavailable",
+        }
+        mock_mail._send_html_email.assert_not_called()
+
+    async def test_draft_send_blocks_off_list_recipient(self, mock_mail: MagicMock) -> None:
+        mock_mail.get_draft_state.return_value = {
+            "to": [self.OFF_LIST],
+            "cc": [],
+            "bcc": [],
+            "subject": "s",
+            "body": "b",
+        }
+
+        result = await server.mcp.call_tool("draft_send", {"draft_id": "draft-1"})
+
+        body = result.structured_content
+        assert body is not None
+        assert body["success"] is False
+        assert body["error_type"] in {
+            "outbound_disallowed",
+            "allowlist_unavailable",
+        }
+        # The draft must survive a blocked send — the whole reason the
+        # gate sits before the delete-and-recreate path.
+        mock_mail.delete_draft.assert_not_called()
+
+
+class TestDraftUpdateInvocation:
+    """draft_update is delete-and-recreate, so it needs three connector
+    calls stubbed and does not fit the single-method table above."""
+
+    async def test_draft_update_recreates_and_returns_new_id(self, mock_mail: MagicMock) -> None:
+        mock_mail.get_draft_state.return_value = {
+            "to": ["a@example.com"],
+            "cc": [],
+            "bcc": [],
+            "subject": "old",
+            "body": "old",
+            "attachment_paths": [],
+        }
+        mock_mail.delete_draft.return_value = True
+        mock_mail.create_draft.return_value = {
+            "draft_id": "draft-2",
+            "sent_message_id": "",
+        }
+
+        result = await server.mcp.call_tool(
+            "draft_update", {"draft_id": "draft-1", "body": "revised"}
+        )
+
+        body = result.structured_content
+        assert body is not None
+        assert body["success"] is True
+        assert body["draft_id"] == "draft-2"
+        mock_mail.create_draft.assert_called_once()
