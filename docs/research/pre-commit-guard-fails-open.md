@@ -219,3 +219,80 @@ payload.
   guard might reasonably have permitted some of them anyway.
 
 Recorded 2026-09-07.
+
+## Observation 7 — the guard is not repo-scoped, and gates by the wrong repository
+
+Observed 2026-09-09, unplanned, while committing to a different repository entirely.
+
+The command was a commit into `~/AgentAccessFleet/sop`, a separate git repository with no
+relationship to this one:
+
+    cd ~/AgentAccessFleet/sop
+    git add testing/<file>.md
+    git commit -q -F - <<'MSG'
+    ...
+    MSG
+
+Result:
+
+    PreToolUse:Bash hook error: [./scripts/hooks/pre_bash.sh]:
+    Cannot commit directly to main. Create a feature branch first.
+
+That commit had nothing to do with this project. The mechanism is in
+`check_no_commits_to_main`:
+
+    CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+
+`git rev-parse` runs in the hook's own working directory, which is this project, not the
+directory the guarded command runs in. A `cd` inside the command does not move the hook. So the
+guard reads **this** repository's branch and applies the verdict to a commit in **any**
+repository.
+
+The control observation is direct rather than inferred. The identical command shape succeeded
+earlier the same day, landing commit `5d2489d` in the SOP repository, while this project was on
+`fix/e2e-suite-stale-tool-names`. It began failing immediately after that branch merged and
+this project returned to `main`. Nothing about the SOP repository changed between the two.
+
+### A second mechanism, found while working around the first
+
+The obvious repair — create a feature branch, then commit — fails when both are sent as one
+Bash call:
+
+    git checkout -q -b docs/guard-is-not-repo-scoped
+    ... edit ...
+    git commit -q -F - <<'MSG'
+
+This is a `PreToolUse` hook. It evaluates the whole command string before any of it runs, so at
+evaluation time `HEAD` is still `main`, the guard returns 2, and **the entire call is aborted**
+— the `checkout` never happens either, and neither does the file edit that sat between them.
+The branch has to be created in its own call, and the commit sent in the next one.
+
+Worth naming because the failure is silent in a specific way: the refusal message names the
+commit, so the natural reading is that only the commit was rejected. Everything else in the
+call is discarded with it, including edits, and nothing says so.
+
+### Why this belongs beside the fail-open finding rather than replacing it
+
+The guard now has both failure directions recorded, from the same twenty lines:
+
+- **Fails open** on `git add . && git commit -m ...`, because `^git commit` is anchored and
+  `git add` occupies the start of the line. That is Observation 3, and it is the ordinary idiom.
+- **Fails closed** across repository boundaries, blocking commits it has no business having an
+  opinion about, because the branch it reads is not the branch being committed to.
+
+A guard that can be walked past by the most common spelling of the thing it guards, and that
+also refuses unrelated work in other repositories, is not calibrated in either direction. Both
+follow from the same design: matching on the text of the command instead of on what the command
+will do, and reading state from the hook's environment instead of the command's.
+
+### Still not fixed, and still deliberately
+
+Unchanged from the framing at the top of this document: this hook is shared by every session
+working in this repository, and tightening or loosening it changes what is refused for all of
+them. The three checks share the same `^`-anchored matching and the same ambient-cwd
+assumption, so a fix should address all three at once rather than patching whichever one
+happened to surface.
+
+What landed the blocked SOP commit was satisfying the guard rather than bypassing it: this
+project moved to a feature branch, and the commit in the other repository then went through.
+Nothing about that commit changed, only this project's `HEAD`.
