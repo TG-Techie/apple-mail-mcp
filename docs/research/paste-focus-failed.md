@@ -55,6 +55,39 @@ set to `""` and everything else unchanged:
 **The path works today with the seed and without it.** The source file
 was reverted immediately (`git checkout --`); the tree is clean.
 
+## Observation 4 — an aged Mail does not reproduce it either (2026-09-09)
+
+The gap named on 2026-09-07 was that the runs happened minutes after
+boot, while the failure had been reported from a long-running session.
+Re-run against the same Mail process two days later, without restarting
+it:
+
+    $ ps -o lstart=,etime= -p $(pgrep -x Mail)
+    Mon Sep  7 21:03:37 2026     01-16:22:22
+
+So: same pid, up 1 day 16 hours, on a host up the same. Both runs
+repeated:
+
+    with _BODY_SEED = " "     1 passed in 19.95s
+    with _BODY_SEED = ""      1 passed in 10.08s
+
+**Still passes with the seed and without it, on an aged Mail.** The
+source was reverted immediately; the tree is clean.
+
+A session restart does not restart Mail, so the process keeps ageing
+across one. That is what made this measurable without arranging
+anything.
+
+### What this does and does not settle
+
+It removes process age as the explanation. It does not remove the
+degraded-state hypothesis, because **age is not the same variable as
+wear**: the Mail that failed had been driven repeatedly through the
+failing path and had four orphaned compose windows in it, and this one
+has been idle. Nobody has tried to reproduce the failure by first
+putting Mail into that state, and that is now the untested condition
+rather than "an old Mail".
+
 ## Derivations, mine
 
 - The condition that produced `PASTE_FOCUS_FAILED` is **not present on
@@ -62,12 +95,15 @@ was reverted immediately (`git checkout --`); the tree is clean.
   under current conditions. It is not disproven either. Nothing here
   says the seed is unnecessary; it says the experiment that would settle
   it is unavailable while the failure will not reproduce.
-- A restart intervened between the failure and this run. That makes a
-  degraded Mail or window-server state a candidate explanation, which
-  would also fit the four orphaned compose windows cleared on
+- A restart intervened between the failure and the first runs. That
+  made a degraded Mail or window-server state a candidate explanation,
+  which would also fit the four orphaned compose windows cleared on
   2026-09-05 — windows present in the AX tree and in Mail's own window
-  list, with no backing object in `outgoing messages`. **Candidate, not
-  established.** Nobody has reproduced either symptom deliberately.
+  list, with no backing object in `outgoing messages`. **Candidate,
+  not established.** Observation 4 narrows it: whatever the state is,
+  it is not simply an old process, because a process up nearly two days
+  behaves like a fresh one. If the hypothesis survives, the variable is
+  what Mail has been made to do, not how long it has been running.
 - The seed stays. It is a single space, it costs nothing, and removing
   it would trade a state known to work for one whose failure mode is
   understood only from a report that no longer reproduces.
@@ -89,13 +125,11 @@ was reverted immediately (`git checkout --`); the tree is clean.
   consecutive passes were observed on 2026-09-07. No one has run it
   enough times, on either side, to tell those apart.
 
-- **The non-reproduction is scoped to a freshly started Mail.** Observation
-  3 ran minutes after boot. The three reported failures came from a
-  long-running session on a Mail that had by then accumulated four orphaned
-  compose windows. Nothing here tested a Mail process that had been up for
-  hours, which is the state the failure was actually reported in. Any future
-  attempt should record time since boot and the age of the Mail process
-  alongside the result; without those two numbers a pass and a failure are
-  not comparable.
+- **Superseded by Observation 4 below.** This gap said the
+  non-reproduction was scoped to a freshly started Mail and that nobody
+  had tested an aged one. That has now been tested. The requirement it
+  introduced stands: any future attempt records time since boot and the
+  age of the Mail process alongside the result, because without those
+  two numbers a pass and a failure are not comparable.
 
-Recorded 2026-09-07.
+Recorded 2026-09-07; Observation 4 added 2026-09-09.
