@@ -253,15 +253,26 @@ earlier the same day, landing commit `5d2489d` in the SOP repository, while this
 `fix/e2e-suite-stale-tool-names`. It began failing immediately after that branch merged and
 this project returned to `main`. Nothing about the SOP repository changed between the two.
 
-**The scope is the session, not the machine.** Hooks are configured in this project's
-`.claude/settings.json`, so this guard runs for every Bash call made by a session whose project
-is this repository — whatever directory the command runs in — and for no session whose project
-is something else. crisp-kelp established the second half positively rather than by assumption:
-it committed to `~/AgentAccessFleet/sop` twice the same afternoon from its own session and never
-hit the guard. So the effect is that a session working here cannot commit to any repository
-while this project's `HEAD` is `main`, which is narrower than "the SOP is unwritable" and
-stranger, because two sessions running the identical command against the identical repository
-get different answers.
+**The scope is the session, not the machine** — with the two halves of that claim resting on
+different evidence, so they are separated here.
+
+*Observed, in this session:* the guard runs for Bash calls made from here regardless of which
+directory the command runs in, and gates them by this project's branch. That is the body of this
+observation.
+
+*Derived from the mechanism:* hooks are configured in a project's own `.claude/settings.json`,
+so a session whose project is a different repository should not run this one at all. This is a
+derivation from where the configuration lives, not something measured.
+
+*Consistent with it, one positive result:* crisp-kelp reports committing to
+`~/AgentAccessFleet/sop` twice on 2026-09-09 from its own session without hitting the guard.
+One session, two commits, relayed rather than observed here. That is consistent with the
+derivation and is not proof of it.
+
+If the derivation holds, the effect is narrower than "the SOP is unwritable" and stranger: a
+session working here cannot commit to any repository while this project's `HEAD` is `main`,
+while a session elsewhere runs the identical command against the identical repository and
+succeeds.
 
 ### A second mechanism, found while working around the first
 
