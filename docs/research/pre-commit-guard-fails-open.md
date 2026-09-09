@@ -310,9 +310,26 @@ will do, and reading state from the hook's environment instead of the command's.
 
 Unchanged from the framing at the top of this document: this hook is shared by every session
 working in this repository, and tightening or loosening it changes what is refused for all of
-them. The three checks share the same `^`-anchored matching and the same ambient-cwd
-assumption, so a fix should address all three at once rather than patching whichever one
-happened to surface.
+them.
+
+**Correction, 2026-09-09.** An earlier version of this section said all three checks share both
+the `^`-anchored matching and the ambient-cwd assumption. Only the first half is true, and the
+sentence was written from memory rather than from the file. Read back from
+`scripts/hooks/pre_bash.sh` and `scripts/hooks/post_bash.sh`:
+
+| check | file | matches | reads git state |
+|---|---|---|---|
+| `check_no_commits_to_main` | `pre_bash.sh:13` | `^git commit` | yes — `git rev-parse` in the hook's cwd |
+| `check_tag_creation_workflow` | `pre_bash.sh:38` | `^git tag` | no |
+| CI watch after push | `post_bash.sh:10` | `^git push` | no |
+
+`pre_bash.sh` defines exactly two checks, not three; the third is in the other file. **All three
+share the anchored-match defect. Only the branch guard has the ambient-cwd defect**, because it
+is the only one that reads repository state at all.
+
+So a fix addresses the matching in all three, and the cwd question in one. That is a smaller and
+better-defined change than the sentence it replaces implied, which is the reason to get it right
+rather than leave a tidy overstatement standing.
 
 What landed the blocked SOP commit was satisfying the guard rather than bypassing it: this
 project moved to a feature branch, and the commit in the other repository then went through.
