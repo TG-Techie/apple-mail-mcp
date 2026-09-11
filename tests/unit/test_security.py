@@ -581,18 +581,18 @@ class TestCheckTestModeSafety:
         assert result["error_type"] == "safety_violation"
         assert "real@person.com" in result["error"]
 
-    def test_send_blocked_when_recipients_none_in_test_mode(
+    def test_recipients_none_means_this_call_sends_nothing(
         self, monkeypatch: Any
     ) -> None:
-        """#175: implicit-reply path (no explicit to/cc/bcc, Mail.app
-        derives at send time) reaches the gate with recipients=None.
-        Must reject — the safety check has nothing to verify."""
+        """A draft being saved reaches the gate for its account only,
+        with recipients=None; nothing leaves, so there is nothing to
+        confine. The send path always passes a list — an empty one is a
+        send whose recipients Mail would derive, refused below (#175).
+        Until 2026-09-11 None was refused too, which made the gate
+        unusable for the save path."""
         monkeypatch.setenv("MAIL_TEST_MODE", "true")
 
-        result = check_test_mode_safety("create_draft", recipients=None)
-        assert result is not None
-        assert result["error_type"] == "safety_violation"
-        assert "explicit recipients" in result["error"]
+        assert check_test_mode_safety("create_draft", recipients=None) is None
 
     def test_send_blocked_when_recipients_empty_in_test_mode(
         self, monkeypatch: Any
@@ -690,6 +690,11 @@ class TestAccountGateCoversEveryAccountScopedMutation:
             "update_mailbox",
             "delete_mailbox",
             "delete_messages",
+            # The sender the caller names: a draft saved into, or mail
+            # sent from, that account.
+            "create_draft",
+            "update_draft",
+            "email_send_html",
         ],
     )
     def test_mutation_on_another_account_is_refused(
@@ -704,7 +709,10 @@ class TestAccountGateCoversEveryAccountScopedMutation:
 
     @pytest.mark.parametrize(
         "operation",
-        ["update_mailbox", "delete_mailbox", "delete_messages"],
+        [
+            "update_mailbox", "delete_mailbox", "delete_messages",
+            "create_draft", "update_draft", "email_send_html",
+        ],
     )
     def test_mutation_on_the_test_account_is_allowed(
         self, operation: str, monkeypatch: Any

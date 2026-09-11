@@ -320,6 +320,12 @@ ACCOUNT_GATED_OPERATIONS = {
     "create_mailbox",
     "update_mailbox",
     "delete_mailbox",
+    # The sender the caller names (from_account): a draft saved into that
+    # account's Drafts, or mail sent under it. A sender left to Mail's
+    # default is not confined here — the fresh send path cannot name one.
+    "create_draft",
+    "update_draft",
+    "email_send_html",
 }
 
 # Of those, the ones that change mail and can be called without naming an
@@ -451,8 +457,12 @@ def check_test_mode_safety(
     - Account-gated operations must target MAIL_TEST_ACCOUNT.
     - delete_messages and update_message must name the test account;
       with no account they would act on message ids from any account.
-    - Send operations must send only to RFC 2606 reserved domains
-      (when explicit recipients are supplied).
+    - Send operations, on a call that sends, must send only to RFC 2606
+      reserved domains and must name every recipient. ``recipients``
+      says whether the call sends: None means nothing is sent by this
+      call (a draft being saved, checked here for its account only);
+      a list, even an empty one, means a send, and an empty one is a
+      send whose recipients Mail would derive, which is refused.
     - Rule-mutation operations must target rules whose names start with
       RULE_TEST_PREFIX (protects the user's real rules during integration
       testing), and a rule that forwards may forward only to RFC 2606
@@ -502,7 +512,7 @@ def check_test_mode_safety(
             )
 
     # Send operations: verify every recipient is on a reserved test domain.
-    if operation in SEND_OPERATIONS:
+    if operation in SEND_OPERATIONS and recipients is not None:
         # #175: empty recipients in test mode is unsafe — an implicit-reply
         # send_now path (no explicit to/cc/bcc) lets Mail.app derive
         # recipients at send time, bypassing the reserved-domain gate.

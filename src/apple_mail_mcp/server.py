@@ -2916,6 +2916,35 @@ async def _gate_create_draft_send(
     )
 
 
+async def _gate_update_draft_send(
+    *,
+    seed_kind: str,
+    draft_id: str,
+    to: list[str],
+    cc: list[str],
+    bcc: list[str],
+    subject: str | None,
+    body: str,
+    ctx: Context | None,
+) -> dict[str, Any] | None:
+    """The gate chain for a draft that is to be sent as it is updated.
+
+    The recipient groups are the merged ones — the draft's own state
+    with the caller's overrides — so their shape is not re-validated
+    here (#175 + #192); everything else is as for ``create_draft``.
+    Returns the first gate's error, or None when every gate passed.
+    """
+    summary = _build_draft_send_summary(seed_kind, to, cc, bcc, subject, body)
+    return await _run_send_now_gates(
+        operation="update_draft",
+        ctx=ctx,
+        recipients=to + cc + bcc,
+        rate_params={"draft_id": draft_id, "subject": subject},
+        summary=summary,
+        elicit_extra={"draft_id": draft_id, "send_now": True},
+    )
+
+
 async def create_draft(
     reply_to: str | None = None,
     forward_of: str | None = None,
@@ -3006,6 +3035,14 @@ async def create_draft(
                 "error": "template_vars requires template_name",
                 "error_type": "validation_error",
             }
+
+        # A named sender is an account this call writes into (the draft
+        # lands in its Drafts, or the mail goes out under it); in test
+        # mode it must be the test account. The send gates below see the
+        # recipients separately.
+        safety_err = check_test_mode_safety("create_draft", account=from_account)
+        if safety_err:
+            return safety_err
 
         seed_kind, seed_id = _resolve_create_draft_seed(reply_to, forward_of)
 
@@ -3173,6 +3210,12 @@ async def update_draft(
                 "error_type": "validation_error",
             }
 
+        # Only the caller's override is an account named here; the sender
+        # carried over from the draft's own state is where it already is.
+        safety_err = check_test_mode_safety("update_draft", account=from_account)
+        if safety_err:
+            return safety_err
+
         try:
             state = mail.get_draft_state(draft_id)
         except MailDraftError as e:
@@ -3212,22 +3255,10 @@ async def update_draft(
         )
 
         if send_now:
-            all_recipients = (
-                (final_to or []) + (final_cc or []) + (final_bcc or [])
-            )
-            summary = _build_draft_send_summary(
-                seed_kind, final_to, final_cc, final_bcc, final_subject,
-                final_body or "",
-            )
-            # validate_recipient_shape stays False — recipients came from
-            # existing draft state, not fresh caller input. (#175 + #192)
-            gate_err = await _run_send_now_gates(
-                operation="update_draft",
-                ctx=ctx,
-                recipients=all_recipients,
-                rate_params={"draft_id": draft_id, "subject": final_subject},
-                summary=summary,
-                elicit_extra={"draft_id": draft_id, "send_now": True},
+            gate_err = await _gate_update_draft_send(
+                seed_kind=seed_kind, draft_id=draft_id,
+                to=final_to, cc=final_cc, bcc=final_bcc,
+                subject=final_subject, body=final_body or "", ctx=ctx,
             )
             if gate_err:
                 return gate_err
@@ -3826,6 +3857,10 @@ async def email_send_html(
     bcc_list = bcc or []
     attachment_paths = attachment_paths or []
     all_recipients = list(to) + list(cc_list) + list(bcc_list)
+
+    safety_err = check_test_mode_safety("email_send_html", account=from_account)
+    if safety_err:
+        return safety_err
 
     err = _validate_html_send_request(
         to=to, cc_list=cc_list, bcc_list=bcc_list, subject=subject,

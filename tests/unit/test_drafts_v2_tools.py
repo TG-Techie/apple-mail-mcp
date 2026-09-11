@@ -1098,3 +1098,98 @@ class TestEmailSendHtmlIsConfinedInTestMode:
         )
         assert result["success"] is True
         mock_mail._send_html_email.assert_called_once()
+
+
+class TestANamedSenderIsConfinedInTestMode:
+    """A draft saved from a named account lands in that account's Drafts,
+    and mail sent from one goes out under it. In test mode a caller's
+    ``from_account`` must therefore be the test account, as ``account``
+    must be for the mailbox and message tools. A sender left to Mail's
+    default is not confined here: the fresh send path cannot name one."""
+
+    _STATE = {
+        "draft_id": "OLD",
+        "to": ["alice@example.com"], "cc": [], "bcc": [],
+        "subject": "hi", "body": "x",
+        "in_reply_to": "", "references": "", "attachment_names": [],
+        "sender": "Agent <agent@example.com>",
+    }
+
+    @pytest.fixture
+    def test_mode(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from apple_mail_mcp.security import _get_test_account_identifiers
+
+        _get_test_account_identifiers.cache_clear()
+        monkeypatch.setenv("MAIL_TEST_MODE", "true")
+        monkeypatch.setenv("MAIL_TEST_ACCOUNT", "TestAccount")
+
+    @pytest.mark.asyncio
+    async def test_draft_create_from_another_account_is_refused(
+        self, isolated_drafts: None, mock_mail: MagicMock, test_mode: None,
+    ) -> None:
+        from apple_mail_mcp.server import draft_create
+
+        result = await draft_create(
+            to=["alice@example.com"], subject="s", body="b",
+            from_account="Other",
+        )
+        assert result["success"] is False
+        assert result["error_type"] == "safety_violation"
+        mock_mail.create_draft.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_draft_create_from_the_test_account_proceeds(
+        self, isolated_drafts: None, mock_mail: MagicMock, test_mode: None,
+    ) -> None:
+        from apple_mail_mcp.server import draft_create
+
+        mock_mail.create_draft.return_value = {
+            "draft_id": "NEW", "sent_message_id": "",
+        }
+        result = await draft_create(
+            to=["alice@example.com"], subject="s", body="b",
+            from_account="TestAccount",
+        )
+        assert result["success"] is True
+
+    @pytest.mark.asyncio
+    async def test_draft_update_to_another_account_is_refused(
+        self, isolated_drafts: None, mock_mail: MagicMock, test_mode: None,
+    ) -> None:
+        from apple_mail_mcp.server import draft_update
+
+        mock_mail.get_draft_state.return_value = dict(self._STATE)
+        result = await draft_update(draft_id="OLD", from_account="Other")
+        assert result["success"] is False
+        assert result["error_type"] == "safety_violation"
+        mock_mail.create_draft.assert_not_called()
+        mock_mail.delete_draft.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_draft_update_carrying_its_sender_over_is_not_a_reach(
+        self, isolated_drafts: None, mock_mail: MagicMock, test_mode: None,
+    ) -> None:
+        """The sender read back from Mail is an address, not an account
+        the caller named; the draft is recreated where it already is."""
+        from apple_mail_mcp.server import draft_update
+
+        mock_mail.get_draft_state.return_value = dict(self._STATE)
+        mock_mail.create_draft.return_value = {
+            "draft_id": "NEW", "sent_message_id": "",
+        }
+        result = await draft_update(draft_id="OLD", body="revised")
+        assert result["success"] is True
+
+    @pytest.mark.asyncio
+    async def test_email_send_html_from_another_account_is_refused(
+        self, isolated_drafts: None, mock_mail: MagicMock, test_mode: None,
+    ) -> None:
+        from apple_mail_mcp.server import email_send_html
+
+        result = await email_send_html(
+            reply_to="12345", to=["alice@example.com"], body="<p>b</p>",
+            from_account="Other",
+        )
+        assert result["success"] is False
+        assert result["error_type"] == "safety_violation"
+        mock_mail._send_html_email.assert_not_called()
