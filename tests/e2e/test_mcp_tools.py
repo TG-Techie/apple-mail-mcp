@@ -347,3 +347,69 @@ class TestDraftUpdateInvocation:
         assert body["success"] is True
         assert body["draft_id"] == "draft-2"
         mock_mail.create_draft.assert_called_once()
+
+
+class TestConfirmationAnsweredByARealClient:
+    """The gate, answered over the wire by a client that can elicit.
+
+    ``TestConfirmationGate`` above only shows that a client which cannot
+    elicit is refused. Every failure inside the gate collapses to the same
+    ``confirmation_required`` result, so that test cannot tell "the client
+    could not answer" from "the server asked a question the framework
+    refuses to send". fastmcp 4 removed ``ctx.elicit(message, None)``, and
+    with it every confirmation-gated tool became unconfirmable while that
+    test stayed green.
+
+    These drive the server through fastmcp's in-memory client with a
+    handler that answers the elicitation, so the question actually has to
+    be askable and the answer actually has to be read.
+    """
+
+    @staticmethod
+    def _client(answer: Any) -> Any:
+        from fastmcp import Client
+        from fastmcp.client.elicitation import ElicitResult
+
+        async def handler(message: str, response_type: Any, params: Any, ctx: Any) -> Any:
+            if answer is DECLINE:
+                return ElicitResult(action="decline")
+            return answer
+
+        return Client(server.mcp, elicitation_handler=handler)
+
+    async def test_accept_true_lets_the_tool_proceed(self, mock_mail: MagicMock) -> None:
+        mock_mail.delete_mailbox.return_value = True
+        async with self._client(True) as client:
+            result = await client.call_tool(
+                "delete_mailbox", {"account": "TestAccount", "name": "Empty"}
+            )
+        body = result.structured_content
+        assert body is not None
+        assert body["success"] is True, body
+        mock_mail.delete_mailbox.assert_called_once()
+
+    async def test_accept_false_is_a_decline(self, mock_mail: MagicMock) -> None:
+        """A form answered "no" is not a yes. The bool is the answer."""
+        async with self._client(False) as client:
+            result = await client.call_tool(
+                "delete_mailbox", {"account": "TestAccount", "name": "Empty"}
+            )
+        body = result.structured_content
+        assert body is not None
+        assert body["success"] is False
+        assert body["error_type"] == "cancelled"
+        mock_mail.delete_mailbox.assert_not_called()
+
+    async def test_decline_is_cancelled(self, mock_mail: MagicMock) -> None:
+        async with self._client(DECLINE) as client:
+            result = await client.call_tool(
+                "delete_mailbox", {"account": "TestAccount", "name": "Empty"}
+            )
+        body = result.structured_content
+        assert body is not None
+        assert body["success"] is False
+        assert body["error_type"] == "cancelled"
+        mock_mail.delete_mailbox.assert_not_called()
+
+
+DECLINE = object()

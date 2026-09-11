@@ -104,9 +104,20 @@ async def _elicit_confirmation(
     """Elicit user confirmation via MCP. Fails closed — confirmation gates
     the destructive operation entirely.
 
+    The question is a ``bool`` form: fastmcp 4 removed the bare
+    accept/decline elicitation (``response_type=None``) because its empty
+    schema rendered as an empty form in some clients, and raises
+    ``TypeError`` on it. Under the old form that error would have been
+    caught below and reported as "capability unavailable" — every gated
+    tool unconfirmable, and every test still green, because a client that
+    cannot answer and a question that cannot be asked produce the same
+    result. The e2e suite now answers the question through a real client.
+
     Returns:
-        - ``None`` only when the user explicitly accepted.
-        - ``{"error_type": "cancelled"}`` when the user declined.
+        - ``None`` only when the user explicitly accepted with ``True``.
+        - ``{"error_type": "cancelled"}`` when the user declined, or
+          accepted the form with ``False`` — a form answered "no" is not
+          a yes.
         - ``{"error_type": "confirmation_required"}`` when no context was
           provided or the client's elicitation call failed (capability
           unsupported, IO error). Pre-#226 these paths silently
@@ -126,7 +137,12 @@ async def _elicit_confirmation(
             "error_type": "confirmation_required",
         }
     try:
-        result = await ctx.elicit(summary, None)
+        # mypy resolves this call to fastmcp's ``response_type: None``
+        # overload and rejects ``bool`` against it (fastmcp 3.4.7, mypy
+        # 1.x; the ``type[T]`` overload is the one that applies and is
+        # what runs). The e2e suite answers this question through a real
+        # client, which is the check that matters here.
+        result = await ctx.elicit(summary, bool)  # type: ignore[arg-type]
     except Exception as e:
         logger.warning(
             "Elicitation unavailable; blocking %s: %s", operation, e
@@ -142,7 +158,13 @@ async def _elicit_confirmation(
             ),
             "error_type": "confirmation_required",
         }
-    if not isinstance(result, AcceptedElicitation):
+    # Same overload confusion: mypy types ``data`` as the ``None``
+    # overload's ``dict[str, Any]``; at runtime it is the bool answer.
+    answered_yes = (
+        isinstance(result, AcceptedElicitation)
+        and result.data is True  # type: ignore[comparison-overlap]
+    )
+    if not answered_yes:
         operation_logger.log_operation(operation, params, "cancelled")
         return {
             "success": False,

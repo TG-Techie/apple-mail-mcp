@@ -62,9 +62,19 @@ def mock_logger() -> Any:
 
 @pytest.fixture
 def mock_ctx_accept() -> MagicMock:
-    """Mock MCP Context that accepts elicitation."""
+    """Mock MCP Context that accepts elicitation, answering the bool
+    form with True."""
     ctx = MagicMock()
-    ctx.elicit = AsyncMock(return_value=AcceptedElicitation(data={}))
+    ctx.elicit = AsyncMock(return_value=AcceptedElicitation(data=True))
+    return ctx
+
+
+@pytest.fixture
+def mock_ctx_accept_false() -> MagicMock:
+    """Mock MCP Context that submits the confirmation form answered
+    False — accepted as a form, but the answer is no."""
+    ctx = MagicMock()
+    ctx.elicit = AsyncMock(return_value=AcceptedElicitation(data=False))
     return ctx
 
 
@@ -122,6 +132,31 @@ class TestElicitConfirmationFailsClosed:
         assert result["success"] is False
         assert result["error_type"] == "confirmation_required"
         assert "elicitation" in result["error"].lower()
+
+    async def test_accepted_form_answered_false_is_cancelled(
+        self, mock_ctx_accept_false: MagicMock,
+    ) -> None:
+        """The bool is the answer. An accepted form carrying False must
+        not proceed, and must read as the user saying no."""
+        result = await _elicit_confirmation(
+            ctx=mock_ctx_accept_false, summary="Do X?",
+            operation="op", params={"k": "v"},
+        )
+        assert result is not None
+        assert result["success"] is False
+        assert result["error_type"] == "cancelled"
+
+    async def test_asks_a_bool_question_not_a_bare_one(
+        self, mock_ctx_accept: MagicMock,
+    ) -> None:
+        """fastmcp 4 raises on response_type=None; that TypeError would be
+        swallowed into confirmation_required and every gated tool would
+        be unconfirmable while looking fail-closed."""
+        await _elicit_confirmation(
+            ctx=mock_ctx_accept, summary="Do X?",
+            operation="op", params={"k": "v"},
+        )
+        mock_ctx_accept.elicit.assert_awaited_once_with("Do X?", bool)
 
     async def test_returns_cancelled_when_user_declines(
         self, mock_ctx_decline: MagicMock,
