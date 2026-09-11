@@ -32,6 +32,7 @@ from .exceptions import (
     MailMailboxNotFoundError,
     MailMessageNotFoundError,
     MailOutboundDisallowedError,
+    MailRuleChangedError,
     MailRuleNotFoundError,
     MailUnsupportedGmailSystemLabelError,
     MailUnsupportedRuleActionError,
@@ -1048,6 +1049,7 @@ class AppleMailConnector:
         conditions: list[dict[str, Any]] | None = None,
         actions: dict[str, Any] | None = None,
         match_logic: str | None = None,
+        expected_name: str | None = None,
     ) -> None:
         """Update an existing Mail.app rule (patch-style for top-level fields,
         full replacement for conditions/actions when provided).
@@ -1066,12 +1068,19 @@ class AppleMailConnector:
             actions: If provided, REPLACES all action flags wholesale —
                 unprovided actions are reset to off.
             match_logic: 'all' | 'any', only set if not None.
+            expected_name: The name the caller confirmed for this index.
+                When given, the update applies only if the rule at the
+                index still carries that name, checked inside the same
+                AppleScript call as the changes. See ``delete_rule``.
 
         Raises:
             ValueError: If any provided input fails schema validation.
             MailRuleNotFoundError: If rule_index is out of range.
             MailUnsupportedRuleActionError: If the rule currently has an
                 action outside the supported schema.
+            MailRuleChangedError: If ``expected_name`` was given and the
+                rule at the index is now a different one. Nothing was
+                changed.
         """
         if rule_index < 1:
             raise MailRuleNotFoundError(
@@ -1150,12 +1159,12 @@ class AppleMailConnector:
         if len(body_parts) == 1:
             # Only the rule lookup, no actual updates — caller passed nothing.
             return
-        script = (
-            'tell application "Mail"\n'
-            + "\n".join(body_parts)
-            + "\nend tell"
+        tell_body = self._guarded_rule_mutation(rule_index, expected_name, body_parts)
+        script = _wrap_as_json_script(tell_body, timeout=self.timeout)
+        outcome = cast(
+            dict[str, Any], parse_applescript_json(self._run_applescript(script))
         )
-        self._run_applescript(script)
+        self._raise_if_rule_changed(rule_index, expected_name, outcome)
 
     def _check_supported_actions(self, rule_index: int) -> None:
         """Verify a rule's existing actions are all in our schema.
@@ -1209,7 +1218,7 @@ class AppleMailConnector:
                 f"Mail.app's Rules pane instead."
             )
 
-    def delete_rule(self, rule_index: int) -> str:
+    def delete_rule(self, rule_index: int, expected_name: str | None = None) -> str:
         """Delete a rule by 1-based index.
 
         Reads the rule's name in the same AppleScript call so callers
@@ -1220,25 +1229,82 @@ class AppleMailConnector:
 
         Args:
             rule_index: 1-based positional index, as returned by ``list_rules``.
+            expected_name: The name the caller confirmed for this index.
+                When given, the delete applies only if the rule at the
+                index still carries that name — checked inside the same
+                AppleScript call, so there is no gap between the check
+                and the act. Indices are positions, and positions move
+                while a confirmation prompt is open.
 
         Returns:
             The name of the deleted rule (for confirmation / logging).
 
         Raises:
             MailRuleNotFoundError: If rule_index is out of range.
+            MailRuleChangedError: If ``expected_name`` was given and the
+                rule at the index is now a different one. Nothing was
+                deleted.
         """
         if rule_index < 1:
             raise MailRuleNotFoundError(
                 f"rule_index must be 1-based and positive, got {rule_index}"
             )
-        script = (
-            f'tell application "Mail"\n'
-            f"    set deletedName to name of rule {rule_index}\n"
-            f"    delete rule {rule_index}\n"
-            f"    return deletedName\n"
-            f"end tell"
+        tell_body = self._guarded_rule_mutation(
+            rule_index, expected_name, [f"delete rule {rule_index}"]
         )
-        return self._run_applescript(script)
+        script = _wrap_as_json_script(tell_body, timeout=self.timeout)
+        outcome = cast(
+            dict[str, Any], parse_applescript_json(self._run_applescript(script))
+        )
+        self._raise_if_rule_changed(rule_index, expected_name, outcome)
+        return cast(str, outcome["name"])
+
+    @staticmethod
+    def _guarded_rule_mutation(
+        rule_index: int, expected_name: str | None, statements: list[str]
+    ) -> str:
+        """AppleScript that applies ``statements`` to ``rule rule_index``
+        only if its name is still ``expected_name``.
+
+        The name is read and compared inside the same tell block as the
+        mutation. The block sets ``resultData`` to ``{name, applied}``
+        for :func:`_wrap_as_json_script`; ``applied`` is false when the
+        name did not match and nothing ran. With no ``expected_name``
+        the statements run unconditionally.
+        """
+        body = "\n".join("            " + stmt for stmt in statements)
+        if expected_name is None:
+            return f'''
+        tell application "Mail"
+            set currentName to name of rule {rule_index}
+{body}
+            set resultData to {{|name|:currentName, |applied|:true}}
+        end tell
+        '''
+        name_safe = escape_applescript_string(expected_name)
+        return f'''
+        tell application "Mail"
+            set currentName to name of rule {rule_index}
+            if currentName is "{name_safe}" then
+{body}
+                set resultData to {{|name|:currentName, |applied|:true}}
+            else
+                set resultData to {{|name|:currentName, |applied|:false}}
+            end if
+        end tell
+        '''
+
+    @staticmethod
+    def _raise_if_rule_changed(
+        rule_index: int, expected_name: str | None, outcome: dict[str, Any]
+    ) -> None:
+        if outcome.get("applied") is True:
+            return
+        raise MailRuleChangedError(
+            rule_index,
+            expected_name=expected_name or "",
+            actual_name=cast(str, outcome.get("name", "")),
+        )
 
     def list_mailboxes(self, account: str) -> list[dict[str, Any]]:
         """List all mailboxes for an account.

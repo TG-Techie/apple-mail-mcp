@@ -26,6 +26,7 @@ from .exceptions import (
     MailMailboxNotFoundError,
     MailMessageNotFoundError,
     MailOutboundDisallowedError,
+    MailRuleChangedError,
     MailRuleNotFoundError,
     MailTemplateError,
     MailTemplateInvalidFormatError,
@@ -330,7 +331,11 @@ async def delete_rule(
         if cancel_err:
             return cancel_err
 
-        deleted = mail.delete_rule(rule_index)
+        # Bound to what was confirmed: the connector checks the name at
+        # the index inside the same AppleScript call as the delete, so a
+        # rule that moved while the prompt was open is not the one acted
+        # on — nothing is, and the caller is told to re-list.
+        deleted = mail.delete_rule(rule_index, expected_name=rule_name)
         operation_logger.log_operation(
             "delete_rule",
             {"rule_index": rule_index, "deleted_name": deleted},
@@ -342,6 +347,8 @@ async def delete_rule(
             "deleted_name": deleted,
         }
 
+    except MailRuleChangedError as e:
+        return {"success": False, "error": str(e), "error_type": "rule_changed"}
     except MailRuleNotFoundError as e:
         return {
             "success": False,
@@ -524,6 +531,7 @@ async def update_rule(
             conditions=conditions,
             actions=actions,
             match_logic=match_logic,
+            expected_name=rule_name,
         )
         operation_logger.log_operation(
             "update_rule",
@@ -535,6 +543,8 @@ async def update_rule(
             "rule_index": rule_index,
         }
 
+    except MailRuleChangedError as e:
+        return {"success": False, "error": str(e), "error_type": "rule_changed"}
     except MailRuleNotFoundError as e:
         return {
             "success": False,

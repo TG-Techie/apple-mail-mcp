@@ -372,7 +372,7 @@ class TestDeleteRule:
         assert result["success"] is True
         assert result["deleted_name"] == "Junk filter"
         mock_ctx_accept.elicit.assert_awaited_once()
-        mock_mail.delete_rule.assert_called_once_with(1)
+        mock_mail.delete_rule.assert_called_once_with(1, expected_name="Junk filter")
 
     async def test_declined_ctx_blocks_delete(
         self, mock_mail: MagicMock, mock_ctx_decline: MagicMock
@@ -3848,3 +3848,73 @@ class TestConnectorCreateDraftEdgeCase:
             connector.create_draft(
                 seed="reply", seed_id="160000", body="x"
             )
+
+
+class TestRuleToolsBindTheActionToTheConfirmedRule:
+    """What the user confirmed is what gets acted on, or nothing is."""
+
+    @pytest.mark.asyncio
+    async def test_delete_rule_passes_the_confirmed_name_to_the_connector(
+        self, mock_mail: MagicMock, mock_logger: MagicMock, mock_ctx_accept: MagicMock
+    ) -> None:
+        from apple_mail_mcp.server import delete_rule
+
+        mock_mail.list_rules.return_value = [{"index": 2, "name": "Junk filter"}]
+        mock_mail.delete_rule.return_value = "Junk filter"
+
+        result = await delete_rule(rule_index=2, ctx=mock_ctx_accept)
+
+        assert result["success"] is True
+        mock_mail.delete_rule.assert_called_once_with(2, expected_name="Junk filter")
+
+    @pytest.mark.asyncio
+    async def test_delete_rule_reports_a_moved_rule_as_rule_changed(
+        self, mock_mail: MagicMock, mock_logger: MagicMock, mock_ctx_accept: MagicMock
+    ) -> None:
+        from apple_mail_mcp.exceptions import MailRuleChangedError
+        from apple_mail_mcp.server import delete_rule
+
+        mock_mail.list_rules.return_value = [{"index": 2, "name": "Junk filter"}]
+        mock_mail.delete_rule.side_effect = MailRuleChangedError(
+            2, expected_name="Junk filter", actual_name="Something else"
+        )
+
+        result = await delete_rule(rule_index=2, ctx=mock_ctx_accept)
+
+        assert result["success"] is False
+        assert result["error_type"] == "rule_changed"
+        assert "Junk filter" in result["error"]
+        assert "Something else" in result["error"]
+        assert "list_rules" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_update_rule_passes_the_confirmed_name_to_the_connector(
+        self, mock_mail: MagicMock, mock_logger: MagicMock, mock_ctx_accept: MagicMock
+    ) -> None:
+        from apple_mail_mcp.server import update_rule
+
+        mock_mail.list_rules.return_value = [{"index": 3, "name": "Newsletters"}]
+
+        result = await update_rule(rule_index=3, enabled=False, ctx=mock_ctx_accept)
+
+        assert result["success"] is True
+        assert mock_mail.update_rule.call_args.kwargs["expected_name"] == "Newsletters"
+
+    @pytest.mark.asyncio
+    async def test_update_rule_reports_a_moved_rule_as_rule_changed(
+        self, mock_mail: MagicMock, mock_logger: MagicMock, mock_ctx_accept: MagicMock
+    ) -> None:
+        from apple_mail_mcp.exceptions import MailRuleChangedError
+        from apple_mail_mcp.server import update_rule
+
+        mock_mail.list_rules.return_value = [{"index": 3, "name": "Newsletters"}]
+        mock_mail.update_rule.side_effect = MailRuleChangedError(
+            3, expected_name="Newsletters", actual_name="Receipts"
+        )
+
+        result = await update_rule(
+            rule_index=3, actions={"mark_read": True}, ctx=mock_ctx_accept
+        )
+
+        assert result["success"] is False
+        assert result["error_type"] == "rule_changed"

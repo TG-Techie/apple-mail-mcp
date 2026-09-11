@@ -1187,6 +1187,8 @@ Patch a rule's properties. Only the fields you pass are changed. Also serves as 
 
 **Conditional confirmation:** prompts the user via MCP elicitation only when the patch touches `conditions`, `actions`, or `match_logic` (irreversible replacements). Patches limited to `enabled` and/or `name` skip the prompt — both are trivially reversible.
 
+**Bound to the rule that was named:** `rule_index` is a position, and positions move when a rule is created, deleted or reordered — including while a confirmation prompt is open. The update applies only if the rule at that index still has the name the tool resolved (and showed you, when it prompted); the check and the change happen in one AppleScript call. Otherwise nothing is changed and the tool returns `error_type: "rule_changed"` — re-run `list_rules` and try again.
+
 **Returns:**
 
 ```json
@@ -1208,12 +1210,14 @@ Delete a rule by index.
 
 - `rule_index` (int, required): 1-based index from `list_rules`.
 
-**Confirmation:** elicits user confirmation before deletion.
+**Confirmation:** elicits user confirmation before deletion, naming the rule at the index.
+
+**Bound to the rule that was confirmed:** the delete applies only if the rule at `rule_index` still has the name shown in the prompt — checked in the same AppleScript call as the delete. A rule that moved while the prompt was open is not deleted; nothing is, and the tool returns `error_type: "rule_changed"` with both names. Re-run `list_rules` and confirm again.
 
 **Returns:**
 
 ```json
-{"success": true, "rule_index": 7, "name": "File OmniFocus replies"}
+{"success": true, "rule_index": 7, "deleted_name": "File OmniFocus replies"}
 ```
 
 ---

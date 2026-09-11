@@ -165,6 +165,28 @@ class MailRuleNotFoundError(MailError):
     pass
 
 
+class MailRuleChangedError(MailError):
+    """The rule at a positional index is not the rule the caller confirmed.
+
+    Rule indices are positions in a list, and the list can change while a
+    confirmation prompt is open — a rule created, deleted or reordered in
+    Mail.app moves every index after it. The connector checks the
+    confirmed name against the rule at the index inside the same
+    AppleScript call as the mutation, so a mismatch means **nothing was
+    applied**. The caller should re-run list_rules and confirm again.
+    """
+
+    def __init__(self, rule_index: int, expected_name: str, actual_name: str):
+        self.rule_index = rule_index
+        self.expected_name = expected_name
+        self.actual_name = actual_name
+        super().__init__(
+            f"Rule at index {rule_index} is now '{actual_name}', not "
+            f"'{expected_name}' as confirmed; nothing was changed. Re-run "
+            f"list_rules and confirm again."
+        )
+
+
 class MailUnsupportedRuleActionError(MailError):
     """update_rule was called on a rule whose existing actions include
     one that's not modeled in our schema (e.g. run-AppleScript,

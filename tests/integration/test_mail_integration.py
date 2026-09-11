@@ -1916,3 +1916,59 @@ class TestBulkCrossScanCountsEachIdOnce:
         finally:
             cleared = connector.update_message([msg_id], flagged=False)
         assert cleared == 1
+
+
+class TestRuleMutationsActOnTheConfirmedRule:
+    """The name check and the mutation happen in one AppleScript call.
+
+    Creates a test-prefixed rule, then asks the connector to delete the
+    rule at that index *as if* a different name had been confirmed. The
+    rule must survive and the connector must say so; deleting it with the
+    right name must then succeed. Self-cleaning.
+    """
+
+    RULE = "[apple-mail-mcp-test] confirmed-name guard"
+
+    def _index_of(self, connector: AppleMailConnector) -> int | None:
+        return next(
+            (r["index"] for r in connector.list_rules() if r["name"] == self.RULE),
+            None,
+        )
+
+    def test_mismatched_name_applies_nothing(
+        self, connector: AppleMailConnector, test_account: str
+    ) -> None:
+        from apple_mail_mcp.exceptions import MailRuleChangedError
+
+        # Pre-clean a leftover from a failed run.
+        stale = self._index_of(connector)
+        if stale is not None:
+            connector.delete_rule(stale)
+
+        index = connector.create_rule(
+            name=self.RULE,
+            conditions=[{"field": "subject", "operator": "contains",
+                         "value": "this-string-will-not-match-anything-zzz"}],
+            actions={"mark_read": True},
+            match_logic="all",
+            enabled=False,
+        )
+        try:
+            with pytest.raises(MailRuleChangedError) as exc:
+                connector.delete_rule(index, expected_name="not the confirmed rule")
+            assert exc.value.actual_name == self.RULE
+            assert self._index_of(connector) == index, "the rule was deleted anyway"
+
+            with pytest.raises(MailRuleChangedError):
+                connector.update_rule(index, enabled=True, expected_name="wrong")
+            still = next(r for r in connector.list_rules() if r["name"] == self.RULE)
+            assert still["enabled"] is False, "the update was applied anyway"
+
+            connector.update_rule(index, enabled=True, expected_name=self.RULE)
+            now = next(r for r in connector.list_rules() if r["name"] == self.RULE)
+            assert now["enabled"] is True
+        finally:
+            leftover = self._index_of(connector)
+            if leftover is not None:
+                assert connector.delete_rule(leftover, expected_name=self.RULE) == self.RULE
+        assert self._index_of(connector) is None

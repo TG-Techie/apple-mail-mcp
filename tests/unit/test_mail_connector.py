@@ -305,7 +305,7 @@ class TestAppleMailConnector:
     def test_delete_rule_returns_deleted_name(
         self, mock_run: MagicMock, connector: AppleMailConnector
     ) -> None:
-        mock_run.return_value = "Junk filter"
+        mock_run.return_value = '{"name":"Junk filter","applied":true}'
         result = connector.delete_rule(rule_index=2)
         assert result == "Junk filter"
 
@@ -313,7 +313,7 @@ class TestAppleMailConnector:
     def test_delete_rule_emits_correct_script(
         self, mock_run: MagicMock, connector: AppleMailConnector
     ) -> None:
-        mock_run.return_value = "X"
+        mock_run.return_value = '{"name":"X","applied":true}'
         connector.delete_rule(rule_index=2)
         script = mock_run.call_args[0][0]
         # Reads name before deleting (so we can echo it back).
@@ -684,7 +684,7 @@ class TestAppleMailConnector:
         # Two AppleScript calls happen: _check_supported_actions, then update.
         mock_run.side_effect = [
             self._supported_actions_clean_response(),
-            "",  # the update itself returns nothing
+            '{"name":"X","applied":true}',  # the guarded update's outcome
         ]
         connector.update_rule(rule_index=2, name="Renamed")
         update_script = mock_run.call_args_list[1][0][0]
@@ -700,7 +700,7 @@ class TestAppleMailConnector:
     ) -> None:
         mock_run.side_effect = [
             self._supported_actions_clean_response(),
-            "",
+            '{"name":"X","applied":true}',
         ]
         connector.update_rule(rule_index=3, enabled=False)
         update_script = mock_run.call_args_list[1][0][0]
@@ -729,7 +729,7 @@ class TestAppleMailConnector:
     ) -> None:
         mock_run.side_effect = [
             self._supported_actions_clean_response(),
-            "",
+            '{"name":"X","applied":true}',
         ]
         connector.update_rule(
             rule_index=2,
@@ -7271,3 +7271,104 @@ class TestBulkCrossScanCountsEachIdOnce:
         connector.mark_as_read(["1"], account="Gmail", source_mailbox="INBOX")
         script = mock_run.call_args[0][0]
         assert "matched" not in script
+
+
+class TestRuleMutationsActOnTheConfirmedRule:
+    """A rule index is a position, and positions move.
+
+    The server resolves the name at an index, shows it in a confirmation
+    prompt, waits for a human, and then acts on the index. Rules can be
+    created, deleted or reordered while the prompt is open — the window is
+    as long as a person takes to read a dialog — so the confirmed name and
+    the acted-on index can name different rules. Classic TOCTOU.
+
+    The connector now takes the confirmed name and checks it against the
+    rule at that index inside the same AppleScript call as the mutation,
+    so there is no gap between the check and the act. A mismatch applies
+    nothing and raises MailRuleChangedError.
+    """
+
+    @pytest.fixture
+    def connector(self) -> AppleMailConnector:
+        return AppleMailConnector(timeout=30)
+
+    @staticmethod
+    def _clean_actions() -> str:
+        return (
+            '{"run_script_set":false,"play_sound_set":false,'
+            '"redirect_set":false,"forward_text_set":false,'
+            '"reply_text_set":false,"highlight_text":false,'
+            '"color_message":"none"}'
+        )
+
+    # --- delete_rule -----------------------------------------------------
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_delete_checks_the_name_in_the_same_script(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        mock_run.return_value = '{"name":"Junk filter","applied":true}'
+        assert connector.delete_rule(2, expected_name="Junk filter") == "Junk filter"
+        script = mock_run.call_args[0][0]
+        assert 'if currentName is "Junk filter" then' in script
+        assert "delete rule 2" in script
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_delete_of_a_moved_rule_applies_nothing_and_raises(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        from apple_mail_mcp.exceptions import MailRuleChangedError
+
+        mock_run.return_value = '{"name":"Something else","applied":false}'
+        with pytest.raises(MailRuleChangedError) as exc:
+            connector.delete_rule(2, expected_name="Junk filter")
+        assert exc.value.rule_index == 2
+        assert exc.value.expected_name == "Junk filter"
+        assert exc.value.actual_name == "Something else"
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_delete_without_an_expected_name_is_unconditional(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        """Callers that just listed (the integration tests' cleanup) may
+        delete by index alone; the check exists for confirmations."""
+        mock_run.return_value = '{"name":"X","applied":true}'
+        assert connector.delete_rule(2) == "X"
+        assert "if currentName is" not in mock_run.call_args[0][0]
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_expected_name_is_escaped(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        mock_run.return_value = '{"name":"a \\"b\\"","applied":true}'
+        connector.delete_rule(1, expected_name='a "b"')
+        assert 'if currentName is "a \\"b\\"" then' in mock_run.call_args[0][0]
+
+    # --- update_rule -----------------------------------------------------
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_update_checks_the_name_before_any_change(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        mock_run.side_effect = [
+            self._clean_actions(),
+            '{"name":"Junk filter","applied":true}',
+        ]
+        connector.update_rule(2, enabled=False, expected_name="Junk filter")
+        script = mock_run.call_args_list[1][0][0]
+        check_at = script.index('if currentName is "Junk filter" then')
+        change_at = script.index("set enabled of newRule to false")
+        assert check_at < change_at
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_update_of_a_moved_rule_applies_nothing_and_raises(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        from apple_mail_mcp.exceptions import MailRuleChangedError
+
+        mock_run.side_effect = [
+            self._clean_actions(),
+            '{"name":"Something else","applied":false}',
+        ]
+        with pytest.raises(MailRuleChangedError):
+            connector.update_rule(2, enabled=False, expected_name="Junk filter")
