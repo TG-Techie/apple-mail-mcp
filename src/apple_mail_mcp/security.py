@@ -260,11 +260,19 @@ def validate_attachment_size(size_bytes: int, max_size: int = 25 * 1024 * 1024) 
 RESERVED_TEST_DOMAINS = {"example.com", "example.net", "example.org"}
 RESERVED_TEST_TLDS = {".example", ".test", ".invalid", ".localhost"}
 
+# Operations that take an account and, in test mode, may only target
+# MAIL_TEST_ACCOUNT. Every account-scoped mutation belongs here: the gate
+# is what keeps an integration run off a real account, and a mutation
+# missing from this set is one the server can call the gate for and get
+# a no-op back (update_mailbox and delete_mailbox were exactly that).
 ACCOUNT_GATED_OPERATIONS = {
     "list_mailboxes",
     "search_messages",
     "update_message",
+    "delete_messages",
     "create_mailbox",
+    "update_mailbox",
+    "delete_mailbox",
 }
 
 SEND_OPERATIONS = {

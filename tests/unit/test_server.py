@@ -2259,6 +2259,33 @@ class TestDeleteMessages:
         assert result["count"] == 0
         mock_mail.delete_messages.assert_not_called()
 
+    def test_test_mode_refuses_another_account_before_deleting(
+        self, mock_mail: MagicMock, monkeypatch: Any
+    ) -> None:
+        """delete_messages took an account and never asked the gate; under
+        MAIL_TEST_MODE a delete scoped to a real account went straight to
+        Mail. Now it is refused before the connector is touched."""
+        monkeypatch.setenv("MAIL_TEST_MODE", "true")
+        monkeypatch.setenv("MAIL_TEST_ACCOUNT", "TestAccount")
+
+        result = delete_messages(["1"], account="Gmail", source_mailbox="INBOX")
+
+        assert result["success"] is False
+        assert result["error_type"] == "safety_violation"
+        mock_mail.delete_messages.assert_not_called()
+
+    def test_test_mode_allows_the_test_account(
+        self, mock_mail: MagicMock, monkeypatch: Any
+    ) -> None:
+        monkeypatch.setenv("MAIL_TEST_MODE", "true")
+        monkeypatch.setenv("MAIL_TEST_ACCOUNT", "TestAccount")
+        mock_mail.delete_messages.return_value = 1
+
+        result = delete_messages(["1"], account="TestAccount", source_mailbox="INBOX")
+
+        assert result["success"] is True
+        mock_mail.delete_messages.assert_called_once()
+
     def test_over_limit_validation_error(self, mock_mail: MagicMock) -> None:
         result = delete_messages([str(i) for i in range(101)])
 

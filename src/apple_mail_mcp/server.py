@@ -1860,6 +1860,15 @@ def delete_messages(
                 "error_type": "validation_error",
             }
 
+        # Test-mode safety: when account is provided, gate against
+        # MAIL_TEST_ACCOUNT — the same rule update_message applies.
+        if account is not None:
+            safety_err = check_test_mode_safety(
+                "delete_messages", account=account
+            )
+            if safety_err:
+                return safety_err
+
         logger.info(f"Deleting {len(message_ids)} message(s) to trash")
 
         # Delete the messages

@@ -5,6 +5,8 @@ from __future__ import annotations
 from typing import Any
 from unittest.mock import patch
 
+import pytest
+
 from apple_mail_mcp.security import (
     OPERATION_TIERS,
     TIER_LIMITS,
@@ -535,3 +537,48 @@ class TestCheckTestModeSafety:
         violations = [op for op in recent if op["result"] == "safety_violation"]
         assert len(violations) == 1
         assert violations[0]["operation"] == "search_messages"
+
+
+class TestAccountGateCoversEveryAccountScopedMutation:
+    """Every operation that takes an account and changes it is gated.
+
+    The gate exists so integration runs under MAIL_TEST_MODE cannot reach a
+    real account. It was keyed on a hand-kept set that named create_mailbox
+    but not update_mailbox, delete_mailbox or delete_messages — so the
+    server called check_test_mode_safety for the two mailbox tools and the
+    call was a no-op, and delete_messages never called it at all. The
+    parametrize below is the list; a mutation added later that takes an
+    account belongs in it.
+    """
+
+    @pytest.mark.parametrize(
+        "operation",
+        [
+            "update_message",
+            "create_mailbox",
+            "update_mailbox",
+            "delete_mailbox",
+            "delete_messages",
+        ],
+    )
+    def test_mutation_on_another_account_is_refused(
+        self, operation: str, monkeypatch: Any
+    ) -> None:
+        monkeypatch.setenv("MAIL_TEST_MODE", "true")
+        monkeypatch.setenv("MAIL_TEST_ACCOUNT", "TestAccount")
+
+        result = check_test_mode_safety(operation, account="Gmail")
+        assert result is not None, f"{operation} is not account-gated"
+        assert result["error_type"] == "safety_violation"
+
+    @pytest.mark.parametrize(
+        "operation",
+        ["update_mailbox", "delete_mailbox", "delete_messages"],
+    )
+    def test_mutation_on_the_test_account_is_allowed(
+        self, operation: str, monkeypatch: Any
+    ) -> None:
+        monkeypatch.setenv("MAIL_TEST_MODE", "true")
+        monkeypatch.setenv("MAIL_TEST_ACCOUNT", "TestAccount")
+
+        assert check_test_mode_safety(operation, account="TestAccount") is None
