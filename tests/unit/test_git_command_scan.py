@@ -298,3 +298,79 @@ class TestBranchChangesInTheSameCall:
             "the guard must be able to see that this call lands on main "
             "before the commit runs"
         )
+
+
+class TestPushTargets:
+    """What a push sends, and where, so a monitor can find its CI run.
+
+    The post-push CI monitor used to look the run up with a bare
+    ``gh run list --commit $(git rev-parse HEAD)``. Two things wrong with
+    that, both measured 2026-09-11: without a repository, ``gh`` here
+    resolves the ``upstream`` remote, so the run was looked up in the wrong
+    repository and never found; and HEAD is not what was pushed when the
+    refspec names something else. The scanner now reports the remote and
+    the refspec of a push so the hook can resolve both properly.
+    """
+
+    @staticmethod
+    def push(command: str):
+        pushes = [i for i in scan_git_commands(command, BASE) if i.subcommand == "push"]
+        assert len(pushes) == 1, pushes
+        return pushes[0]
+
+    def test_bare_push_names_neither(self) -> None:
+        inv = self.push("git push")
+        assert inv.remote is None
+        assert inv.refspec is None
+
+    def test_remote_only(self) -> None:
+        inv = self.push("git push -q origin")
+        assert inv.remote == "origin"
+        assert inv.refspec is None
+
+    def test_remote_and_refspec(self) -> None:
+        inv = self.push("git push origin main")
+        assert (inv.remote, inv.refspec) == ("origin", "main")
+
+    def test_flags_before_and_between_are_skipped(self) -> None:
+        inv = self.push("git push -q --force-with-lease origin feature/x")
+        assert (inv.remote, inv.refspec) == ("origin", "feature/x")
+
+    def test_repo_option_sets_the_remote_when_no_positional_does(self) -> None:
+        """git's grammar is positional: the first bare word is always the
+        repository, and --repo only applies when there is none. So
+        ``--repo=upstream main`` pushes to a remote called ``main``."""
+        inv = self.push("git push --repo=upstream")
+        assert (inv.remote, inv.refspec) == ("upstream", None)
+        inv = self.push("git push --repo=upstream main")
+        assert (inv.remote, inv.refspec) == ("main", None)
+
+    def test_push_option_value_is_not_a_positional(self) -> None:
+        inv = self.push("git push -o ci.skip origin main")
+        assert (inv.remote, inv.refspec) == ("origin", "main")
+
+    def test_the_merge_idiom_is_seen_at_all(self) -> None:
+        """The anchored grep this replaces never matched this line."""
+        inv = self.push(
+            "git checkout -q main && git merge --ff-only -q x && git push -q origin main"
+        )
+        assert (inv.remote, inv.refspec) == ("origin", "main")
+
+    def test_other_subcommands_carry_no_push_fields(self) -> None:
+        (inv,) = scan_git_commands("git commit -m x", BASE)
+        assert inv.remote is None and inv.refspec is None
+
+    def test_cli_rows_have_six_fields_on_a_non_whitespace_separator(self) -> None:
+        """Tab would be IFS whitespace, and bash's read collapses runs of
+        it: an empty branch_target shifted remote into its place."""
+        import subprocess
+
+        script = Path(__file__).parents[2] / "scripts" / "hooks" / "git_command_scan.py"
+        out = subprocess.run(
+            [sys.executable, str(script), "--format=usv", BASE],
+            input="git checkout main && git push origin main",
+            capture_output=True, text=True, check=True,
+        ).stdout.rstrip("\n").split("\n")
+        assert "\t" not in out[0]
+        assert [len(line.split("\x1f")) for line in out] == [6, 6]
+        assert out[1].split("\x1f")[3:] == ["", "origin", "main"]

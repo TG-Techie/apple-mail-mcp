@@ -28,51 +28,22 @@ INPUT=$(cat)
 COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command')
 
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SCANNER="$HOOK_DIR/git_command_scan.py"
-
-# Resolve an interpreter that actually runs, rather than trusting PATH.
-#
-# This is not paranoia. On this machine the PATH a hook inherits resolves
-# `python3` to ~/.tg/bin/python3, which is a broken binary: it links
-# against a Homebrew Python 3.14 framework that no longer exists and dies
-# with a dyld error and exit 134. An earlier version of this hook called
-# plain `python3`, could not analyse any command, and refused every Bash
-# call in the session until it was reverted.
-#
-# /usr/bin/python3 is present on every macOS and is what a login shell
-# picks here. The scanner is kept compatible with it (3.9).
-PYTHON=""
-for candidate in /usr/bin/python3 "$(command -v python3 2>/dev/null)" /opt/homebrew/bin/python3; do
-    if [ -n "$candidate" ] && [ -x "$candidate" ] && "$candidate" --version >/dev/null 2>&1; then
-        PYTHON="$candidate"
-        break
-    fi
-done
+# shellcheck source=scan_lib.sh
+. "$HOOK_DIR/scan_lib.sh"
+scan_lib_init "$HOOK_DIR"
 
 if [ -z "$PYTHON" ]; then
     echo "pre_bash.sh: no working python3 found; cannot analyse the command. Refusing rather than guessing." >&2
     exit 2
 fi
 
-# The repository this hook belongs to. These checks apply to it and to no
-# other; git commands in other repositories are none of their business.
-THIS_REPO=$(git -C "$HOOK_DIR" rev-parse --show-toplevel 2>/dev/null)
-
-# The directory the command starts in. Claude Code runs Bash from the
-# project directory.
-BASE_DIR="${CLAUDE_PROJECT_DIR:-$THIS_REPO}"
-
-# One "<subcommand>\t<directory>\t<degraded>" line per git invocation.
-SCAN_OUTPUT=$("$PYTHON" "$SCANNER" --format=tsv "$BASE_DIR" <<<"$COMMAND" 2>&1)
-SCAN_STATUS=$?
-
-if [ $SCAN_STATUS -ne 0 ]; then
+if [ "$SCAN_STATUS" -ne 0 ]; then
     # The scanner itself failed. Do NOT silently allow — a failed scan
     # reading as "no git here" is exactly the fail-open shape this
     # rewrite exists to remove. Print what broke so it is fixable.
     echo "pre_bash.sh: could not analyse the command; refusing rather than guessing." >&2
     echo "  interpreter: $PYTHON" >&2
-    echo "  scanner:     $SCANNER" >&2
+    echo "  scanner:     $HOOK_DIR/git_command_scan.py" >&2
     echo "  exit:        $SCAN_STATUS" >&2
     echo "  output:      $SCAN_OUTPUT" >&2
     exit 2
@@ -82,7 +53,7 @@ fi
 # CHECK: Prevent commits to main, in THIS repository
 # ===================================================
 check_no_commits_to_main() {
-    local sub dir degraded btarget target_repo branch
+    local sub dir degraded btarget remote refspec branch
 
     # The branch this repository will be on when a commit runs — not the
     # branch it is on now.
@@ -99,12 +70,9 @@ check_no_commits_to_main() {
     # makes in this repository, before deciding about any commit.
     branch=$(git -C "$THIS_REPO" rev-parse --abbrev-ref HEAD 2>/dev/null)
 
-    while IFS=$'\t' read -r sub dir degraded btarget; do
-        target_repo=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)
-
+    while IFS=$'\x1f' read -r sub dir degraded btarget remote refspec; do
         # Another repository, or nothing we can resolve: not ours.
-        [ -n "$target_repo" ] || continue
-        [ "$target_repo" = "$THIS_REPO" ] || continue
+        scan_lib_in_this_repo "$dir" || continue
 
         # A branch change earlier in the same call moves the target.
         if [ "${sub:-}" = "checkout" ] || [ "${sub:-}" = "switch" ]; then
@@ -143,8 +111,8 @@ check_no_commits_to_main() {
             if echo "$COMMAND" | grep -qiE "hotfix|emergency"; then
                 continue
             fi
-            echo "Cannot commit directly to $branch in $target_repo. Create a feature branch first." >&2
-            if [ -n "${btarget:-}" ] || echo "$SCAN_OUTPUT" | grep -qE $'^(checkout|switch)\t'; then
+            echo "Cannot commit directly to $branch in $THIS_REPO. Create a feature branch first." >&2
+            if [ -n "${btarget:-}" ] || echo "$SCAN_OUTPUT" | grep -qE $'^(checkout|switch)\x1f'; then
                 echo "(This call switches to $branch before committing; the branch you are on now is not the one that matters.)" >&2
             fi
             if [ "${degraded:-0}" = "1" ]; then
@@ -162,15 +130,13 @@ check_no_commits_to_main() {
 # CHECK: Enforce wrapper script for tag creation
 # ===================================================
 check_tag_creation_workflow() {
-    local sub dir degraded btarget target_repo
+    local sub dir degraded btarget remote refspec
 
-    while IFS=$'\t' read -r sub dir degraded btarget; do
+    while IFS=$'\x1f' read -r sub dir degraded btarget remote refspec; do
         [ "${sub:-}" = "tag" ] || continue
 
         # Same scoping rule: only this repository's tags.
-        target_repo=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)
-        [ -n "$target_repo" ] || continue
-        [ "$target_repo" = "$THIS_REPO" ] || continue
+        scan_lib_in_this_repo "$dir" || continue
 
         echo "Use ./scripts/create_tag.sh <tag-name> instead of direct git tag commands." >&2
         echo "Note: this refusal discards the ENTIRE Bash call, including any file edits in it." >&2

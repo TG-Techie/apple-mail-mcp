@@ -74,12 +74,25 @@ class GitInvocation:
             measured 2026-09-09, and an empty commit landed on main. A
             guard has to ask what branch the command will be on when it
             commits, not what branch it is on now.
+        remote: For ``push``, the repository argument (or ``--repo``),
+            when one was given. ``None`` otherwise.
+        refspec: For ``push``, the first refspec argument, when one was
+            given. ``None`` otherwise — which for a push means "whatever
+            the current branch's upstream is".
+
+            These exist so the post-push CI monitor can find the run for
+            the commit that was actually pushed, in the repository it was
+            pushed to. It used to read HEAD and call ``gh`` with no
+            repository; with an ``upstream`` remote present, ``gh``
+            resolves that, and the run was looked up in the wrong place.
     """
 
     subcommand: str
     directory: str
     degraded: bool = False
     branch_target: str | None = None
+    remote: str | None = None
+    refspec: str | None = None
 
 
 def _resolve(base: str, target: str) -> str:
@@ -154,16 +167,58 @@ def _branch_target(subcommand: str, rest: list[str]) -> str | None:
     return None
 
 
+# push options that take their value as the NEXT word (the `=` form is a
+# single word and needs no special handling).
+_PUSH_OPTS_WITH_VALUE = {"-o", "--push-option", "--repo", "--receive-pack", "--exec"}
+
+
+def _push_targets(subcommand: str, rest: list[str]) -> tuple[str | None, str | None]:
+    """The (remote, refspec) of a push, each None when not given.
+
+    ``git push [<options>] [<repository> [<refspec>...]]``. The first
+    positional is the repository, the second the refspec; ``--repo=<r>``
+    also names the repository.
+    """
+    if subcommand != "push":
+        return None, None
+
+    remote: str | None = None
+    positionals: list[str] = []
+    i = 0
+    while i < len(rest):
+        word = rest[i]
+        if word.startswith("--repo="):
+            remote = word[len("--repo="):]
+        elif word in _PUSH_OPTS_WITH_VALUE:
+            if word == "--repo" and i + 1 < len(rest):
+                remote = rest[i + 1]
+            i += 2
+            continue
+        elif word.startswith("-"):
+            pass
+        else:
+            positionals.append(word)
+        i += 1
+
+    if positionals:
+        remote = positionals[0]
+    refspec = positionals[1] if len(positionals) > 1 else None
+    return remote, refspec
+
+
 def _subcommand_and_dir(
     words: list[str], cwd: str
-) -> tuple[str, str, str | None] | None:
-    """Extract the subcommand, effective directory and branch target."""
+) -> tuple[str, str, str | None, str | None, str | None] | None:
+    """Extract the subcommand, effective directory, branch target, and
+    push remote/refspec."""
     directory = cwd
     i = 1  # words[0] is git itself
     while i < len(words):
         word = words[i]
         if not word.startswith("-"):
-            return word, directory, _branch_target(word, words[i + 1 :])
+            rest = words[i + 1 :]
+            remote, refspec = _push_targets(word, rest)
+            return word, directory, _branch_target(word, rest), remote, refspec
         if word == "-C" and i + 1 < len(words):
             directory = _resolve(directory, words[i + 1])
             i += 2
@@ -269,14 +324,21 @@ def scan_git_commands(command: str, base_dir: str) -> list[GitInvocation]:
 
             result = _subcommand_and_dir(stripped, cwd)
             if result is not None:
-                subcommand, directory, branch_target = result
+                subcommand, directory, branch_target, remote, refspec = result
                 invocations.append(
                     GitInvocation(
-                        subcommand, directory, branch_target=branch_target
+                        subcommand,
+                        directory,
+                        branch_target=branch_target,
+                        remote=remote,
+                        refspec=refspec,
                     )
                 )
 
     return invocations
+
+
+_FIELD_SEP = "\x1f"
 
 
 def _main(argv: list[str]) -> int:
@@ -284,11 +346,21 @@ def _main(argv: list[str]) -> int:
 
     Usage::
 
-        git_command_scan.py [--format=tsv] <base_dir>   # command on stdin
+        git_command_scan.py [--format=usv] <base_dir>   # command on stdin
 
-    Prints one ``<subcommand>\\t<directory>\\t<degraded>\\t<branch_target>``
-    line per git invocation, where ``degraded`` is 1 or 0 and
-    ``branch_target`` is empty unless the invocation moves HEAD.
+    Prints one line per git invocation, six fields separated by ASCII
+    unit separator (0x1f)::
+
+        <subcommand> <directory> <degraded> <branch_target> <remote> <refspec>
+
+    where ``degraded`` is 1 or 0, ``branch_target`` is empty unless the
+    invocation moves HEAD, and ``remote``/``refspec`` are empty unless
+    the invocation is a push that named them.
+
+    Not tab: tab is IFS whitespace, and bash's ``read`` collapses runs
+    of IFS whitespace, so an empty middle field shifted every field
+    after it one column left. Measured 2026-09-11: a push row read
+    ``origin`` as the branch target and ``main`` as the remote.
 
     Empty stdout means the command runs no git commands. That is a real
     answer and is deliberately distinct from a non-zero exit, which means
@@ -299,7 +371,7 @@ def _main(argv: list[str]) -> int:
     args = [a for a in argv[1:] if not a.startswith("--")]
     if len(args) != 1:
         print(
-            "usage: git_command_scan.py [--format=tsv] <base_dir>  "
+            "usage: git_command_scan.py [--format=usv] <base_dir>  "
             "(command on stdin)",
             file=sys.stderr,
         )
@@ -310,8 +382,16 @@ def _main(argv: list[str]) -> int:
 
     for inv in scan_git_commands(command, base_dir):
         print(
-            f"{inv.subcommand}\t{inv.directory}\t"
-            f"{1 if inv.degraded else 0}\t{inv.branch_target or ''}"
+            _FIELD_SEP.join(
+                [
+                    inv.subcommand,
+                    inv.directory,
+                    "1" if inv.degraded else "0",
+                    inv.branch_target or "",
+                    inv.remote or "",
+                    inv.refspec or "",
+                ]
+            )
         )
     return 0
 

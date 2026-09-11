@@ -426,7 +426,7 @@ answers method costs a few minutes and removes that whole class of problem.
 `post_bash.sh:10` still matches `^git push` and carries the same fail-open defect. It is a
 monitor rather than a guard — failing open loses a CI watch rather than admitting a bad commit —
 so it is left for a separate change rather than bundled into a guard rewrite that had already
-locked the session once.
+locked the session once. *(Closed in Observation 10.)*
 
 ## Observation 9 — the guard read HEAD, and HEAD is not where the commit lands
 
@@ -494,3 +494,66 @@ and the action runs in the world after.
 It was found only by running the guard against a case whose answer was known independently.
 Nothing in the unit tests would have caught it, because the unit tests test the parser, and the
 parser was right — the hook was asking it the wrong question.
+
+## Observation 10 — the monitor had never watched anything
+
+`post_bash.sh` is the PostToolUse hook that watches CI after a push. Fixed 2026-09-11. It had
+the anchored text match from Observation 7, and a second defect underneath that the match had
+been hiding.
+
+### Measured
+
+Every push this session was made as `git checkout -q main && git merge --ff-only -q <branch>
+&& git push -q origin main`. `grep -qE "^git push"` does not match that line, so the hook
+exited at line 10 on every one of them. No watch ever fired, and nothing said so — a monitor
+that never fires is indistinguishable from one with nothing to report.
+
+Had the match fired, the lookup would still have failed. The hook ran `gh run list --commit
+$(git rev-parse HEAD)` with no repository. This checkout has an `upstream` remote and no `gh`
+default set, and in that state `gh` resolves the **upstream** repository:
+
+    $ gh repo view --json nameWithOwner --jq .nameWithOwner
+    s-morgan-jeffries/apple-mail-fast-mcp
+    $ gh run list --commit <sha on main>            # nothing
+    $ gh run list -R <origin url> --commit <sha>    # {"conclusion":"success", ...}
+
+So a matched push would have looked for its run in the upstream author's repository, found
+nothing, and printed "No CI run found … check after opening the PR". Same day, the same
+misdirection had `gh issue list` showing upstream's tracker as if it were ours.
+
+One more, found once the first two were fixed: `--limit 1` takes the newest run on the commit,
+whichever event produced it. On the commit measured, that was a dependabot "dynamic" job; the
+Tests run was seventh in the list.
+
+### The fix
+
+The push is found by `git_command_scan.py`, which now reports a push's remote and refspec
+alongside the subcommand. The commit watched is the refspec's source side (`HEAD` when the push
+named none), resolved in the directory the push ran in. The repository is the URL of the remote
+that was pushed to, passed to `gh` with `-R`. Every run the push event triggered on that commit
+is watched, and the hook exits 2 if any failed.
+
+The interpreter resolution and the scan moved into `scan_lib.sh`, sourced by both hooks, so the
+guard and the monitor cannot drift apart on them again.
+
+### A field-separator defect found on the way
+
+The scanner's shell output was tab-separated. Tab is IFS whitespace, and bash's `read` collapses
+runs of IFS whitespace — so a row with an empty middle column (`push`, with no branch target)
+had every later column shift one place left. Measured: the monitor read `origin` as the branch
+target and `main` as the remote, and reported "Remote 'main' has no URL". The separator is now
+ASCII 0x1f, which `read` does not collapse. The guard had been reading the same rows; it never
+noticed because it only consults the branch-target column on `checkout`/`switch` rows, where the
+column is non-empty.
+
+### Acceptance, measured against the installed hooks
+
+Guard, on a feature branch (0 allow, 2 refuse): `git commit` 0; `git add . && git commit` 0;
+`git checkout main && git commit --allow-empty` 2; `git checkout -- path && git commit` 0;
+`git checkout $B && git commit` 2; `git -C /tmp commit` 0; `git tag v1` 2; `ls` 0.
+
+Monitor: failed push → stands down; non-push → stands down; push in another repository → stands
+down; `git push origin :old` (a delete) → stands down; `git push origin $B` → says it cannot
+tell what was pushed; the merge idiom above, against an already-pushed commit → finds the Tests
+run in the origin repository and reports its conclusion.
+
