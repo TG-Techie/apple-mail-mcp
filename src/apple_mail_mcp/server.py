@@ -2659,6 +2659,29 @@ def _resolve_update_subject_body(
     return final_subject, final_body
 
 
+def _resolve_update_sender(
+    from_account: str | None,
+    state: dict[str, Any],
+    seed_kind: str,
+    send_now: bool,
+) -> str | None:
+    """The account the recreated draft is built in.
+
+    The caller's override wins. Otherwise the draft's own sender, read
+    back from Mail, is carried over, so an update does not silently move
+    the draft to Mail's default account (the connector resolves the
+    address to its account). The one path that cannot set a sender is a
+    fresh draft sent immediately, which goes through mailto:; nothing is
+    passed there, and whether that draft's sender matches what Mail's URL
+    handler will use is not knowable here (see DESIGN-QUEUE).
+    """
+    if from_account is not None:
+        return from_account
+    if send_now and seed_kind == "new":
+        return None
+    return cast(str, state.get("sender") or "") or None
+
+
 def _merge_draft_recipients(
     to: list[str] | None,
     cc: list[str] | None,
@@ -2927,6 +2950,9 @@ async def update_draft(
     value. ``None`` keeps the existing value. ``attachment_paths=None``
     PRESERVES existing attachments (extracted via Mail's ``save``
     command); ``[]`` explicitly clears them; a list replaces.
+    ``from_account=None`` keeps the draft in the account it was saved
+    from (the sender is read back from Mail), except on a fresh draft
+    sent immediately, whose mailto: dispatch path cannot set a sender.
 
     For drafts created externally (not via ``create_draft``), seed
     recovery falls back to scanning Mail.app for the In-Reply-To header
@@ -2948,9 +2974,10 @@ async def update_draft(
             is touched.
         template_name / template_vars: Optional template render. User-
             supplied subject/body override the rendered output.
-        from_account: Override sender. Refused (``from_account_unsupported``)
-            when ``send_now=True`` on a fresh draft, which sends through
-            mailto: and cannot set it; the draft is left as it was.
+        from_account: Override sender. None keeps the draft's own sender.
+            Refused (``from_account_unsupported``) when ``send_now=True``
+            on a fresh draft, which sends through mailto: and cannot set
+            it; the draft is left as it was.
         send_now: ``False`` (default) saves new draft. ``True`` sends
             after eliciting confirmation.
 
@@ -2994,6 +3021,9 @@ async def update_draft(
 
         final_to, final_cc, final_bcc = _merge_draft_recipients(
             to, cc, bcc, state,
+        )
+        final_from = _resolve_update_sender(
+            from_account, state, seed_kind, send_now,
         )
 
         # tempdir (if any) is cleaned up in the finally block.
@@ -3042,7 +3072,7 @@ async def update_draft(
             body=final_body or "",
             attachment_paths=final_attachments,
             reply_all=reply_all,
-            from_account=from_account,
+            from_account=final_from,
             send_now=send_now,
         )
         new_draft_id = result.get("draft_id", "")
@@ -3264,7 +3294,7 @@ async def draft_update(
             (exists, no executable extension, under 25MB) before the
             existing draft is touched.
         template_name / template_vars: Optional template render.
-        from_account: Sender override. A saved draft keeps it.
+        from_account: Sender override. None keeps the draft's own sender.
 
     Returns:
         ``{"success": True, "draft_id": "<NEW_ID>"}``. The id is new.

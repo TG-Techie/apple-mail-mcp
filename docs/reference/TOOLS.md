@@ -932,7 +932,7 @@ after this call. Callers caching the id must re-read the response.
 | `body` | string | No | None | Override body. `None` keeps existing; non-None replaces (including `""`). |
 | `attachment_paths` | array[string] | No | None | Override attachments: `None` **preserves existing** (extracted to a temp dir and re-attached, not re-checked); `[]` clears; populated list replaces, and is checked like a send (exists, no executable extension, under 25MB) before the existing draft is touched — a refused list leaves the draft as it was. |
 | `template_name` / `template_vars` | string / object | No | None | Optional template render. User-supplied `subject`/`body` override the rendered output. |
-| `from_account` | string | No | None | Override sender. With `send_now=True` on a fresh draft it is refused (`from_account_unsupported`) before anything is deleted — the mailto: send path cannot set it — and the draft is left as it was. |
+| `from_account` | string | No | None | Override sender. `None` keeps the draft in the account it was saved from (the sender is read back from Mail and carried over, so an update never silently moves a draft to Mail's default account). With `send_now=True` on a fresh draft an explicit value is refused (`from_account_unsupported`) before anything is deleted — the mailto: send path cannot set it — and the draft is left as it was; on that path the draft's own sender is not carried either. |
 | `send_now` | boolean | No | False | `False` saves new draft. `True` sends after eliciting confirmation. |
 
 **Returns:**

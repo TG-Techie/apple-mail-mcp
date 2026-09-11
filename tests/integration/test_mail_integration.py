@@ -381,6 +381,19 @@ class TestMailIntegration:
             assert att["downloaded"] is False
 
 
+def _first_address_of(connector: AppleMailConnector, account: str) -> str:
+    """The test account's first address, lower-cased, or skip."""
+    match = next(
+        (a for a in connector.list_accounts() if a["name"] == account), None
+    )
+    if not match:
+        pytest.skip(f"test account {account!r} not found")
+    emails = match.get("email_addresses") or []
+    if not emails:
+        pytest.skip(f"test account {account!r} has no email addresses")
+    return str(emails[0]).lower()
+
+
 class TestDraftsLifecycleIntegration:
     """Integration tests for the drafts lifecycle (#134).
 
@@ -508,6 +521,70 @@ class TestDraftsLifecycleIntegration:
             assert extracted[0].read_bytes() == b"%PDF-FAKE-INTEG-CONTENT"
         finally:
             connector.delete_draft(draft_id)
+
+    def test_state_reads_the_sender_back(
+        self, connector: AppleMailConnector, test_account: str
+    ) -> None:
+        """A draft saved from the test account reports that account's
+        address as its sender. This is what update_draft carries over."""
+        address = _first_address_of(connector, test_account)
+        result = connector.create_draft(
+            seed="new",
+            to=["target@example.com"],
+            subject="ZZZ-AMM-INTEG-SENDER",
+            body="whose draft is this",
+            from_account=test_account,
+        )
+        draft_id = result["draft_id"]
+        try:
+            state = connector.get_draft_state(draft_id)
+            assert address in state["sender"].lower(), state["sender"]
+        finally:
+            connector.delete_draft(draft_id)
+
+    def test_update_keeps_the_draft_in_its_account(
+        self,
+        connector: AppleMailConnector,
+        test_account: str,
+        monkeypatch: MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """Server-layer update_draft, against real Mail: a draft saved from
+        the test account and then updated without naming an account is
+        rebuilt in that account, not in Mail's default. Run with
+        MAIL_TEST_ACCOUNT set to an account that is not Mail's default
+        sender for this to prove anything beyond the read-back."""
+        import asyncio
+
+        from apple_mail_mcp import server
+
+        monkeypatch.setenv("APPLE_MAIL_MCP_HOME", str(tmp_path))
+        monkeypatch.setattr(server, "mail", connector)
+        address = _first_address_of(connector, test_account)
+
+        created = asyncio.run(server.create_draft(
+            to=["target@example.com"],
+            subject="ZZZ-AMM-INTEG-UPDATE-SENDER",
+            body="v1",
+            from_account=test_account,
+        ))
+        assert created["success"] is True, created
+        draft_id = created["draft_id"]
+        new_draft_id = ""
+        try:
+            updated = asyncio.run(server.update_draft(draft_id=draft_id, body="v2"))
+            assert updated["success"] is True, updated
+            new_draft_id = updated["draft_id"]
+            state = connector.get_draft_state(new_draft_id)
+            assert "v2" in state["body"]
+            assert address in state["sender"].lower(), state["sender"]
+        finally:
+            for did in (new_draft_id, draft_id):
+                if did:
+                    try:
+                        connector.delete_draft(did)
+                    except Exception:
+                        pass
 
     def test_delete_draft_removes_from_drafts_mailbox(
         self,

@@ -3814,6 +3814,40 @@ class TestAppleMailConnector:
         )
 
     @patch.object(AppleMailConnector, "list_accounts")
+    def test_resolve_account_to_sender_accepts_the_accounts_own_address(
+        self, mock_list: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        """A sender read back from a draft ("Name <email>" or a bare
+        email) resolves to the account that owns the address, so a
+        rebuilt draft stays in that account. Case-insensitive on the
+        address, as mail addresses are."""
+        mock_list.return_value = [
+            {
+                "id": "UUID-1",
+                "name": "iCloud",
+                "full_name": "Alice Smith",
+                "email_addresses": ["alice@icloud.com", "alias@icloud.com"],
+            },
+            {
+                "id": "UUID-2",
+                "name": "Gmail",
+                "full_name": "",
+                "email_addresses": ["alice@gmail.com"],
+            },
+        ]
+        assert (
+            connector._resolve_account_to_sender("Alice Smith <alice@icloud.com>")
+            == "Alice Smith <alice@icloud.com>"
+        )
+        assert (
+            connector._resolve_account_to_sender("Alias@iCloud.com")
+            == "Alice Smith <alice@icloud.com>"
+        )
+        assert connector._resolve_account_to_sender("alice@gmail.com") == "alice@gmail.com"
+        with pytest.raises(MailAccountNotFoundError):
+            connector._resolve_account_to_sender("nobody@example.com")
+
+    @patch.object(AppleMailConnector, "list_accounts")
     def test_resolve_account_to_sender_without_full_name_falls_back_to_bare_email(
         self, mock_list: MagicMock, connector: AppleMailConnector
     ) -> None:
@@ -5303,6 +5337,23 @@ class TestGetDraftState:
             "references": "<orig@x>",
             "attachment_names": ["report.pdf"],
         }
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_reads_the_sender_back(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        """The draft's own sender is part of its state, so update_draft can
+        rebuild it in the same account instead of Mail's default."""
+        mock_run.return_value = (
+            '{"found":true,"draft_id":"x","to":[],"cc":[],"bcc":[],'
+            '"subject":"","body":"","in_reply_to":"","references":"",'
+            '"attachment_names":[],"sender":"Alice Smith <alice@icloud.com>"}'
+        )
+        state = connector.get_draft_state("x")
+        assert state["sender"] == "Alice Smith <alice@icloud.com>"
+        script = mock_run.call_args.args[0]
+        assert "sender of foundDraft" in script
+        assert "|sender|:" in script
 
     @patch.object(AppleMailConnector, "_run_applescript")
     def test_not_found_raises(

@@ -388,6 +388,101 @@ class TestAFreshSendCannotChooseTheSender:
         assert mock_mail.create_draft.call_args.kwargs["from_account"] == "Work"
 
 
+class TestDraftUpdateKeepsTheDraftInItsAccount:
+    """update_draft is delete-and-recreate. Before this the recreated draft
+    was built with the caller's from_account only, so a draft saved from
+    account X and then updated without naming X silently moved to Mail's
+    default account. Now the draft's own sender, read back from Mail, is
+    carried over unless the caller overrides it."""
+
+    _STATE = {
+        "draft_id": "OLD",
+        "to": ["alice@example.com"], "cc": [], "bcc": [],
+        "subject": "hi", "body": "x",
+        "in_reply_to": "", "references": "", "attachment_names": [],
+        "sender": "Agent <agent@icloud.com>",
+    }
+
+    @pytest.mark.asyncio
+    async def test_carries_the_existing_sender_over(
+        self, isolated_drafts: None, mock_mail: MagicMock
+    ) -> None:
+        from apple_mail_mcp.server import draft_update
+
+        mock_mail.get_draft_state.return_value = dict(self._STATE)
+        mock_mail.create_draft.return_value = {"draft_id": "NEW", "sent_message_id": ""}
+        result = await draft_update(draft_id="OLD", body="revised")
+        assert result["success"] is True
+        kwargs = mock_mail.create_draft.call_args.kwargs
+        assert kwargs["from_account"] == "Agent <agent@icloud.com>"
+
+    @pytest.mark.asyncio
+    async def test_an_explicit_override_wins(
+        self, isolated_drafts: None, mock_mail: MagicMock
+    ) -> None:
+        from apple_mail_mcp.server import draft_update
+
+        mock_mail.get_draft_state.return_value = dict(self._STATE)
+        mock_mail.create_draft.return_value = {"draft_id": "NEW", "sent_message_id": ""}
+        await draft_update(draft_id="OLD", from_account="Work")
+        assert mock_mail.create_draft.call_args.kwargs["from_account"] == "Work"
+
+    @pytest.mark.asyncio
+    async def test_a_draft_with_no_sender_recorded_is_left_to_mail(
+        self, isolated_drafts: None, mock_mail: MagicMock
+    ) -> None:
+        from apple_mail_mcp.server import draft_update
+
+        state = dict(self._STATE)
+        state["sender"] = ""
+        mock_mail.get_draft_state.return_value = state
+        mock_mail.create_draft.return_value = {"draft_id": "NEW", "sent_message_id": ""}
+        await draft_update(draft_id="OLD", body="revised")
+        assert mock_mail.create_draft.call_args.kwargs["from_account"] is None
+
+    @pytest.mark.asyncio
+    async def test_a_reply_sent_now_keeps_its_sender(
+        self, isolated_drafts: None, mock_mail: MagicMock
+    ) -> None:
+        """Reply sends go through the AppleScript compose path, which sets
+        the sender; the carried-over sender reaches it."""
+        from apple_mail_mcp.drafts import SeedRecord
+        from apple_mail_mcp.server import _get_draft_state_store, update_draft
+
+        _get_draft_state_store().set_seed(
+            "OLD", SeedRecord(seed_kind="reply", seed_id="msg-1")
+        )
+        state = dict(self._STATE)
+        state["in_reply_to"] = "<orig@example.com>"
+        mock_mail.get_draft_state.return_value = state
+        mock_mail.create_draft.return_value = {"draft_id": "", "sent_message_id": ""}
+        ctx = MagicMock()
+        ctx.elicit = AsyncMock()
+        result = await update_draft(draft_id="OLD", send_now=True, ctx=ctx)
+        assert result["success"] is True, result
+        assert mock_mail.create_draft.call_args.kwargs["from_account"] == (
+            "Agent <agent@icloud.com>"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_fresh_draft_sent_now_cannot_carry_it(
+        self, isolated_drafts: None, mock_mail: MagicMock
+    ) -> None:
+        """The mailto: path composes from Mail's default account and has no
+        sender to set. The carried-over sender is not passed there — the
+        connector would refuse it — and whether that draft's sender matches
+        what mailto: will use is not knowable here (DESIGN-QUEUE)."""
+        from apple_mail_mcp.server import update_draft
+
+        mock_mail.get_draft_state.return_value = dict(self._STATE)
+        mock_mail.create_draft.return_value = {"draft_id": "", "sent_message_id": ""}
+        ctx = MagicMock()
+        ctx.elicit = AsyncMock()
+        result = await update_draft(draft_id="OLD", send_now=True, ctx=ctx)
+        assert result["success"] is True, result
+        assert mock_mail.create_draft.call_args.kwargs["from_account"] is None
+
+
 class TestDraftUpdate:
     @pytest.mark.asyncio
     async def test_returns_new_draft_id(

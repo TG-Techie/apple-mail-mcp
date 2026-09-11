@@ -13,6 +13,7 @@ import warnings
 from collections.abc import Callable
 from datetime import date as _date
 from datetime import timedelta as _timedelta
+from email.utils import parseaddr
 from pathlib import Path
 from typing import IO, Any, cast
 
@@ -751,8 +752,9 @@ class AppleMailConnector:
         return accounts
 
     def _resolve_account_to_sender(self, account: str) -> str:
-        """Resolve an account name or UUID to a sender string for the
-        AppleScript ``sender`` property.
+        """Resolve an account name, UUID, or one of the account's own
+        addresses to a sender string for the AppleScript ``sender``
+        property.
 
         Returns ``"Display Name <email>"`` when the account has a
         ``full_name`` configured (#158), or bare ``email`` as a graceful
@@ -760,16 +762,24 @@ class AppleMailConnector:
         recipients see in their inbox's From column.
 
         Used by the draft lifecycle (``create_draft`` / ``update_draft``)
-        per #155. Accepts either name or UUID, matching the convention on
-        ``list_mailboxes``, ``search_messages``, etc.
+        per #155. Accepts a name or UUID, matching the convention on
+        ``list_mailboxes``, ``search_messages``, etc., and also an
+        address in ``email`` or ``Name <email>`` form — the form
+        ``get_draft_state`` reads back — matched case-insensitively
+        against the account's addresses, so a rebuilt draft resolves to
+        the account it was saved from.
 
         Raises:
             MailAccountNotFoundError: No account matches the given name/UUID.
             ValueError: Account exists but has no email addresses configured.
         """
+        wanted_address = parseaddr(account)[1].lower() if "@" in account else ""
         for acc in self.list_accounts():
-            if acc.get("id") == account or acc.get("name") == account:
-                emails = acc.get("email_addresses") or []
+            emails = acc.get("email_addresses") or []
+            owns_address = wanted_address and any(
+                str(e).lower() == wanted_address for e in emails
+            )
+            if acc.get("id") == account or acc.get("name") == account or owns_address:
                 if not emails:
                     raise ValueError(
                         f"Account {account!r} has no email addresses "
@@ -3870,11 +3880,13 @@ class AppleMailConnector:
         return result
 
     def get_draft_state(self, draft_id: str) -> dict[str, Any]:
-        """Read recipients, subject, body, threading headers, and
+        """Read recipients, subject, body, sender, threading headers, and
         attachment names from a saved draft.
 
         Used by ``update_draft`` to merge the caller's overrides with
-        the draft's current state before delete-and-recreate.
+        the draft's current state before delete-and-recreate. The sender
+        is read back so the recreated draft stays in the account the
+        draft was saved from rather than moving to Mail's default.
 
         Iterates Drafts mailboxes manually (rather than `whose id is`)
         because newly-created drafts can take a moment to be queryable
@@ -3892,6 +3904,7 @@ class AppleMailConnector:
                 "in_reply_to": "<msg-id>" | "",
                 "references": "<msg-id> ..." | "",
                 "attachment_names": ["foo.pdf", ...],
+                "sender": "Name <email>" | "email" | "",
             }``
 
         Raises:
@@ -3970,8 +3983,12 @@ class AppleMailConnector:
                 try
                     set draftBody to (content of foundDraft)
                 end try
+                set draftSender to ""
+                try
+                    set draftSender to (sender of foundDraft)
+                end try
 
-                set resultData to {{|found|:true, |draft_id|:targetId, |to|:toList, |cc|:ccList, |bcc|:bccList, |subject|:draftSubject, |body|:draftBody, |in_reply_to|:inReplyTo, |references|:refs, |attachment_names|:attNames}}
+                set resultData to {{|found|:true, |draft_id|:targetId, |to|:toList, |cc|:ccList, |bcc|:bccList, |subject|:draftSubject, |body|:draftBody, |in_reply_to|:inReplyTo, |references|:refs, |attachment_names|:attNames, |sender|:draftSender}}
             end if
         end tell
         """
