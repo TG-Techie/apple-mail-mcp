@@ -3994,7 +3994,12 @@ class AppleMailConnector:
         `whose id is`) because newly-created drafts can take a moment to
         be queryable via whose-clause; iteration is reliable and Drafts
         mailboxes are typically small. The aggregate covers every
-        account's drafts mailbox whatever the locale names it.
+        account's drafts mailbox whatever the locale names it. A draft
+        that vanishes between the listing and the walk reaching it (Mail
+        re-saves a draft with a named sender under a new id 8–31 s after
+        it is saved, docs/research/icloud-draft-resync.md) is skipped
+        rather than failing the walk: it is not the draft asked for, and
+        if it was, not-found is the truth.
 
         Returns:
             ``{
@@ -4022,7 +4027,11 @@ class AppleMailConnector:
             set targetId to "{draft_id}"
             set foundDraft to missing value
             repeat with d in messages of drafts mailbox
-                if (id of d as text) is targetId then
+                set candId to ""
+                try
+                    set candId to (id of d as text)
+                end try
+                if candId is targetId then
                     set foundDraft to d
                     exit repeat
                 end if
@@ -5679,7 +5688,11 @@ end if
             set targetId to "{draft_id}"
             set foundDraft to missing value
             repeat with d in messages of drafts mailbox
-                if (id of d as text) is targetId then
+                set candId to ""
+                try
+                    set candId to (id of d as text)
+                end try
+                if candId is targetId then
                     set foundDraft to d
                     exit repeat
                 end if

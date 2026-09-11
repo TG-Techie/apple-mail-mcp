@@ -5634,8 +5634,14 @@ class TestGetDraftState:
         assert "messages of drafts mailbox" in script
         assert 'contains "Drafts"' not in script
         # Should use as-text id comparison (probes showed numeric whose
-        # clauses are unreliable on IMAP-backed Drafts).
-        assert "(id of d as text) is targetId" in script
+        # clauses are unreliable on IMAP-backed Drafts), and read each
+        # id inside a try: a draft that vanished between the listing and
+        # the walk reaching it (Mail's re-save of a draft with a named
+        # sender) is skipped, not a failure of the whole read.
+        assert "set candId to (id of d as text)" in script
+        assert "if candId is targetId then" in script
+        walk = script[script.index("repeat with d in messages of drafts mailbox"):]
+        assert walk.index("try") < walk.index("id of d as text")
 
     @patch.object(AppleMailConnector, "_run_applescript")
     def test_script_reads_threading_headers(
