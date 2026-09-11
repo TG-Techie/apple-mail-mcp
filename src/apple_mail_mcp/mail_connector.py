@@ -178,9 +178,11 @@ def _bulk_repeat_block(
     When `account` and `source_mailbox` are both provided, emits a narrow
     O(N) loop scoped to a single mailbox. When both are None, falls back
     to the legacy O(N × accounts × mailboxes) cross-scan for backwards
-    compatibility. Any partial-pair raises ValueError — a mailbox name
-    without an account is ambiguous (the same name can exist across
-    multiple accounts).
+    compatibility; that scan stops at the first mailbox that holds an id,
+    so a message filed under several Gmail labels is acted on and counted
+    once. Any partial-pair raises ValueError — a mailbox name without an
+    account is ambiguous (the same name can exist across multiple
+    accounts).
 
     Args:
         account: Account name or UUID, or None.
@@ -223,18 +225,33 @@ def _bulk_repeat_block(
         )
 
     # Cross-scan path (legacy / backwards compat). O(N × M × K).
+    #
+    # Each id contributes at most once. Gmail exposes every label as a
+    # mailbox and files one message under each label it carries, so the
+    # same message matches in INBOX, All Mail and every user label. Without
+    # leaving the scan on the first match, the actions ran and the counter
+    # bumped once per label: update_message on one message returned 2, and
+    # the count is the only success signal these tools have. Mail's numeric
+    # `id` is unique per message, so the first match is the right one.
+    #
+    # `exit repeat` leaves only the innermost loop, hence the flag: it ends
+    # the mailbox loop directly and the account loop on the next check.
     action_indent = " " * 28
     action_lines = "\n".join(action_indent + a for a in actions)
     return (
         f"            repeat with msgId in idList\n"
+        f"                set matched to false\n"
         f"                repeat with acc in accounts\n"
         f"                    repeat with mb in mailboxes of acc\n"
         f"                        try\n"
         f"                            set msg to first message of mb whose id is msgId\n"
         f"{action_lines}\n"
         f"                            set {counter_var} to {counter_var} + 1\n"
+        f"                            set matched to true\n"
+        f"                            exit repeat\n"
         f"                        end try\n"
         f"                    end repeat\n"
+        f"                    if matched then exit repeat\n"
         f"                end repeat\n"
         f"            end repeat"
     )

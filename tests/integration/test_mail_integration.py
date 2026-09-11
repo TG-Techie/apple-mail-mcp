@@ -1857,3 +1857,62 @@ class TestSearchResultOrdering:
         assert dates == sorted(dates, reverse=True), (
             f"rows must be newest-first; got {[d.isoformat() for d in dates]}"
         )
+
+
+class TestBulkCrossScanCountsEachIdOnce:
+    """One message, however many mailboxes hold it, is counted once.
+
+    The cross-scan path (no ``account``/``source_mailbox``) walks every
+    mailbox of every account. Gmail files one message under every label it
+    carries, each label being a mailbox, so before the fix a message in the
+    INBOX also matched in All Mail and ``update_message`` returned 2 for one
+    message. Unit tests pin the emitted script; this is the observation
+    that the count Mail reports is 1.
+    """
+
+    @staticmethod
+    def _unflagged_inbox_message_id(account: str) -> str | None:
+        """Numeric Mail id of an unflagged INBOX message, via AppleScript.
+
+        Unflagged, so the test can restore the message by clearing the
+        flag rather than reconstructing a colour. ``INBOX`` is the one
+        mailbox name IMAP mandates, so it is not a choice of this test.
+        """
+        import subprocess
+
+        from apple_mail_mcp.utils import escape_applescript_string
+
+        acc = escape_applescript_string(account)
+        r = subprocess.run(
+            [
+                "/usr/bin/osascript", "-e",
+                'tell application "Mail"\n'
+                f'  set mb to mailbox "INBOX" of account "{acc}"\n'
+                '  repeat with m in (messages of mb)\n'
+                '    if flagged status of m is false then return id of m\n'
+                '  end repeat\n'
+                '  return ""\n'
+                'end tell',
+            ],
+            capture_output=True, text=True, check=False,
+        )
+        if r.returncode != 0:
+            return None
+        return r.stdout.strip() or None
+
+    def test_flag_by_id_without_scope_counts_exactly_one(
+        self, connector: AppleMailConnector, test_account: str
+    ) -> None:
+        msg_id = self._unflagged_inbox_message_id(test_account)
+        if msg_id is None:
+            pytest.skip(f"No unflagged INBOX message in account {test_account!r}")
+
+        try:
+            flagged = connector.update_message([msg_id], flag_color="orange")
+            assert flagged == 1, (
+                f"one message flagged, Mail counted {flagged}: the cross-scan "
+                f"is counting once per mailbox that holds the message"
+            )
+        finally:
+            cleared = connector.update_message([msg_id], flagged=False)
+        assert cleared == 1

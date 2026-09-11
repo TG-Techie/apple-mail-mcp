@@ -7205,3 +7205,69 @@ class TestSendHtmlReply:
                 from_account=None,
                 reply_to="12345",
             )
+
+
+class TestBulkCrossScanCountsEachIdOnce:
+    """A message that appears in several mailboxes is one message.
+
+    Gmail exposes every label as a mailbox and files a message under each
+    label it carries, so the cross-scan (no ``account``/``source_mailbox``)
+    finds the same message in INBOX, All Mail and every user label. Without
+    leaving the scan on the first match it ran the actions and bumped the
+    counter once per label — ``update_message`` on one message returned 2
+    or more, and the count is the only success signal these tools have.
+
+    The scan must leave both the mailbox loop and the account loop once an
+    id has matched. AppleScript's ``exit repeat`` only leaves the innermost
+    loop, so the outer exit rides on a flag. Mail's numeric ``id`` is
+    unique per message, so the first match is the right one.
+    """
+
+    @pytest.fixture
+    def connector(self) -> AppleMailConnector:
+        return AppleMailConnector(timeout=30)
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_cross_scan_exits_both_loops_after_a_match(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        mock_run.return_value = "1"
+        connector.update_message(["123"], flag_color="orange")
+        script = mock_run.call_args[0][0]
+
+        assert "repeat with acc in accounts" in script
+        # The match is recorded on a flag, the mailbox loop is left at
+        # once, and the account loop is left as soon as that loop ends.
+        assert "set matched to false" in script
+        assert "set matched to true" in script
+        # The flag is set and the loop left after the counter bumps, in
+        # that order, inside the try.
+        counter_at = script.index("set updateCount to updateCount + 1")
+        flag_at = script.index("set matched to true")
+        exit_at = script.index("exit repeat", flag_at)
+        assert counter_at < flag_at < exit_at
+        assert "if matched then exit repeat" in script
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_flag_is_reset_per_id_not_per_script(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        """Two ids in one call: the second must scan even after the first
+        matched, so the reset sits inside the id loop."""
+        mock_run.return_value = "2"
+        connector.mark_as_read(["1", "2"])
+        script = mock_run.call_args[0][0]
+        id_loop = script.index("repeat with msgId in idList")
+        reset = script.index("set matched to false")
+        acc_loop = script.index("repeat with acc in accounts")
+        assert id_loop < reset < acc_loop
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_narrow_path_is_untouched(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        """One mailbox can hold an id at most once; no flag needed there."""
+        mock_run.return_value = "1"
+        connector.mark_as_read(["1"], account="Gmail", source_mailbox="INBOX")
+        script = mock_run.call_args[0][0]
+        assert "matched" not in script
