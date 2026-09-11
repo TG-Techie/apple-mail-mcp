@@ -56,8 +56,10 @@ draft_update(draft_id="ABCD",  → {"draft_id": "EFGH"}   # id CHANGES
 draft_send(draft_id="EFGH")    → {"sent_message_id": ""}
 ```
 
-``draft_update`` is implemented as delete-and-recreate; the returned id
-is a NEW id. Always use the returned id for the next call. Off-allowlist
+``draft_update`` is implemented as recreate-then-delete; the returned id
+is a NEW id, and the old draft is removed only after the new one exists,
+so a failed update or send leaves it in Drafts under the id you hold.
+Always use the returned id for the next call. Off-allowlist
 recipients are fine on saved drafts; they are only blocked at
 ``draft_send``, and a blocked send is a pure no-op on Mail.app state.
 

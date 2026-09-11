@@ -3808,8 +3808,9 @@ class TestDraftToolErrorPaths:
         mock_logger: MagicMock,
     ) -> None:
         """If the draft is somehow deleted between get_draft_state and
-        the orchestrator's own delete_draft call, return a typed error
-        rather than crash."""
+        the orchestrator's own delete_draft call, the new draft still
+        exists and the requested end state holds; report it beside the
+        success rather than as a failure."""
         from apple_mail_mcp.exceptions import MailDraftNotFoundError
         from apple_mail_mcp.server import update_draft
 
@@ -3818,9 +3819,14 @@ class TestDraftToolErrorPaths:
             "subject": "", "body": "", "in_reply_to": "",
             "references": "", "attachment_names": [],
         }
+        mock_mail.create_draft.return_value = {
+            "draft_id": "161000", "sent_message_id": ""
+        }
         mock_mail.delete_draft.side_effect = MailDraftNotFoundError("gone")
         result = await update_draft(draft_id="160991", body="x")
-        assert result["error_type"] == "draft_not_found"
+        assert result["success"] is True
+        assert result["draft_id"] == "161000"
+        assert "160991" in result["warning"]
 
     @pytest.mark.asyncio
     async def test_update_draft_template_success_renders(

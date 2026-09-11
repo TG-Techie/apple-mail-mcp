@@ -688,6 +688,113 @@ class TestDraftSend:
         mock_mail.extract_draft_attachments.assert_not_called()
 
 
+class TestAFailureLeavesTheDraftWhereItWas:
+    """draft_update and draft_send are delete-and-recreate. Before this the
+    old draft was deleted first, so a failure in the recreate or the send
+    (Mail timing out, a reply's seed message gone, the sender account no
+    longer matching) returned an error while the draft whose id the
+    caller still held was sitting in Trash, against what the tool doc
+    promised. Now the new message is created (or sent) first and the old
+    draft is removed only after that succeeded; a failure leaves it
+    untouched, and a removal that fails after the success is reported
+    beside the success rather than turning it into an error."""
+
+    _STATE = {
+        "draft_id": "ABCD",
+        "to": ["alice@example.com"], "cc": [], "bcc": [],
+        "subject": "hi", "body": "x",
+        "in_reply_to": "", "references": "", "attachment_names": [],
+    }
+
+    @pytest.fixture(autouse=True)
+    def _no_elicitation(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv(
+            "APPLE_MAIL_MCP_SEND_ELICITATION_ALLOWLIST", raising=False
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_send_that_fails_leaves_the_draft_in_drafts(
+        self, isolated_drafts: None, mock_mail: MagicMock
+    ) -> None:
+        from apple_mail_mcp.drafts import SeedRecord
+        from apple_mail_mcp.exceptions import MailAppleScriptError
+        from apple_mail_mcp.server import _get_draft_state_store, draft_send
+
+        _get_draft_state_store().set_seed(
+            "ABCD", SeedRecord(seed_kind="reply", seed_id="msg-1")
+        )
+        mock_mail.get_draft_state.return_value = dict(self._STATE)
+        mock_mail.create_draft.side_effect = MailAppleScriptError("Mail timed out")
+        result = await draft_send(draft_id="ABCD")
+        assert result["success"] is False
+        assert result["error_type"] == "applescript_error"
+        mock_mail.delete_draft.assert_not_called()
+        assert _get_draft_state_store().get_seed("ABCD") is not None
+
+    @pytest.mark.asyncio
+    async def test_an_update_that_fails_leaves_the_draft_in_drafts(
+        self, isolated_drafts: None, mock_mail: MagicMock
+    ) -> None:
+        from apple_mail_mcp.exceptions import MailMessageNotFoundError
+        from apple_mail_mcp.server import draft_update
+
+        mock_mail.get_draft_state.return_value = dict(self._STATE)
+        mock_mail.create_draft.side_effect = MailMessageNotFoundError(
+            "no message with id 'msg-1'"
+        )
+        result = await draft_update(draft_id="ABCD", body="revised")
+        assert result["success"] is False
+        assert result["error_type"] == "message_not_found"
+        mock_mail.delete_draft.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_old_draft_goes_only_after_the_new_one_exists(
+        self, isolated_drafts: None, mock_mail: MagicMock
+    ) -> None:
+        from apple_mail_mcp.server import draft_update
+
+        mock_mail.get_draft_state.return_value = dict(self._STATE)
+        mock_mail.create_draft.return_value = {"draft_id": "EFGH", "sent_message_id": ""}
+        result = await draft_update(draft_id="ABCD", body="revised")
+        assert result["success"] is True
+        assert result["draft_id"] == "EFGH"
+        names = [c[0] for c in mock_mail.mock_calls]
+        assert names.index("create_draft") < names.index("delete_draft")
+        mock_mail.delete_draft.assert_called_once_with("ABCD")
+        assert "warning" not in result
+
+    @pytest.mark.asyncio
+    async def test_a_removal_that_fails_after_the_send_is_reported(
+        self, isolated_drafts: None, mock_mail: MagicMock
+    ) -> None:
+        from apple_mail_mcp.exceptions import MailAppleScriptError
+        from apple_mail_mcp.server import draft_send
+
+        mock_mail.get_draft_state.return_value = dict(self._STATE)
+        mock_mail.create_draft.return_value = {"draft_id": "", "sent_message_id": ""}
+        mock_mail.delete_draft.side_effect = MailAppleScriptError("Mail busy")
+        result = await draft_send(draft_id="ABCD")
+        assert result["success"] is True
+        assert "ABCD" in result["warning"]
+        assert "Drafts" in result["warning"]
+        assert "Mail busy" in result["warning"]
+
+    @pytest.mark.asyncio
+    async def test_an_old_draft_already_gone_is_reported_not_failed(
+        self, isolated_drafts: None, mock_mail: MagicMock
+    ) -> None:
+        from apple_mail_mcp.exceptions import MailDraftNotFoundError
+        from apple_mail_mcp.server import draft_update
+
+        mock_mail.get_draft_state.return_value = dict(self._STATE)
+        mock_mail.create_draft.return_value = {"draft_id": "EFGH", "sent_message_id": ""}
+        mock_mail.delete_draft.side_effect = MailDraftNotFoundError("gone")
+        result = await draft_update(draft_id="ABCD", body="revised")
+        assert result["success"] is True
+        assert result["draft_id"] == "EFGH"
+        assert "ABCD" in result["warning"]
+
+
 class TestAllowlistUnavailableFailClosed:
     """FAIL CLOSED (owner directive 2026-08-24): with no readable comms
     config there is NO fallback list — sends are blocked with the

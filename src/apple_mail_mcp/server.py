@@ -2637,6 +2637,44 @@ async def _run_send_now_gates(
     return None
 
 
+def _retire_old_draft(
+    draft_id: str,
+    store: DraftStateStore,
+    *,
+    new_draft_id: str,
+    sent: bool,
+) -> str | None:
+    """Remove the draft that update_draft has just replaced or sent.
+
+    Runs only once the new message exists, so nothing here can lose the
+    caller's draft. A removal that fails is reported, not raised: the
+    outcome the caller asked for holds, and the old id stays usable
+    until they deal with it. Returns the text to surface as a warning,
+    or None when the old draft is gone as intended.
+    """
+    try:
+        mail.delete_draft(draft_id)
+    except MailDraftNotFoundError:
+        store.delete(draft_id)
+        return (
+            f"the old draft {draft_id!r} was already gone when its removal "
+            "was attempted; the new state is as requested."
+        )
+    except MailAppleScriptError as e:
+        logger.error("old draft %r not removed after update: %s", draft_id, e)
+        outcome = (
+            "the message was sent"
+            if sent
+            else f"the new draft {new_draft_id!r} was saved"
+        )
+        return (
+            f"{outcome}, but the old draft {draft_id!r} could not be removed "
+            f"and is still in Drafts: {e}. Delete it with draft_delete."
+        )
+    store.delete(draft_id)
+    return None
+
+
 def _persist_draft_seed(
     draft_id: str,
     seed_kind: str,
@@ -2983,11 +3021,15 @@ async def update_draft(
     send_now: bool = False,
     ctx: Context | None = None,
 ) -> dict[str, Any]:
-    """Update an existing draft. Implemented as delete-and-recreate.
+    """Update an existing draft. Implemented as recreate-then-delete.
 
     **Returns a NEW draft_id** — Mail.app forbids mutating saved drafts,
     so update is implemented by reading the draft's current state,
-    deleting it, and creating a new draft with the merged fields.
+    creating a new draft with the merged fields, and then removing the
+    old one. The old draft goes only after the new message exists (or
+    has been sent), so any failure leaves it in Drafts under the id the
+    caller already holds; if the removal itself fails after that, the
+    response is a success carrying a ``warning`` that names the old id.
     Threading headers (for reply seeds) and forward anchor are preserved
     via persisted seed metadata.
 
@@ -3097,16 +3139,9 @@ async def update_draft(
             if gate_err:
                 return gate_err
 
-        # Delete + recreate. Clear stale state first so a connector failure
-        # doesn't leave orphan entries.
-        try:
-            mail.delete_draft(draft_id)
-        except MailDraftNotFoundError:
-            return _draft_error_response(
-                MailDraftNotFoundError(f"no draft with id {draft_id!r}")
-            )
-        store.delete(draft_id)
-
+        # Recreate, then retire. The old draft is the only copy the caller
+        # holds an id for, so nothing is removed until the new message
+        # exists (or has gone out); a failure here leaves it in Drafts.
         result = mail.create_draft(
             seed=seed_kind,
             seed_id=seed_id,
@@ -3125,12 +3160,16 @@ async def update_draft(
         _persist_draft_seed(
             new_draft_id, seed_kind, seed_id, reply_all, send_now,
         )
+        warning = _retire_old_draft(
+            draft_id, store, new_draft_id=new_draft_id, sent=send_now,
+        )
 
         operation_logger.log_operation(
             "update_draft",
             {
                 "old_draft_id": draft_id,
                 "new_draft_id": new_draft_id,
+                "old_draft_removed": warning is None,
                 "send_now": send_now,
                 "to": final_to,
                 "cc": final_cc,
@@ -3140,12 +3179,15 @@ async def update_draft(
             },
             "success",
         )
-        return {
+        response: dict[str, Any] = {
             "success": True,
             "draft_id": new_draft_id,
             "sent_message_id": result.get("sent_message_id", ""),
             "details": {"seed_kind": seed_kind, "send_now": send_now},
         }
+        if warning is not None:
+            response["warning"] = warning
+        return response
 
     except Exception as e:
         handled = _draft_action_error("update_draft", e)
@@ -3227,10 +3269,12 @@ def delete_draft(draft_id: str) -> dict[str, Any]:
 # the human can review and either edit the recipients or send manually
 # from Mail.app.
 #
-# IMPORTANT: draft_update is implemented as delete-and-recreate, so the
+# IMPORTANT: draft_update is implemented as recreate-then-delete, so the
 # returned draft_id is a NEW id. Always use the returned id for the next
 # step in the lifecycle. Treat the id you held before draft_update as
-# stale.
+# stale. The old draft is removed only after the new one exists (or the
+# send went out), so a failed draft_update or draft_send leaves it in
+# Drafts under the id you already hold.
 # ──────────────────────────────────────────────────────────────────────────
 
 
@@ -3330,7 +3374,7 @@ async def draft_update(
     ``draft_send(draft_id)`` afterwards.
 
     IMPORTANT: Mail.app forbids mutating saved drafts, so this is
-    implemented as delete-and-recreate. The returned ``draft_id`` is a
+    implemented as recreate-then-delete. The returned ``draft_id`` is a
     NEW id — use it for any subsequent ``draft_update`` or ``draft_send``
     call. The id you passed in is stale after this call returns.
 
@@ -3422,9 +3466,9 @@ async def draft_send(
         {"success": True, "sent_message_id": "", "draft_id": ""}
     """
     # PRE-VALIDATION: read the draft's recipients and check the policy
-    # BEFORE any destructive op. If off-list, the draft is left intact
-    # — distinct from the connector-layer gate which fires too late
-    # (after the delete in update_draft's delete-and-recreate flow).
+    # before Mail is touched at all, so an off-list draft gets the typed
+    # error from the one obvious tool. The connector re-checks on the
+    # send itself; that is the backstop, not the gate.
     try:
         state = mail.get_draft_state(draft_id)
     except MailDraftError as e:

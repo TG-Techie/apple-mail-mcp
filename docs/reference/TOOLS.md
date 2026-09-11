@@ -924,14 +924,20 @@ create_draft(
 
 ### update_draft
 
-Update an existing draft. Implemented as **delete-and-recreate** —
+Update an existing draft. Implemented as **recreate-then-delete** —
 Mail.app forbids mutating saved drafts, so this tool reads the
-current state, deletes the draft, and creates a new one with the
-merged fields. Threading headers (for replies) and forward anchors
-are preserved via persisted seed metadata.
+current state, creates a new draft with the merged fields, and then
+removes the old one. Threading headers (for replies) and forward
+anchors are preserved via persisted seed metadata.
 
-**⚠️ Returns a NEW `draft_id`** — the input id is no longer valid
-after this call. Callers caching the id must re-read the response.
+**⚠️ Returns a NEW `draft_id`** — after a success the input id is no
+longer valid. Callers caching the id must re-read the response.
+
+The old draft is removed only after the new one exists (or, with
+`send_now=True`, after the send went out), so a failure at any point
+leaves it in Drafts under the id you already hold. If the removal
+itself fails after that, the response is still a success and carries
+a `warning` naming the old id, which is then still in Drafts.
 
 **Parameters:**
 

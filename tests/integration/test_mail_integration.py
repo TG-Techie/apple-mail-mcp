@@ -553,10 +553,17 @@ class TestDraftsLifecycleIntegration:
         the test account and then updated without naming an account is
         rebuilt in that account, not in Mail's default. Run with
         MAIL_TEST_ACCOUNT set to an account that is not Mail's default
-        sender for this to prove anything beyond the read-back."""
+        sender for this to prove anything beyond the read-back.
+
+        Known to fail on an iCloud account: a freshly saved draft there
+        reads back with no recipients until Mail re-saves it under a new
+        id, so the update is refused. See
+        docs/research/icloud-draft-resync.md; passes on the Gmail
+        account."""
         import asyncio
 
         from apple_mail_mcp import server
+        from apple_mail_mcp.exceptions import MailDraftNotFoundError
 
         monkeypatch.setenv("APPLE_MAIL_MCP_HOME", str(tmp_path))
         monkeypatch.setattr(server, "mail", connector)
@@ -578,6 +585,11 @@ class TestDraftsLifecycleIntegration:
             state = connector.get_draft_state(new_draft_id)
             assert "v2" in state["body"]
             assert address in state["sender"].lower(), state["sender"]
+            # The new draft was found by diffing Drafts ids while the old
+            # one still existed; the old one is then gone, cleanly.
+            assert "warning" not in updated, updated
+            with pytest.raises(MailDraftNotFoundError):
+                connector.get_draft_state(draft_id)
         finally:
             for did in (new_draft_id, draft_id):
                 if did:
