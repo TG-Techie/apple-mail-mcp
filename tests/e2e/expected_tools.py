@@ -68,16 +68,17 @@ NO_INVOCATION_CASE = {
     # does not fit the single-method table. Covered by
     # TestDraftUpdateInvocation.
     "draft_update",
-    # Writes to disk rather than through the connector, so it does not
-    # fit the single-method table. Covered by TestSaveTemplateInvocation.
-    "save_template",
-    # Rule and template tools do not go through the mail connector, so
-    # the mock_mail-based table does not fit them. Not yet covered here.
-    "create_rule",
+    # Resolve the rule's name through list_rules before acting, so they
+    # need two connector methods stubbed. Covered by
+    # TestRuleMutationInvocation and the two confirmation classes.
     "update_rule",
     "delete_rule",
+    # Read and write the on-disk template store rather than the
+    # connector. Covered by TestTemplateInvocation; delete_template's
+    # gate by the two confirmation classes.
     "list_templates",
     "get_template",
+    "save_template",
     "delete_template",
     "render_template",
 }

@@ -78,6 +78,10 @@ class TestToolRegistration:
         )
 
 
+# The one rule the mocked connector reports; the rule tools resolve a
+# name from this row before they act.
+_RULE_ROW = {"index": 1, "name": "Junk filter", "enabled": True}
+
 # Sentinels replaced at test-time with values derived from tmp_path. Needed
 # because parametrize is evaluated at collection time and cannot reference
 # per-test fixtures directly.
@@ -171,6 +175,16 @@ INVOCATION_CASES: list[tuple[str, dict[str, Any], str, Any]] = [
         "delete_messages",
         1,
     ),
+    (
+        "create_rule",
+        {
+            "name": "Junk filter",
+            "conditions": [{"type": "from", "operator": "contains", "value": "spam"}],
+            "actions": {"move_to": "Junk"},
+        },
+        "create_rule",
+        3,
+    ),
 ]
 
 
@@ -249,7 +263,7 @@ class TestInvocationCoverage:
 
 
 class TestConfirmationGate:
-    """delete_mailbox must not proceed without an accepting client.
+    """A confirmation-gated tool must not proceed without an accepting client.
 
     mcp.call_tool injects a Context whose elicitation capability is not
     backed by a real client, so the gate is exercised exactly as it is
@@ -267,6 +281,49 @@ class TestConfirmationGate:
         assert body["success"] is False
         assert body["error_type"] == "confirmation_required"
         mock_mail.delete_mailbox.assert_not_called()
+
+    async def test_delete_rule_blocks_without_confirmation(self, mock_mail: MagicMock) -> None:
+        mock_mail.list_rules.return_value = [_RULE_ROW]
+        result = await server.mcp.call_tool("delete_rule", {"rule_index": 1})
+
+        body = result.structured_content
+        assert body is not None
+        assert body["success"] is False
+        assert body["error_type"] == "confirmation_required"
+        mock_mail.delete_rule.assert_not_called()
+
+    async def test_update_rule_blocks_without_confirmation_when_it_rewrites_logic(
+        self, mock_mail: MagicMock
+    ) -> None:
+        """Renaming or toggling is reversible and asks nothing; replacing
+        the conditions or actions discards state Mail.app cannot give back,
+        so that path asks."""
+        mock_mail.list_rules.return_value = [_RULE_ROW]
+        result = await server.mcp.call_tool(
+            "update_rule", {"rule_index": 1, "actions": {"move_to": "Archive"}}
+        )
+
+        body = result.structured_content
+        assert body is not None
+        assert body["success"] is False
+        assert body["error_type"] == "confirmation_required"
+        mock_mail.update_rule.assert_not_called()
+
+    async def test_delete_template_blocks_without_confirmation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("APPLE_MAIL_MCP_HOME", str(tmp_path))
+        await server.mcp.call_tool("save_template", {"name": "t", "body": "v1\n"})
+
+        result = await server.mcp.call_tool("delete_template", {"name": "t"})
+
+        body = result.structured_content
+        assert body is not None
+        assert body["success"] is False
+        assert body["error_type"] == "confirmation_required"
+        still_there = await server.mcp.call_tool("get_template", {"name": "t"})
+        assert still_there.structured_content is not None
+        assert still_there.structured_content["success"] is True
 
 
 class TestOutboundAllowlistGate:
@@ -349,17 +406,115 @@ class TestDraftUpdateInvocation:
         mock_mail.create_draft.assert_called_once()
 
 
-class TestSaveTemplateInvocation:
-    """save_template writes to disk rather than through the connector,
-    so it does not fit the single-method table. The pair that matters
-    at the dispatch layer: a taken name is refused, and overwrite=True
-    is the one way through."""
+class TestRuleMutationInvocation:
+    """update_rule and delete_rule resolve the rule's name through
+    list_rules before acting, so they need two connector methods stubbed
+    and do not fit the single-method table. The confirmation-free path
+    of update_rule is dispatched here; the gated paths are in
+    TestConfirmationGate and TestConfirmationAnsweredByARealClient."""
+
+    async def test_update_rule_rename_needs_no_confirmation(self, mock_mail: MagicMock) -> None:
+        mock_mail.list_rules.return_value = [_RULE_ROW]
+        mock_mail.update_rule.return_value = None
+
+        result = await server.mcp.call_tool(
+            "update_rule", {"rule_index": 1, "name": "Junk filter (old)", "enabled": False}
+        )
+
+        body = result.structured_content
+        assert body is not None
+        assert body == {"success": True, "rule_index": 1}
+        mock_mail.update_rule.assert_called_once()
+        assert mock_mail.update_rule.call_args.kwargs["expected_name"] == "Junk filter"
+
+    async def test_unknown_index_is_a_typed_error(self, mock_mail: MagicMock) -> None:
+        mock_mail.list_rules.return_value = [_RULE_ROW]
+
+        result = await server.mcp.call_tool("delete_rule", {"rule_index": 9})
+
+        body = result.structured_content
+        assert body is not None
+        assert body["success"] is False
+        assert body["error_type"] == "rule_not_found"
+        mock_mail.delete_rule.assert_not_called()
+
+
+class TestTemplateInvocation:
+    """The template tools read and write the on-disk store rather than the
+    connector, so they do not fit the single-method table. Each is
+    dispatched here against an isolated store; delete_template's gate is
+    in TestConfirmationGate and TestConfirmationAnsweredByARealClient."""
 
     @pytest.fixture(autouse=True)
     def _isolated_templates(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("APPLE_MAIL_MCP_HOME", str(tmp_path))
 
-    async def test_taken_name_is_refused_until_overwrite_is_named(self) -> None:
+    async def test_list_is_empty_then_shows_what_was_saved(self) -> None:
+        empty = await server.mcp.call_tool("list_templates", {})
+        assert empty.structured_content == {"success": True, "templates": [], "count": 0}
+
+        await server.mcp.call_tool(
+            "save_template", {"name": "t", "body": "Hi {who}\n", "subject": "Re: {orig}"}
+        )
+
+        listed = await server.mcp.call_tool("list_templates", {})
+        body = listed.structured_content
+        assert body is not None
+        assert body["count"] == 1
+        assert body["templates"][0]["name"] == "t"
+
+    async def test_get_returns_the_saved_template_and_its_placeholders(self) -> None:
+        await server.mcp.call_tool(
+            "save_template", {"name": "t", "body": "Hi {who}\n", "subject": "Re: {orig}"}
+        )
+
+        got = await server.mcp.call_tool("get_template", {"name": "t"})
+
+        body = got.structured_content
+        assert body is not None
+        assert body["success"] is True
+        assert body["subject"] == "Re: {orig}"
+        assert body["body"] == "Hi {who}\n"
+        assert set(body["placeholders"]) == {"who", "orig"}
+
+    async def test_get_unknown_name_is_a_typed_error(self) -> None:
+        got = await server.mcp.call_tool("get_template", {"name": "nope"})
+
+        body = got.structured_content
+        assert body is not None
+        assert body["success"] is False
+        assert body["error_type"] == "template_not_found"
+
+    async def test_render_merges_auto_fill_under_caller_vars(self, mock_mail: MagicMock) -> None:
+        mock_mail.auto_template_vars.return_value = {"today": "2026-01-01", "who": "auto"}
+        await server.mcp.call_tool(
+            "save_template", {"name": "t", "body": "Hi {who}, {today}\n", "subject": "s"}
+        )
+
+        rendered = await server.mcp.call_tool(
+            "render_template", {"name": "t", "vars": {"who": "caller"}}
+        )
+
+        body = rendered.structured_content
+        assert body is not None
+        assert body["success"] is True
+        assert body["body"] == "Hi caller, 2026-01-01\n"
+        assert body["used_vars"] == {"today": "2026-01-01", "who": "caller"}
+        mock_mail.auto_template_vars.assert_called_once_with(None)
+
+    async def test_render_names_the_missing_placeholder(self, mock_mail: MagicMock) -> None:
+        mock_mail.auto_template_vars.return_value = {"today": "2026-01-01"}
+        await server.mcp.call_tool("save_template", {"name": "t", "body": "Hi {who}\n"})
+
+        rendered = await server.mcp.call_tool("render_template", {"name": "t"})
+
+        body = rendered.structured_content
+        assert body is not None
+        assert body["success"] is False
+        assert body["error_type"] == "missing_template_variable"
+        assert "who" in body["error"]
+
+    async def test_save_refuses_a_taken_name_until_overwrite_is_named(self) -> None:
         first = await server.mcp.call_tool("save_template", {"name": "t", "body": "v1\n"})
         assert first.structured_content is not None
         assert first.structured_content["created"] is True
@@ -418,6 +573,28 @@ class TestConfirmationAnsweredByARealClient:
         assert body is not None
         assert body["success"] is True, body
         mock_mail.delete_mailbox.assert_called_once()
+
+    async def test_accept_true_lets_delete_rule_proceed(self, mock_mail: MagicMock) -> None:
+        mock_mail.list_rules.return_value = [_RULE_ROW]
+        mock_mail.delete_rule.return_value = "Junk filter"
+        async with self._client(True) as client:
+            result = await client.call_tool("delete_rule", {"rule_index": 1})
+        body = result.structured_content
+        assert body is not None
+        assert body == {"success": True, "rule_index": 1, "deleted_name": "Junk filter"}
+        mock_mail.delete_rule.assert_called_once_with(1, expected_name="Junk filter")
+
+    async def test_accept_true_lets_delete_template_proceed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("APPLE_MAIL_MCP_HOME", str(tmp_path))
+        async with self._client(True) as client:
+            await client.call_tool("save_template", {"name": "t", "body": "v1\n"})
+            result = await client.call_tool("delete_template", {"name": "t"})
+            gone = await client.call_tool("get_template", {"name": "t"})
+        assert result.structured_content == {"success": True, "name": "t"}
+        assert gone.structured_content is not None
+        assert gone.structured_content["error_type"] == "template_not_found"
 
     async def test_accept_false_is_a_decline(self, mock_mail: MagicMock) -> None:
         """A form answered "no" is not a yes. The bool is the answer."""
