@@ -1537,6 +1537,11 @@ def create_mailbox(
             parent_mailbox=parent_mailbox,
         )
 
+        operation_logger.log_operation(
+            "create_mailbox",
+            {"account": account, "mailbox": name, "parent": parent_mailbox},
+            "success" if success else "failure",
+        )
         return {
             "success": success,
             "account": account,
@@ -1925,9 +1930,21 @@ def delete_messages(
             source_mailbox=source_mailbox,
         )
 
+        operation_logger.log_operation(
+            "delete_messages",
+            {
+                "message_ids": message_ids,
+                "count": count,
+                "permanent": permanent,
+                "account": account,
+                "source_mailbox": source_mailbox,
+            },
+            "success",
+        )
         return {
             "success": True,
             "count": count,
+            "requested": len(message_ids),
             "permanent": permanent,
         }
 

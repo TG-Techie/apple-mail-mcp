@@ -223,12 +223,21 @@ class TestToolInvocation:
 
         getattr(mock_mail, connector_method).return_value = connector_return
 
+        from apple_mail_mcp.security import operation_logger
+
+        audit_before = len(operation_logger.operations)
         result = await server.mcp.call_tool(tool_name, resolved_args)
 
         assert result.structured_content is not None
         assert result.structured_content["success"] is True
         assert "error" not in result.structured_content
         getattr(mock_mail, connector_method).assert_called_once()
+        # The security checklist: every tool's success path writes an
+        # audit entry. A tool that acts and leaves no record is the gap
+        # the durable audit log exists to close.
+        assert len(operation_logger.operations) == audit_before + 1, (
+            f"{tool_name} succeeded without writing an audit entry"
+        )
 
 
 def _tool_names_in_invocation_cases() -> set[str]:

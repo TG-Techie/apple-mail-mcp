@@ -785,9 +785,14 @@ Delete messages — always moves them to the account's Trash mailbox.
 {
   "success": true,
   "count": 2,
+  "requested": 2,
   "permanent": false
 }
 ```
+
+`count` is how many messages were actually moved; compare it with
+`requested`, since an id that matched nothing is skipped rather than
+reported.
 
 **Examples:**
 
