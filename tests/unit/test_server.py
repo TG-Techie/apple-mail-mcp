@@ -411,6 +411,30 @@ class TestDeleteRule:
 
 
 class TestCreateRule:
+    def test_the_audit_entry_carries_the_rule(
+        self, mock_mail: MagicMock, mock_logger: MagicMock
+    ) -> None:
+        """A rule acts on every future message that matches it. The entry
+        used to record only the name and index, so it could not say what
+        the rule the agent installed does."""
+        mock_mail.create_rule.return_value = 6
+        conditions = [{"field": "subject", "operator": "contains", "value": "X"}]
+        actions = {"move_to_mailbox": "Archive"}
+        create_rule(
+            name="My New Rule", conditions=conditions, actions=actions,
+            match_logic="any", enabled=False,
+        )
+        op, params, status = mock_logger.log_operation.call_args.args
+        assert (op, status) == ("create_rule", "success")
+        assert params == {
+            "name": "My New Rule",
+            "rule_index": 6,
+            "conditions": conditions,
+            "actions": actions,
+            "match_logic": "any",
+            "enabled": False,
+        }
+
     def test_success_returns_new_index(self, mock_mail: MagicMock) -> None:
         mock_mail.create_rule.return_value = 6
         result = create_rule(
@@ -457,6 +481,32 @@ class TestCreateRule:
 
 
 class TestUpdateRule:
+    async def test_the_audit_entry_carries_the_patch(
+        self, mock_mail: MagicMock, mock_ctx_accept: MagicMock,
+        mock_logger: MagicMock,
+    ) -> None:
+        """The entry used to record only the index and previous name, so
+        it could not say what about the rule was changed. It now carries
+        the patch as given: None for a field left alone."""
+        mock_mail.list_rules.return_value = [
+            {"index": 1, "name": "Junk filter", "enabled": True},
+        ]
+        actions = {"mark_read": True}
+        await update_rule(
+            rule_index=1, actions=actions, enabled=False, ctx=mock_ctx_accept,
+        )
+        op, params, status = mock_logger.log_operation.call_args.args
+        assert (op, status) == ("update_rule", "success")
+        assert params == {
+            "rule_index": 1,
+            "previous_name": "Junk filter",
+            "name": None,
+            "enabled": False,
+            "conditions": None,
+            "actions": actions,
+            "match_logic": None,
+        }
+
     # ---- Irreversible patches: prompt required ---------------------------
 
     async def test_conditions_patch_prompts_and_succeeds(
@@ -1428,6 +1478,31 @@ class TestGetMessages:
 
 
 class TestUpdateMessage:
+    def test_the_audit_entry_says_which_messages_went_where(
+        self, mock_mail: MagicMock, mock_logger: MagicMock
+    ) -> None:
+        """A move is the one update that changes where a message lives.
+        The audit entry used to record only how many ids were asked for,
+        under the name `count`, so it could not answer which messages
+        were moved, from where, or how many actually were."""
+        mock_mail.update_message.return_value = 1
+
+        update_message(
+            ["1", "2"], destination_mailbox="Archive",
+            account="Work", source_mailbox="INBOX", gmail_mode=True,
+        )
+
+        mock_logger.log_operation.assert_called_once()
+        op, params, status = mock_logger.log_operation.call_args.args
+        assert (op, status) == ("update_message", "success")
+        assert params["message_ids"] == ["1", "2"]
+        assert params["requested"] == 2
+        assert params["updated"] == 1
+        assert params["destination_mailbox"] == "Archive"
+        assert params["account"] == "Work"
+        assert params["source_mailbox"] == "INBOX"
+        assert params["gmail_mode"] is True
+
     # ---- Validation -----------------------------------------------------
 
     def test_no_fields_returns_validation_error(

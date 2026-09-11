@@ -424,7 +424,14 @@ def create_rule(
         )
         operation_logger.log_operation(
             "create_rule",
-            {"name": name, "rule_index": new_index},
+            {
+                "name": name,
+                "rule_index": new_index,
+                "conditions": conditions,
+                "actions": actions,
+                "match_logic": match_logic,
+                "enabled": enabled,
+            },
             "success",
         )
         return {
@@ -536,7 +543,15 @@ async def update_rule(
         )
         operation_logger.log_operation(
             "update_rule",
-            {"rule_index": rule_index, "previous_name": rule_name},
+            {
+                "rule_index": rule_index,
+                "previous_name": rule_name,
+                "name": name,
+                "enabled": enabled,
+                "conditions": conditions,
+                "actions": actions,
+                "match_logic": match_logic,
+            },
             "success",
         )
         return {
@@ -1260,11 +1275,16 @@ def update_message(
         operation_logger.log_operation(
             "update_message",
             {
-                "count": len(message_ids),
+                "message_ids": message_ids,
+                "requested": len(message_ids),
+                "updated": count,
                 "read_status": read_status,
                 "flagged": flagged,
                 "flag_color": flag_color,
                 "destination_mailbox": destination_mailbox,
+                "account": account,
+                "source_mailbox": source_mailbox,
+                "gmail_mode": gmail_mode,
             },
             "success",
         )
