@@ -1773,6 +1773,20 @@ class TestUpdateMessage:
 
 
 class TestGetThread:
+    def test_a_fallback_warning_reaches_the_response(
+        self, mock_mail: MagicMock, mock_logger: MagicMock
+    ) -> None:
+        def fake_get_thread(message_id: str, *, on_warning: Any = None) -> list[dict[str, Any]]:
+            on_warning("thread built by the AppleScript path")
+            return [{"id": message_id}]
+
+        mock_mail.get_thread.side_effect = fake_get_thread
+
+        result = get_thread("1")
+
+        assert result["success"] is True
+        assert result["warnings"] == ["thread built by the AppleScript path"]
+
     def test_success_returns_thread_and_logs(
         self, mock_mail: MagicMock, mock_logger: MagicMock
     ) -> None:
@@ -1786,7 +1800,8 @@ class TestGetThread:
         assert result["success"] is True
         assert result["count"] == 2
         assert len(result["thread"]) == 2
-        mock_mail.get_thread.assert_called_once_with("1")
+        assert "warnings" not in result
+        assert mock_mail.get_thread.call_args.args == ("1",)
         mock_logger.log_operation.assert_called_once_with(
             "get_thread", {"message_id": "1"}, "success"
         )

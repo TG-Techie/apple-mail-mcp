@@ -1413,6 +1413,73 @@ class TestAppleMailConnector:
 
     # --- get_thread delegation -------------------------------------------
 
+    _ANCHOR = {
+        "internal_id": "500",
+        "account": "iCloud",
+        "rfc_message_id": "anchor@x",
+        "subject": "S",
+        "in_reply_to": None,
+        "references": [],
+    }
+
+    @patch.object(AppleMailConnector, "_collect_thread_applescript")
+    @patch.object(AppleMailConnector, "_imap_get_thread")
+    @patch.object(AppleMailConnector, "_resolve_thread_anchor_applescript")
+    def test_the_applescript_path_tells_the_caller_what_it_can_miss(
+        self,
+        mock_anchor: MagicMock,
+        mock_imap: MagicMock,
+        mock_collect: MagicMock,
+        connector: AppleMailConnector,
+    ) -> None:
+        """The fallback was logged in the server process only, so a caller
+        got a thread that may lack members whose subject was rewritten
+        and nothing said so. on_warning now carries which path built the
+        thread and why."""
+        mock_anchor.return_value = dict(self._ANCHOR)
+        mock_imap.side_effect = MailKeychainEntryNotFoundError("no entry")
+        mock_collect.return_value = [{"id": "500"}]
+        heard: list[str] = []
+        connector.get_thread("500", on_warning=heard.append)
+        assert len(heard) == 1
+        assert "AppleScript" in heard[0]
+        assert "subject" in heard[0]
+        assert "not configured" in heard[0]
+
+    @patch.object(AppleMailConnector, "_collect_thread_applescript")
+    @patch.object(AppleMailConnector, "_imap_get_thread")
+    @patch.object(AppleMailConnector, "_resolve_thread_anchor_applescript")
+    def test_an_imap_failure_is_named_in_the_warning(
+        self,
+        mock_anchor: MagicMock,
+        mock_imap: MagicMock,
+        mock_collect: MagicMock,
+        connector: AppleMailConnector,
+    ) -> None:
+        mock_anchor.return_value = dict(self._ANCHOR)
+        mock_imap.side_effect = LoginError("bad password")
+        mock_collect.return_value = [{"id": "500"}]
+        heard: list[str] = []
+        connector.get_thread("500", on_warning=heard.append)
+        assert len(heard) == 1
+        assert "bad password" in heard[0]
+
+    @patch.object(AppleMailConnector, "_collect_thread_applescript")
+    @patch.object(AppleMailConnector, "_imap_get_thread")
+    @patch.object(AppleMailConnector, "_resolve_thread_anchor_applescript")
+    def test_the_imap_path_raises_no_warning(
+        self,
+        mock_anchor: MagicMock,
+        mock_imap: MagicMock,
+        mock_collect: MagicMock,
+        connector: AppleMailConnector,
+    ) -> None:
+        mock_anchor.return_value = dict(self._ANCHOR)
+        mock_imap.return_value = [{"id": "anchor@x"}]
+        heard: list[str] = []
+        connector.get_thread("500", on_warning=heard.append)
+        assert heard == []
+
     @patch.object(AppleMailConnector, "_collect_thread_applescript")
     @patch.object(AppleMailConnector, "_imap_get_thread")
     @patch.object(AppleMailConnector, "_resolve_thread_anchor_applescript")

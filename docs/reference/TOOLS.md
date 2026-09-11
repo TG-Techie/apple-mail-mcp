@@ -235,7 +235,7 @@ Return all messages in the thread containing the given anchor message, sorted by
 
 Row fields include both `id` (path-native — see `search_messages` for details) and `rfc_message_id` (always RFC 5322 bracketless, or `null` when the message lacks a Message-ID header). See `search_messages` for the dual-emit (#148) rationale.
 
-Uses the connector's tiered IMAP threading dispatch (Tier 1 X-GM-THRID for Gmail per #122, Tier 3 header-search BFS fallback) when IMAP is configured; falls back to AppleScript otherwise.
+Uses the connector's tiered IMAP threading dispatch (Tier 1 X-GM-THRID for Gmail per #122, Tier 3 header-search BFS fallback) when IMAP is configured; falls back to AppleScript otherwise. The AppleScript path prefilters on subject and misses members whose subject was rewritten mid-thread; whenever it is the path that built the result, the response carries a `warnings` list saying so and why IMAP was not used (not configured, failed, or cooling down after a failure). A response without `warnings` came from IMAP.
 
 **Examples:**
 

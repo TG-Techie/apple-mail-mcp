@@ -2201,7 +2201,12 @@ class AppleMailConnector:
             logger.warning("get_attachments: %s", w)
         return attachments
 
-    def get_thread(self, message_id: str) -> list[dict[str, Any]]:
+    def get_thread(
+        self,
+        message_id: str,
+        *,
+        on_warning: Callable[[str], None] | None = None,
+    ) -> list[dict[str, Any]]:
         """Return all messages in the thread containing ``message_id``.
 
         Tries the IMAP path first (server-side header search, no subject-
@@ -2211,10 +2216,18 @@ class AppleMailConnector:
         Keychain entry, a revoked password, or a dropped network still
         gets working threading via AppleScript.
 
+        The AppleScript path prefilters on subject, so it misses members
+        whose subject was rewritten mid-thread. Whenever it is the path
+        that built the result, ``on_warning`` (if given) is told so and
+        why IMAP was not used, since the log line that records the
+        fallback is written in this process and no caller can see it.
+
         Args:
             message_id: Internal Mail.app id of any message in the thread
                 (the anchor). Typically obtained from search_messages or
                 get_message results.
+            on_warning: Receives one human-readable string when the
+                result came from the AppleScript path.
 
         Returns:
             List of message dicts sorted by date_received ascending. Each
@@ -2227,6 +2240,10 @@ class AppleMailConnector:
         """
         anchor = self._resolve_thread_anchor_applescript(message_id)
         anchor_account = cast(str, anchor["account"])
+        why = (
+            f"IMAP is cooling down for account {anchor_account!r} after an "
+            "earlier failure"
+        )
         if not self._imap_breaker_open(anchor_account):
             try:
                 result = self._imap_get_thread(anchor)
@@ -2234,7 +2251,16 @@ class AppleMailConnector:
                 return result
             except _IMAP_FALLBACK_EXCS as exc:
                 self._log_imap_fallback(anchor_account, exc)
-                # fall through to AppleScript
+                if isinstance(exc, MailKeychainEntryNotFoundError):
+                    why = f"IMAP is not configured for account {anchor_account!r}"
+                else:
+                    why = f"IMAP failed for account {anchor_account!r}: {exc}"
+        if on_warning is not None:
+            on_warning(
+                "thread built by the AppleScript path, which prefilters on "
+                "subject and misses members whose subject was rewritten "
+                f"mid-thread ({why})."
+            )
         return self._collect_thread_applescript(anchor)
 
     def _imap_get_thread(

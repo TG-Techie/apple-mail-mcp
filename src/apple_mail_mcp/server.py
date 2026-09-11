@@ -1369,17 +1369,21 @@ def get_thread(message_id: str) -> dict[str, Any]:
 
         logger.info(f"Getting thread for message: {message_id}")
 
-        thread = mail.get_thread(message_id)
+        warnings: list[str] = []
+        thread = mail.get_thread(message_id, on_warning=warnings.append)
 
         operation_logger.log_operation(
             "get_thread", {"message_id": message_id}, "success"
         )
 
-        return {
+        response: dict[str, Any] = {
             "success": True,
             "thread": thread,
             "count": len(thread),
         }
+        if warnings:
+            response["warnings"] = warnings
+        return response
 
     except MailMessageNotFoundError as e:
         logger.error(f"Message not found: {e}")
