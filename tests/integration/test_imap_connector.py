@@ -1,15 +1,17 @@
-"""Integration tests for ImapConnector against real iCloud.
+"""Integration tests for ImapConnector against a real IMAP server.
 
-Guarded by ``MAIL_TEST_MODE=true``. Requires a Keychain entry:
+Guarded by ``MAIL_TEST_MODE=true``. The account comes from
+``MAIL_TEST_ACCOUNT``; its host, port and login are read from Mail.app.
+The app password comes from a Keychain entry keyed to that login::
 
     security add-generic-password \\
-        -s "apple-mail-mcp.imap.iCloud" \\
-        -a "s.morgan.jeffries@icloud.com" \\
+        -s "apple-mail-mcp.imap.<account name>" \\
+        -a "<login Mail.app uses for the account>" \\
         -w "<APP_PASSWORD>" -T "" -U
 
-Run:
+Run::
 
-    MAIL_TEST_MODE=true MAIL_TEST_ACCOUNT=iCloud \\
+    MAIL_TEST_MODE=true MAIL_TEST_ACCOUNT=<account name> \\
         uv run pytest tests/integration/test_imap_connector.py -v
 """
 
@@ -22,11 +24,7 @@ import pytest
 from apple_mail_mcp.exceptions import MailKeychainEntryNotFoundError
 from apple_mail_mcp.imap_connector import ImapConnector
 from apple_mail_mcp.keychain import get_imap_password
-
-ICLOUD_HOST = "imap.mail.me.com"
-ICLOUD_PORT = 993
-ICLOUD_ACCOUNT_NAME = "iCloud"
-ICLOUD_EMAIL = "s.morgan.jeffries@icloud.com"
+from apple_mail_mcp.mail_connector import AppleMailConnector
 
 
 def _test_mode_enabled() -> bool:
@@ -35,12 +33,11 @@ def _test_mode_enabled() -> bool:
 
 @pytest.mark.integration
 @pytest.mark.skipif(not _test_mode_enabled(), reason="MAIL_TEST_MODE != 'true'")
-class TestEndToEndICloud:
-    def test_end_to_end_search_returns_list(self):
-        password = get_imap_password(ICLOUD_ACCOUNT_NAME, ICLOUD_EMAIL)
-        connector = ImapConnector(
-            ICLOUD_HOST, ICLOUD_PORT, ICLOUD_EMAIL, password
-        )
+class TestEndToEnd:
+    def test_end_to_end_search_returns_list(self, test_account: str):
+        host, port, email = AppleMailConnector()._resolve_imap_config(test_account)
+        password = get_imap_password(test_account, email)
+        connector = ImapConnector(host, port, email, password)
         result = connector.search_messages(limit=5)
         assert isinstance(result, list)
         # May be empty (per PR #70 spike finding — merged-away Apple ID's

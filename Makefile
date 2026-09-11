@@ -31,6 +31,7 @@ test-unit:
 	uv run pytest tests/unit/ -q
 
 test-integration:
+	@test -n "$$MAIL_TEST_ACCOUNT" || { echo "MAIL_TEST_ACCOUNT is not set. Integration tests run against exactly the account it names; there is no default." >&2; exit 2; }
 	MAIL_TEST_MODE=true uv run pytest tests/integration/ --run-integration -v
 
 test-e2e:

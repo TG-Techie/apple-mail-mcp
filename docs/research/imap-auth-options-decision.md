@@ -47,7 +47,7 @@ This decision evaluates the five alternatives catalogued during that spike.
 
 ```
 Service:  apple-mail-mcp.imap.iCloud
-Account:  s.morgan.jeffries@icloud.com
+Account:  <account login>
 Server:   imap.mail.me.com:993
 
 [4426.1 ms] Keychain lookup OK (password length 19)
@@ -81,9 +81,9 @@ The 4.4-second Keychain lookup is a one-time prompt the first time the `security
 STAGE 1: Locate 'gena=Google OAuth' Keychain items
   Found 2 item(s):
     service='Fantastical CalDAV: apidata.googleusercontent.com'
-      account='s.morgan.jeffries@gmail.com'
+      account='<redacted: a personal Google login>'
     service='Fantastical Exchange: outlook.office365.com'
-      account='sjeffries@geisinger.edu'
+      account='<redacted: a work Exchange login>'
 ```
 
 **Finding.** Both `gena="Google OAuth"` items in the login Keychain are owned by **Fantastical**, not Mail.app. Mail.app does not create any login-keychain items with this attribute. Its Google OAuth material lives outside the user-readable login keychain — in the Data Protection Keychain or the Accounts framework DB, both TCC-protected.

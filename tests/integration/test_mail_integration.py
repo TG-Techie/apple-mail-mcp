@@ -9,7 +9,7 @@ These tests require:
    - MAIL_TEST_MODE=true
    - MAIL_TEST_ACCOUNT=<test account name>
 
-Run with: MAIL_TEST_MODE=true MAIL_TEST_ACCOUNT=TestAccount pytest --run-integration
+Run with: MAIL_TEST_MODE=true MAIL_TEST_ACCOUNT=<test account name> pytest --run-integration
 """
 
 import datetime as _dt
@@ -32,17 +32,6 @@ pytestmark = pytest.mark.skipif(
 def connector() -> AppleMailConnector:
     """Create a real connector instance."""
     return AppleMailConnector()
-
-
-@pytest.fixture
-def test_account() -> str:
-    """
-    Return the test account name from MAIL_TEST_ACCOUNT env var.
-
-    This matches the account name the server.py safety gate verifies.
-    """
-    import os
-    return os.getenv("MAIL_TEST_ACCOUNT", "Gmail")
 
 
 class TestMailIntegration:

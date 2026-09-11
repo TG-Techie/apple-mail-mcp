@@ -13,7 +13,7 @@ Requires the `research` optional dependency group:
 Precondition: generate an app-specific password at appleid.apple.com and store
 it in the Keychain:
     security add-generic-password \\
-        -s "apple-mail-mcp.imap.iCloud" \\
+        -s "apple-mail-mcp.imap.<account name>" \\
         -a "<your-icloud-email>" \\
         -w "<APP_PASSWORD>" \\
         -T "" -U
@@ -36,8 +36,10 @@ from email.utils import parsedate_to_datetime
 from imapclient import IMAPClient
 from imapclient.exceptions import LoginError
 
-DEFAULT_ACCOUNT_NAME = "iCloud"
-DEFAULT_EMAIL = "s.morgan.jeffries@icloud.com"
+# The account name and login are arguments with no default: they identify
+# a mailbox, and a default here would be a literal for one person's.
+# The host and port default to Apple's published iCloud IMAP endpoint,
+# which is a property of the service rather than of any account.
 DEFAULT_HOST = "imap.mail.me.com"
 DEFAULT_PORT = 993
 SERVICE_NAME_PREFIX = "apple-mail-mcp.imap."
@@ -213,10 +215,10 @@ def run(email: str, account_name: str, host: str, port: int) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--email", default=DEFAULT_EMAIL,
-                        help=f"iCloud email address (default: {DEFAULT_EMAIL})")
-    parser.add_argument("--account-name", default=DEFAULT_ACCOUNT_NAME,
-                        help=f"Mail.app account name (default: {DEFAULT_ACCOUNT_NAME})")
+    parser.add_argument("--email", required=True,
+                        help="Login for the IMAP account (the Keychain entry's account)")
+    parser.add_argument("--account-name", required=True,
+                        help="Mail.app account name (suffix of the Keychain service name)")
     parser.add_argument("--host", default=DEFAULT_HOST,
                         help=f"IMAP host (default: {DEFAULT_HOST})")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT,

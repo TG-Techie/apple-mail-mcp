@@ -19,7 +19,7 @@
 **Environment:**
 - `uv pip install -e '.[dev]'` — verify `pytest` and `mypy` work.
 - `uv run python -c "from imapclient import IMAPClient; print(IMAPClient.__module__)"` — verify imapclient is importable (already installed via `research` extra from #70).
-- Your existing `apple-mail-mcp.imap.iCloud` Keychain entry from PR #70's spike is reused by the integration test. If it's been deleted, re-create via `security add-generic-password -s "apple-mail-mcp.imap.iCloud" -a s.morgan.jeffries@icloud.com -w <APP_PASSWORD> -T "" -U` before running integration tests.
+- Your existing `apple-mail-mcp.imap.iCloud` Keychain entry from PR #70's spike is reused by the integration test. If it's been deleted, re-create via `security add-generic-password -s "apple-mail-mcp.imap.iCloud" -a <account login> -w <APP_PASSWORD> -T "" -U` before running integration tests.
 
 **What NOT to touch (design doc's "Out of scope"):**
 - `src/apple_mail_mcp/mail_connector.py`
@@ -1430,7 +1430,7 @@ This test runs against your real iCloud account. Requires the Keychain entry fro
 **Step 1: Verify precondition**
 
 ```
-security find-generic-password -s "apple-mail-mcp.imap.iCloud" -a "s.morgan.jeffries@icloud.com" >/dev/null 2>&1 && echo "OK" || echo "MISSING — recreate per the decision doc before running integration tests"
+security find-generic-password -s "apple-mail-mcp.imap.iCloud" -a "<account login>" >/dev/null 2>&1 && echo "OK" || echo "MISSING — recreate per the decision doc before running integration tests"
 ```
 
 If MISSING, add the entry before proceeding.
@@ -1444,7 +1444,7 @@ If MISSING, add the entry before proceeding.
 Guarded by MAIL_TEST_MODE=true. Requires a Keychain entry:
     security add-generic-password \\
         -s "apple-mail-mcp.imap.iCloud" \\
-        -a "s.morgan.jeffries@icloud.com" \\
+        -a "<account login>" \\
         -w "<APP_PASSWORD>" -T "" -U
 
 Run: MAIL_TEST_MODE=true MAIL_TEST_ACCOUNT=iCloud \\
@@ -1464,7 +1464,7 @@ from apple_mail_mcp.keychain import get_imap_password
 ICLOUD_HOST = "imap.mail.me.com"
 ICLOUD_PORT = 993
 ICLOUD_ACCOUNT_NAME = "iCloud"
-ICLOUD_EMAIL = "s.morgan.jeffries@icloud.com"
+ICLOUD_EMAIL = "<account login>"  # placeholder in this plan; the test reads it from Mail.app
 
 
 def _test_mode_enabled() -> bool:
