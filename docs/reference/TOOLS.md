@@ -775,7 +775,7 @@ Delete messages — always moves them to the account's Trash mailbox.
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `message_ids` | list[string] | Yes | - | List of message IDs to delete |
-| `permanent` | boolean | No | False | Reserved; currently a no-op. Passing `True` emits a `DeprecationWarning`. See [issue #111](https://github.com/s-morgan-jeffries/apple-mail-mcp/issues/111). |
+| `permanent` | boolean | No | False | Reserved; currently a no-op. Passing `True` returns `permanent: false` and a `warning`. See [issue #111](https://github.com/s-morgan-jeffries/apple-mail-mcp/issues/111). |
 | `account` | string \| null | No | null | Account name (or UUID). Pair with `source_mailbox` to narrow the scan and unlock the IMAP fast path (#150). |
 | `source_mailbox` | string \| null | No | null | Mailbox the messages live in. Required to unlock the IMAP fast path (#150) — without it, the delete runs via AppleScript even when IMAP is configured. Either alone (without `account`) raises `validation_error`. |
 
@@ -792,7 +792,10 @@ Delete messages — always moves them to the account's Trash mailbox.
 
 `count` is how many messages were actually moved; compare it with
 `requested`, since an id that matched nothing is skipped rather than
-reported.
+reported. `permanent` reports what happened and is always `false`:
+Mail.app exposes no way to bypass Trash (#111), so asking for
+`permanent=True` returns `false` with a `warning` saying the messages
+went to Trash.
 
 **Examples:**
 
@@ -814,7 +817,7 @@ delete_messages(
 
 **Note on `permanent`:**
 
-Mail.app's AppleScript dictionary exposes no path to permanent-delete that bypasses Trash. Calling `delete msg` always moves to the account's Trash; calling `delete` again on a message already in Trash is a no-op, and there is no `empty trash` command. The `permanent` parameter is preserved for API compatibility but currently has no effect; passing `True` raises a `DeprecationWarning` so the gap is visible. Track #111 for status.
+Mail.app's AppleScript dictionary exposes no path to permanent-delete that bypasses Trash. Calling `delete msg` always moves to the account's Trash; calling `delete` again on a message already in Trash is a no-op, and there is no `empty trash` command. The `permanent` parameter is preserved for API compatibility but currently has no effect; passing `True` returns `permanent: false` and a `warning` in the response so the gap is visible to the caller (the connector's `DeprecationWarning` fires in the server process, where an MCP client cannot see it). Track #111 for status.
 
 **Safety Notes:**
 - Bulk deletions limited to 100 messages for safety

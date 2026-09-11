@@ -1867,9 +1867,10 @@ def delete_messages(
         message_ids: List of message IDs to delete
         permanent: Reserved; currently a no-op. Mail.app's AppleScript
             dictionary exposes no path to permanent-delete that bypasses
-            Trash (issue #111). Passing True emits a DeprecationWarning;
-            messages still go to Trash. Recoverable from the account's
-            Trash mailbox until that mailbox is emptied.
+            Trash (issue #111). Passing True returns `permanent: false`
+            and a `warning` saying so; messages still go to Trash.
+            Recoverable from the account's Trash mailbox until that
+            mailbox is emptied.
         account: Optional account name (or UUID) the messages live in.
             Must be provided together with `source_mailbox`. When both
             are given, the operation is much faster.
@@ -1935,18 +1936,28 @@ def delete_messages(
             {
                 "message_ids": message_ids,
                 "count": count,
-                "permanent": permanent,
+                "permanent_requested": permanent,
                 "account": account,
                 "source_mailbox": source_mailbox,
             },
             "success",
         )
-        return {
+        # `permanent` reports what happened, not what was asked: nothing
+        # bypasses Trash (issue #111), and the connector's DeprecationWarning
+        # fires in this process where no MCP client can see it.
+        response: dict[str, Any] = {
             "success": True,
             "count": count,
             "requested": len(message_ids),
-            "permanent": permanent,
+            "permanent": False,
         }
+        if permanent:
+            response["warning"] = (
+                "permanent=True was asked for, but Mail.app exposes no way "
+                "to bypass Trash; the messages were moved to Trash and are "
+                "recoverable from there until it is emptied (issue #111)."
+            )
+        return response
 
     except ValueError as e:
         logger.error(f"Validation error: {e}")
