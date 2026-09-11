@@ -374,3 +374,48 @@ class TestPushTargets:
         assert "\t" not in out[0]
         assert [len(line.split("\x1f")) for line in out] == [6, 6]
         assert out[1].split("\x1f")[3:] == ["", "origin", "main"]
+
+
+class TestQuotedStringsMaySpanLines:
+    """A commit message written as a multi-line -m "..." is one word.
+
+    The scanner tokenized line by line, so a double-quoted string that
+    continued onto the next line was an unbalanced quote on its first
+    line: the line fell to the degraded fallback, which attributes every
+    git word to the base directory. Measured 2026-09-11: ``cd <other
+    repo> && git commit -m "two
+
+    lines"`` was refused as a commit to *this* repository's main. A guard
+    that fires on real work is a guard the next person weakens.
+    """
+
+    def test_multiline_message_in_another_repo_is_attributed_there(self) -> None:
+        (inv,) = scan_git_commands('cd /other && git commit -q -m "one\n\nthree"', BASE)
+        assert inv.subcommand == "commit"
+        assert inv.directory == "/other"
+        assert inv.degraded is False
+
+    def test_a_git_word_inside_the_message_is_not_a_command(self) -> None:
+        cmd = 'cd /other && git commit -m "why\n\nbecause git push failed"'
+        assert subcommands(cmd) == ["commit"]
+
+    def test_commands_on_later_lines_are_still_separate(self) -> None:
+        cmd = 'git add a\ngit commit -m "x"\ngit push origin main'
+        assert subcommands(cmd) == ["add", "commit", "push"]
+
+    def test_cd_on_one_line_applies_to_the_next(self) -> None:
+        cmd = "cd /other\ngit commit -m x"
+        assert dirs_for(cmd, "commit") == ["/other"]
+
+    def test_an_unbalanced_quote_still_degrades_toward_detection(self) -> None:
+        (inv,) = scan_git_commands('git commit -m "never closed', BASE)
+        assert inv.subcommand == "commit"
+        assert inv.degraded is True
+
+    def test_fallback_still_tracks_cd_from_earlier_lines(self) -> None:
+        """When one line is unparseable, the lines before it were read
+        properly and their cd applies to the guess."""
+        cmd = 'cd /other\ngit commit -m "never closed'
+        (inv,) = scan_git_commands(cmd, BASE)
+        assert inv.degraded is True
+        assert inv.directory == "/other"

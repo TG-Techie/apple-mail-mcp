@@ -37,10 +37,22 @@ from dataclasses import dataclass
 
 __all__ = ["GitInvocation", "scan_git_commands"]
 
-# Tokens that end one command and begin another. Everything after one of
-# these starts a fresh argv, which is what the old anchored regex could
-# not see.
-_SEPARATORS = {"&&", "||", ";", "|", "&", "\n"}
+# Characters that end one command and begin another. Everything after a
+# run of these starts a fresh argv, which is what the old anchored regex
+# could not see. shlex groups a run of punctuation into one token, so
+# `&&\n` arrives as a single token; a token made only of these
+# characters is a separator whatever its length.
+_SEPARATOR_CHARS = frozenset("&|;\n")
+
+# shlex's default punctuation set, plus newline — so a newline is a
+# separator token rather than whitespace, and the whole command can be
+# tokenized at once. Line-by-line tokenization broke a double-quoted
+# string that continued onto the next line (a multi-line commit
+# message): its first line was an unbalanced quote, fell to the
+# degraded fallback, and was attributed to the base directory rather
+# than the one a preceding `cd` had moved to. Measured 2026-09-11 as a
+# commit into another repository refused as a commit to this one's main.
+_PUNCTUATION = "();<>|&\n"
 
 # git's own global options, before the subcommand. Those in this set
 # consume the following token as their value, so the value is never
@@ -108,10 +120,22 @@ def _is_git(word: str) -> bool:
     return word == "git" or word.endswith("/git")
 
 
+def _is_separator(token: str) -> bool:
+    return bool(token) and set(token) <= _SEPARATOR_CHARS
+
+
+def _tokenize(text: str) -> list[str]:
+    """Tokenize shell text; raises ValueError on an unbalanced quote."""
+    lexer = shlex.shlex(text, posix=True, punctuation_chars=_PUNCTUATION)
+    lexer.whitespace = " \t\r"
+    lexer.whitespace_split = True
+    return list(lexer)
+
+
 def _split_segments(tokens: list[str]) -> list[list[str]]:
     segments: list[list[str]] = [[]]
     for token in tokens:
-        if token in _SEPARATORS:
+        if _is_separator(token):
             segments.append([])
         else:
             segments[-1].append(token)
@@ -282,6 +306,37 @@ def _strip_heredoc_bodies(command: str) -> list[str]:
     return kept
 
 
+def _scan_segments(
+    segments: list[list[str]], cwd: str, invocations: list[GitInvocation]
+) -> str:
+    """Read each argv in order, tracking ``cd``; returns the final cwd."""
+    for words in segments:
+        stripped = _strip_env_assignments(words)
+        if not stripped:
+            continue
+
+        if stripped[0] == "cd" and len(stripped) > 1:
+            cwd = _resolve(cwd, stripped[1])
+            continue
+
+        if not _is_git(stripped[0]):
+            continue
+
+        result = _subcommand_and_dir(stripped, cwd)
+        if result is not None:
+            subcommand, directory, branch_target, remote, refspec = result
+            invocations.append(
+                GitInvocation(
+                    subcommand,
+                    directory,
+                    branch_target=branch_target,
+                    remote=remote,
+                    refspec=refspec,
+                )
+            )
+    return cwd
+
+
 def scan_git_commands(command: str, base_dir: str) -> list[GitInvocation]:
     """Find every git invocation in ``command``.
 
@@ -294,47 +349,29 @@ def scan_git_commands(command: str, base_dir: str) -> list[GitInvocation]:
         Empty when the line runs no git commands.
     """
     invocations: list[GitInvocation] = []
-    cwd = base_dir
+    text = "\n".join(_strip_heredoc_bodies(command))
 
-    for line in _strip_heredoc_bodies(command):
-        if not line.strip():
-            continue
-
-        lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
-        lexer.whitespace_split = True
-        try:
-            tokens = list(lexer)
-        except ValueError:
-            # Unbalanced quote or similar. Guess toward detection: see
-            # _fallback, and the module docstring on why not returning [].
-            invocations.extend(_fallback(line, cwd))
-            continue
-
-        for words in _split_segments(tokens):
-            stripped = _strip_env_assignments(words)
-            if not stripped:
+    try:
+        tokens = _tokenize(text)
+    except ValueError:
+        # Unbalanced quote or similar. Read the command line by line so
+        # the lines that do parse are still read properly, in order and
+        # with `cd` tracked; only the broken line is guessed at. Guess
+        # toward detection: see _fallback, and the module docstring on
+        # why not returning [].
+        cwd = base_dir
+        for line in text.split("\n"):
+            if not line.strip():
                 continue
-
-            if stripped[0] == "cd" and len(stripped) > 1:
-                cwd = _resolve(cwd, stripped[1])
+            try:
+                line_tokens = _tokenize(line)
+            except ValueError:
+                invocations.extend(_fallback(line, cwd))
                 continue
+            cwd = _scan_segments(_split_segments(line_tokens), cwd, invocations)
+        return invocations
 
-            if not _is_git(stripped[0]):
-                continue
-
-            result = _subcommand_and_dir(stripped, cwd)
-            if result is not None:
-                subcommand, directory, branch_target, remote, refspec = result
-                invocations.append(
-                    GitInvocation(
-                        subcommand,
-                        directory,
-                        branch_target=branch_target,
-                        remote=remote,
-                        refspec=refspec,
-                    )
-                )
-
+    _scan_segments(_split_segments(tokens), base_dir, invocations)
     return invocations
 
 

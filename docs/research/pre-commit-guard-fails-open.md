@@ -557,3 +557,27 @@ down; `git push origin :old` (a delete) → stands down; `git push origin $B` �
 tell what was pushed; the merge idiom above, against an already-pushed commit → finds the Tests
 run in the origin repository and reports its conclusion.
 
+## Observation 11 — a multi-line commit message was an unbalanced quote
+
+Found 2026-09-11 by being refused. `cd ~/AgentAccessFleet/sop && git commit -m "line one
+
+line three"` — a commit into a *different* repository — was refused as a commit to this
+repository's `main`, with the note that the refusal came from the conservative fallback scan.
+
+The scanner tokenized the command **line by line**. A double-quoted string that continues onto
+the next line is, on its first line alone, an unbalanced quote; that line fell to the degraded
+fallback, and the fallback attributes every git word it sees to the base directory — the `cd`
+on the same line was never read. Degraded-and-wrong-directory, on `main`, is a refusal.
+
+The command is now tokenized whole, with newline a separator token rather than whitespace. The
+line-by-line reading remains as the fallback for text that does not tokenize at all, so an
+unbalanced quote still degrades toward detection, and the lines before it are still read
+properly with their `cd` tracked.
+
+Acceptance, measured against the installed guard, on `main`: `cd /tmp && git commit -m "one⏎⏎
+three"` 0; `git commit -m x` 2; `git commit -m "never closed` 2 (degraded). On a feature branch:
+the nine cases from Observation 10 unchanged.
+
+This is the false-positive side of the same coin as Observations 7 to 10. A guard that fires on
+real work is a guard the next person weakens.
+
