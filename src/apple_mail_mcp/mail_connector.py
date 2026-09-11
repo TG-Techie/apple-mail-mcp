@@ -287,7 +287,7 @@ def _attachment_walk_block(
 
     1. **Per-property guard (inner).** Every property is read into its own
        variable under its own ``try``; the record is assembled from those
-       variables. Observed 2026-08-27 against Agents' iCloud INBOX
+       variables. Observed 2026-08-27 against the iCloud test account's INBOX
        messages 1463-1466: ``MIME type of att`` raises
        errAEEventNotHandled (-10000) while ``name`` / ``file size`` /
        ``downloaded`` of the SAME attachment read cleanly. Because the

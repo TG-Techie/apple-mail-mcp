@@ -4,7 +4,7 @@ Recorded 2026-08-27 against the live machine. Format follows
 `imessage-mcp/docs/EPISTEMICS.md`: observations with the command that
 produced them first, derivations labeled and secondary.
 
-Environment: macOS Darwin 25.5.0, Mail.app, account "Agents' iCloud".
+Environment: macOS Darwin 25.5.0, Mail.app, the iCloud test account.
 
 ## Observation 1 — the reported symptom, through our own code
 
