@@ -452,7 +452,9 @@ def check_test_mode_safety(
       (when explicit recipients are supplied).
     - Rule-mutation operations must target rules whose names start with
       RULE_TEST_PREFIX (protects the user's real rules during integration
-      testing).
+      testing), and a rule that forwards may forward only to RFC 2606
+      reserved domains: its ``forward_to`` is a send that repeats for
+      every matching message, passed here as ``recipients``.
     """
     if not _is_test_mode_enabled():
         return None
@@ -511,12 +513,27 @@ def check_test_mode_safety(
                 f"send (implicit-reply targets cannot be safety-verified "
                 f"before send).",
             )
-        bad = [r for r in recipients if not _is_reserved_test_domain(r)]
-        if bad:
-            return _safety_error(
-                operation,
-                f"Test mode: recipients must use RFC 2606 reserved domains "
-                f"(example.com/.test/.invalid/etc.). Violations: {', '.join(bad)}",
-            )
+        return _reserved_domain_violation(operation, recipients)
+
+    # A rule that forwards sends to its targets on every match. Most rules
+    # forward nothing, so an empty list is the ordinary case here, not the
+    # derived-recipient hazard it is for a send.
+    if operation in RULE_GATED_OPERATIONS and recipients:
+        return _reserved_domain_violation(operation, recipients)
 
     return None
+
+
+def _reserved_domain_violation(
+    operation: str, recipients: list[str]
+) -> dict[str, Any] | None:
+    """The safety error for any recipient off the RFC 2606 reserved
+    domains, or None when every one is on them."""
+    bad = [r for r in recipients if not _is_reserved_test_domain(r)]
+    if not bad:
+        return None
+    return _safety_error(
+        operation,
+        f"Test mode: recipients must use RFC 2606 reserved domains "
+        f"(example.com/.test/.invalid/etc.). Violations: {', '.join(bad)}",
+    )

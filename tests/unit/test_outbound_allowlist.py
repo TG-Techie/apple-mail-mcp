@@ -27,6 +27,7 @@ from apple_mail_mcp.outbound_allowlist import (
     COMMS_CONFIG_ENV,
     all_recipients_allowed,
     allowlist_patterns,
+    assert_forward_targets_allowed,
     assert_recipients_allowed_for_send,
     disallowed_recipients,
     single_address,
@@ -487,3 +488,56 @@ class TestAssertRecipientsAllowedForSend:
         assert_recipients_allowed_for_send(
             to=["test@example.com"], cc=None, bcc=None
         )
+
+
+class TestAssertForwardTargetsAllowed:
+    """A rule that forwards is a standing send: every message it matches
+    from then on goes to its targets, with nobody reading each one. The
+    targets are held to the outbound allowlist exactly as a send's
+    recipients are."""
+
+    @pytest.fixture
+    def yaml_cfg(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> Path:
+        cfg = tmp_path / "comms.yaml"
+        cfg.write_text("email:\n  allowed_outbound:\n    - '*@partner.example'\n")
+        monkeypatch.setenv(COMMS_CONFIG_ENV, str(cfg))
+        monkeypatch.delenv("MAIL_TEST_MODE", raising=False)
+        return cfg
+
+    def test_on_list_targets_pass_silently(self, yaml_cfg: Path) -> None:
+        assert_forward_targets_allowed(["a@partner.example", "b@partner.example"])
+
+    def test_any_off_list_target_raises_and_is_named(
+        self, yaml_cfg: Path
+    ) -> None:
+        with pytest.raises(MailOutboundDisallowedError) as exc:
+            assert_forward_targets_allowed(
+                ["a@partner.example", "leak@elsewhere.example"]
+            )
+        assert "leak@elsewhere.example" in str(exc.value)
+        assert "forward_to" in str(exc.value)
+
+    def test_a_target_carrying_two_addresses_is_refused(
+        self, yaml_cfg: Path
+    ) -> None:
+        """The connector joins the targets with commas into one Mail
+        field, so a target that is itself two addresses would smuggle a
+        second recipient past the check."""
+        with pytest.raises(MailOutboundDisallowedError):
+            assert_forward_targets_allowed(
+                ["a@partner.example, leak@elsewhere.example"]
+            )
+
+    def test_no_targets_raise(self, yaml_cfg: Path) -> None:
+        with pytest.raises(MailOutboundDisallowedError):
+            assert_forward_targets_allowed([])
+
+    def test_unavailable_config_fails_closed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(COMMS_CONFIG_ENV, _NO_YAML)
+        monkeypatch.delenv("MAIL_TEST_MODE", raising=False)
+        with pytest.raises(OutboundAllowlistUnavailableError):
+            assert_forward_targets_allowed(["a@partner.example"])

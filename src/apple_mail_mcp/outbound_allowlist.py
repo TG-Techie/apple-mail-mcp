@@ -12,7 +12,9 @@ Imported by BOTH:
 Both layers MUST consult this module. Bypassing it on either side defeats
 the policy. Any new tool, helper, or AppleScript that could cause an
 outbound mail dispatch must call ``assert_recipients_allowed_for_send``
-before executing.
+before executing. A dispatch Mail performs later on the caller's behalf
+counts: a rule's ``forward_to`` goes through
+``assert_forward_targets_allowed`` before the rule is installed.
 
 ╔══════════════════════════════════════════════════════════════════════╗
 ║ POLICY — set by the human repo owner, 2026-05-20; revised 2026-08-24 ║
@@ -288,5 +290,32 @@ def assert_recipients_allowed_for_send(
     if bad:
         raise MailOutboundDisallowedError(
             "send blocked — recipients not on outbound allowlist: "
+            + ", ".join(repr(b) for b in bad)
+        )
+
+
+def assert_forward_targets_allowed(targets: list[str]) -> None:
+    """Hard policy gate for a rule's ``forward_to``.
+
+    A rule that forwards is a standing send: every message it matches
+    from then on goes to these addresses, with nobody reading each one.
+    So the targets meet the outbound allowlist exactly as a send's
+    recipients do, and an unreadable policy blocks the rule.
+
+    Raises ``MailOutboundDisallowedError`` when there is no target, when
+    a target is not one plain address (Mail takes the joined list as a
+    single field, so a target carrying two addresses would smuggle one
+    past the check), or when any target is off the allowlist; raises
+    ``OutboundAllowlistUnavailableError`` (a subclass) when the policy
+    cannot be read — FAIL CLOSED.
+    """
+    if not targets:
+        raise MailOutboundDisallowedError(
+            "rule blocked — forward_to names no address."
+        )
+    bad = disallowed_recipients(targets)
+    if bad:
+        raise MailOutboundDisallowedError(
+            "rule blocked — forward_to addresses not on outbound allowlist: "
             + ", ".join(repr(b) for b in bad)
         )

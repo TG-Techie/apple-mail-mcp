@@ -40,7 +40,10 @@ from .exceptions import (
 )
 from .imap_connector import ImapConnectionPool
 from .mail_connector import AppleMailConnector
-from .outbound_allowlist import all_recipients_allowed
+from .outbound_allowlist import (
+    all_recipients_allowed,
+    assert_forward_targets_allowed,
+)
 from .security import (
     check_rate_limit,
     check_test_mode_safety,
@@ -366,6 +369,34 @@ async def delete_rule(
         }
 
 
+def _rule_policy_gate(
+    operation: str,
+    rule_name: str,
+    actions: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """The policy gates a rule mutation passes before anything is asked
+    of the user or of Mail: the test-mode gate, which sees the rule's
+    name and, as recipients, whatever it forwards to; then the outbound
+    allowlist over those same targets. A forwarding rule is a standing
+    send, so it answers with the errors a blocked send gets. The
+    connector re-checks the allowlist; this is the fail-fast in front of
+    the confirmation prompt. Returns the first error, or None.
+    """
+    targets: list[str] = list((actions or {}).get("forward_to") or [])
+    safety_err = check_test_mode_safety(
+        operation, rule_name=rule_name, recipients=targets,
+    )
+    if safety_err:
+        return safety_err
+    if not targets:
+        return None
+    try:
+        assert_forward_targets_allowed(targets)
+    except MailOutboundDisallowedError as e:
+        return _outbound_policy_error(operation, e)
+    return None
+
+
 @mcp.tool()
 def create_rule(
     name: str,
@@ -398,7 +429,10 @@ def create_rule(
             - flag_color: 'none' | 'red' | 'orange' | 'yellow' | 'green' |
                 'blue' | 'purple' | 'gray'
             - delete: bool
-            - forward_to: list[str] of email addresses
+            - forward_to: list[str] of email addresses, each on the
+              outbound allowlist (a forwarding rule is a standing
+              send; an off-list target is refused with
+              ``outbound_disallowed`` and nothing is installed)
         match_logic: 'all' (AND across conditions) or 'any' (OR). Default 'all'.
         enabled: Whether the rule is enabled on creation. Default True.
 
@@ -410,11 +444,9 @@ def create_rule(
         if rate_err:
             return rate_err
 
-        safety_err = check_test_mode_safety(
-            "create_rule", rule_name=name
-        )
-        if safety_err:
-            return safety_err
+        gate_err = _rule_policy_gate("create_rule", name, actions)
+        if gate_err:
+            return gate_err
 
         new_index = mail.create_rule(
             name=name,
@@ -441,6 +473,10 @@ def create_rule(
             "name": name,
         }
 
+    except MailOutboundDisallowedError as e:
+        # The connector's own gate; reached only if the pre-check above
+        # and the connector disagree, so it answers the same way.
+        return _outbound_policy_error("create_rule", e)
     except ValueError as e:
         return {
             "success": False,
@@ -511,11 +547,9 @@ async def update_rule(
                 "error_type": "rule_not_found",
             }
 
-        safety_err = check_test_mode_safety(
-            "update_rule", rule_name=rule_name
-        )
-        if safety_err:
-            return safety_err
+        gate_err = _rule_policy_gate("update_rule", rule_name, actions)
+        if gate_err:
+            return gate_err
 
         needs_confirmation = (
             conditions is not None
@@ -574,6 +608,8 @@ async def update_rule(
             "error": str(e),
             "error_type": "unsupported_rule_action",
         }
+    except MailOutboundDisallowedError as e:
+        return _outbound_policy_error("update_rule", e)
     except ValueError as e:
         return {
             "success": False,
@@ -2287,13 +2323,12 @@ def _draft_error_response(e: MailDraftError) -> dict[str, Any]:
     return {"success": False, "error": str(e), "error_type": et}
 
 
-def _draft_action_error(op: str, e: Exception) -> dict[str, Any] | None:
-    """Map a catchable draft-action exception to a response dict.
-
-    Returns None if the exception isn't one we model here (caller should
-    fall through to a generic ``unknown`` mapping). Centralizing this
-    keeps the per-tool exception handling small enough to stay under
-    the cyclomatic-complexity threshold."""
+def _outbound_policy_error(
+    op: str, e: MailOutboundDisallowedError
+) -> dict[str, Any]:
+    """Map an outbound-allowlist refusal to a response dict. Shared by
+    every tool behind the allowlist — the send paths and the forwarding
+    rules — so a blocked forward answers exactly as a blocked send does."""
     from .exceptions import OutboundAllowlistUnavailableError
 
     if isinstance(e, OutboundAllowlistUnavailableError):
@@ -2306,14 +2341,24 @@ def _draft_action_error(op: str, e: Exception) -> dict[str, Any] | None:
             "error": str(e),
             "error_type": "allowlist_unavailable",
         }
+    # Policy gate — recipients off the outbound allowlist.
+    logger.warning(f"Outbound allowlist blocked {op}: {e}")
+    return {
+        "success": False,
+        "error": str(e),
+        "error_type": "outbound_disallowed",
+    }
+
+
+def _draft_action_error(op: str, e: Exception) -> dict[str, Any] | None:
+    """Map a catchable draft-action exception to a response dict.
+
+    Returns None if the exception isn't one we model here (caller should
+    fall through to a generic ``unknown`` mapping). Centralizing this
+    keeps the per-tool exception handling small enough to stay under
+    the cyclomatic-complexity threshold."""
     if isinstance(e, MailOutboundDisallowedError):
-        # Policy gate — recipients off the outbound allowlist.
-        logger.warning(f"Outbound allowlist blocked {op}: {e}")
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": "outbound_disallowed",
-        }
+        return _outbound_policy_error(op, e)
     if isinstance(e, MailMessageNotFoundError):
         return {"success": False, "error": str(e), "error_type": "message_not_found"}
     if isinstance(e, MailAccountNotFoundError):

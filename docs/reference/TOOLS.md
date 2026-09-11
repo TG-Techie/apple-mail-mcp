@@ -1194,7 +1194,7 @@ Create a new rule. Appended at the end of the rules list.
 
 - `name` (str, required): Display name. Need not be unique.
 - `conditions` (list, required, ≥1): List of `{field, operator, value}` records. `field` ∈ `from`, `to`, `subject`, `body`, `any_recipient`, `header_name`. `operator` ∈ `contains`, `does_not_contain`, `begins_with`, `ends_with`, `equals`. When `field=="header_name"`, an additional `header_name` key is required to specify which header to test.
-- `actions` (dict, required, ≥1 action): Any subset of `move_to`, `copy_to`, `mark_read`, `mark_flagged`, `flag_color`, `delete`, `forward_to`. `move_to`/`copy_to` take `{account, mailbox}`. `flag_color` ∈ `none`, `red`, `orange`, `yellow`, `green`, `blue`, `purple`, `gray` and is only meaningful with `mark_flagged: true`. `forward_to` is a list of email addresses.
+- `actions` (dict, required, ≥1 action): Any subset of `move_to`, `copy_to`, `mark_read`, `mark_flagged`, `flag_color`, `delete`, `forward_to`. `move_to`/`copy_to` take `{account, mailbox}`. `flag_color` ∈ `none`, `red`, `orange`, `yellow`, `green`, `blue`, `purple`, `gray` and is only meaningful with `mark_flagged: true`. `forward_to` is a list of email addresses, one address per entry, each on the outbound allowlist.
 - `match_logic` (str, default `"all"`): `"all"` requires every condition; `"any"` requires at least one.
 - `enabled` (bool, default `true`): Whether the rule is active immediately.
 
@@ -1205,6 +1205,8 @@ Create a new rule. Appended at the end of the rules list.
 ```
 
 No confirmation prompt — creation is additive and the rule can be deleted afterward.
+
+**A forwarding rule is a standing send.** Every message the rule matches, from then on, goes to its `forward_to` addresses with nobody reading each one, so those addresses meet the outbound allowlist exactly as a send's recipients do: an off-list address is refused with `error_type: "outbound_disallowed"`, an unreadable allowlist with `allowlist_unavailable`, and in either case nothing is installed. Under `MAIL_TEST_MODE`, `forward_to` may name only RFC 2606 reserved domains (`safety_violation` otherwise), as a send may.
 
 **Example:**
 
@@ -1228,7 +1230,7 @@ Patch a rule's properties. Only the fields you pass are changed. Also serves as 
 - `name` (str, optional): New display name.
 - `enabled` (bool, optional): New enabled state.
 - `match_logic` (str, optional): `"all"` or `"any"`.
-- `actions` (dict, optional): When provided, **replaces** the rule's actions wholesale (per the same schema as `create_rule`'s `actions`).
+- `actions` (dict, optional): When provided, **replaces** the rule's actions wholesale (per the same schema as `create_rule`'s `actions`). A `forward_to` is held to the outbound allowlist as in `create_rule`, and is refused before the confirmation prompt, so you are not asked to confirm a change that would then be blocked.
 
 **Conditional confirmation:** prompts the user via MCP elicitation only when the patch touches `conditions`, `actions`, or `match_logic` (irreversible replacements). Patches limited to `enabled` and/or `name` skip the prompt — both are trivially reversible.
 

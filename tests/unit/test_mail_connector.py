@@ -7697,3 +7697,98 @@ class TestRuleMutationsActOnTheConfirmedRule:
         ]
         with pytest.raises(MailRuleChangedError):
             connector.update_rule(2, enabled=False, expected_name="Junk filter")
+
+
+class TestAForwardingRuleIsAStandingSend:
+    """``forward_to`` on a rule sends every matching message, from then
+    on, to the addresses it names, with nobody reading each one. It was
+    the one way mail left through the connector without meeting the
+    outbound allowlist. The gate runs before any AppleScript, so a
+    refused rule touches nothing in Mail."""
+
+    _CONDITIONS = [{"field": "subject", "operator": "contains", "value": "Y"}]
+
+    @pytest.fixture
+    def connector(self) -> AppleMailConnector:
+        return AppleMailConnector(timeout=30)
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_create_refuses_an_off_list_target_before_touching_mail(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        from apple_mail_mcp.exceptions import MailOutboundDisallowedError
+
+        with pytest.raises(MailOutboundDisallowedError) as exc:
+            connector.create_rule(
+                name="X",
+                conditions=self._CONDITIONS,
+                actions={"forward_to": ["a@example.com", "outsider@other.com"]},
+            )
+        assert "outsider@other.com" in str(exc.value)
+        mock_run.assert_not_called()
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_update_refuses_an_off_list_target_before_touching_mail(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        from apple_mail_mcp.exceptions import MailOutboundDisallowedError
+
+        with pytest.raises(MailOutboundDisallowedError):
+            connector.update_rule(
+                rule_index=1,
+                actions={"forward_to": ["outsider@other.com"]},
+                expected_name="X",
+            )
+        mock_run.assert_not_called()
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_an_unreadable_policy_refuses_the_rule(
+        self,
+        mock_run: MagicMock,
+        connector: AppleMailConnector,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from apple_mail_mcp.exceptions import OutboundAllowlistUnavailableError
+        from apple_mail_mcp.outbound_allowlist import COMMS_CONFIG_ENV
+
+        monkeypatch.setenv(COMMS_CONFIG_ENV, "/nonexistent/comms.yaml")
+        monkeypatch.delenv("MAIL_TEST_MODE", raising=False)
+        with pytest.raises(OutboundAllowlistUnavailableError):
+            connector.create_rule(
+                name="X",
+                conditions=self._CONDITIONS,
+                actions={"forward_to": ["a@example.com"]},
+            )
+        mock_run.assert_not_called()
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_on_list_targets_reach_mail(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        mock_run.return_value = "1"
+        connector.create_rule(
+            name="X",
+            conditions=self._CONDITIONS,
+            actions={"forward_to": ["a@example.com"]},
+        )
+        assert 'set forward message of newRule to "a@example.com"' in (
+            mock_run.call_args[0][0]
+        )
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_a_rule_that_does_not_forward_consults_no_policy(
+        self,
+        mock_run: MagicMock,
+        connector: AppleMailConnector,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Only a forwarding rule sends anything, so only it meets the
+        allowlist; an unreadable policy must not block a move rule."""
+        from apple_mail_mcp.outbound_allowlist import COMMS_CONFIG_ENV
+
+        monkeypatch.setenv(COMMS_CONFIG_ENV, "/nonexistent/comms.yaml")
+        monkeypatch.delenv("MAIL_TEST_MODE", raising=False)
+        mock_run.return_value = "1"
+        assert connector.create_rule(
+            name="X", conditions=self._CONDITIONS, actions={"mark_read": True},
+        ) == 1

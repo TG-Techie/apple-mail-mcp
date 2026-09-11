@@ -713,3 +713,74 @@ class TestAccountGateCoversEveryAccountScopedMutation:
         monkeypatch.setenv("MAIL_TEST_ACCOUNT", "TestAccount")
 
         assert check_test_mode_safety(operation, account="TestAccount") is None
+
+
+class TestAForwardingRuleIsConfinedLikeASend:
+    """In test mode a send may only reach RFC 2606 reserved domains. A
+    rule's ``forward_to`` is a send that repeats for every matching
+    message, so an integration run creating one is held to the same
+    domains; the rule-name prefix alone says nothing about where the
+    mail goes."""
+
+    @pytest.mark.parametrize("operation", ["create_rule", "update_rule"])
+    def test_a_forward_to_a_real_domain_is_refused(
+        self, operation: str, monkeypatch: Any
+    ) -> None:
+        monkeypatch.setenv("MAIL_TEST_MODE", "true")
+        monkeypatch.setenv("MAIL_TEST_ACCOUNT", "TestAccount")
+        result = check_test_mode_safety(
+            operation,
+            rule_name="[apple-mail-mcp-test] forward",
+            recipients=["test@example.com", "real@person.com"],
+        )
+        assert result is not None
+        assert result["error_type"] == "safety_violation"
+        assert "real@person.com" in result["error"]
+
+    @pytest.mark.parametrize("operation", ["create_rule", "update_rule"])
+    def test_a_forward_to_reserved_domains_is_allowed(
+        self, operation: str, monkeypatch: Any
+    ) -> None:
+        monkeypatch.setenv("MAIL_TEST_MODE", "true")
+        monkeypatch.setenv("MAIL_TEST_ACCOUNT", "TestAccount")
+        assert (
+            check_test_mode_safety(
+                operation,
+                rule_name="[apple-mail-mcp-test] forward",
+                recipients=["test@example.com", "other@sub.test"],
+            )
+            is None
+        )
+
+    @pytest.mark.parametrize("operation", ["create_rule", "update_rule"])
+    def test_a_rule_that_does_not_forward_needs_no_recipients(
+        self, operation: str, monkeypatch: Any
+    ) -> None:
+        """Unlike a send, a rule with nothing to forward is the normal
+        case, not a derived-recipient hazard."""
+        monkeypatch.setenv("MAIL_TEST_MODE", "true")
+        monkeypatch.setenv("MAIL_TEST_ACCOUNT", "TestAccount")
+        assert (
+            check_test_mode_safety(
+                operation, rule_name="[apple-mail-mcp-test] move", recipients=None,
+            )
+            is None
+        )
+        assert (
+            check_test_mode_safety(
+                operation, rule_name="[apple-mail-mcp-test] move", recipients=[],
+            )
+            is None
+        )
+
+    def test_outside_test_mode_nothing_is_checked_here(
+        self, monkeypatch: Any
+    ) -> None:
+        """The allowlist, not this gate, governs production forwards."""
+        monkeypatch.delenv("MAIL_TEST_MODE", raising=False)
+        assert (
+            check_test_mode_safety(
+                "create_rule", rule_name="x", recipients=["real@person.com"],
+            )
+            is None
+        )

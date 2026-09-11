@@ -41,7 +41,10 @@ from .exceptions import (
 )
 from .imap_connector import ImapConnectionPool, ImapConnector
 from .keychain import get_imap_password
-from .outbound_allowlist import assert_recipients_allowed_for_send
+from .outbound_allowlist import (
+    assert_forward_targets_allowed,
+    assert_recipients_allowed_for_send,
+)
 from .utils import (
     applescript_account_clause,
     applescript_iso_date_statements,
@@ -895,7 +898,15 @@ class AppleMailConnector:
 
     def _validate_rule_actions(self, actions: dict[str, Any]) -> None:
         """Validate a RuleActions dict has at least one meaningful entry,
-        flag_color (if any) is valid, and forward_to emails are valid."""
+        flag_color (if any) is valid, and forward_to emails are valid and
+        on the outbound allowlist.
+
+        A forwarding rule is a standing send, and this is the one place
+        both create_rule and update_rule pass through before any
+        AppleScript runs, so the allowlist gate sits here: a refused
+        rule touches nothing in Mail. Raises MailOutboundDisallowedError
+        (or OutboundAllowlistUnavailableError, fail closed) for the
+        forward_to that the policy does not admit."""
         meaningful_keys = {
             "move_to", "copy_to", "mark_read", "mark_flagged",
             "delete", "forward_to",
@@ -920,6 +931,7 @@ class AppleMailConnector:
                         f"forward_to entries must be valid email "
                         f"addresses; got {addr!r}"
                     )
+            assert_forward_targets_allowed(active["forward_to"])
         for mb_key in ("move_to", "copy_to"):
             if mb_key in active:
                 ref = active[mb_key]
@@ -1008,6 +1020,9 @@ class AppleMailConnector:
 
         Raises:
             ValueError: If any input fails schema validation.
+            MailOutboundDisallowedError: If ``actions.forward_to`` names
+                an address off the outbound allowlist, or the allowlist
+                cannot be read. Nothing is installed.
         """
         if not name or not isinstance(name, str):
             raise ValueError("name must be a non-empty string")
@@ -1098,6 +1113,9 @@ class AppleMailConnector:
 
         Raises:
             ValueError: If any provided input fails schema validation.
+            MailOutboundDisallowedError: If ``actions.forward_to`` names
+                an address off the outbound allowlist, or the allowlist
+                cannot be read. Nothing is changed.
             MailRuleNotFoundError: If rule_index is out of range.
             MailUnsupportedRuleActionError: If the rule currently has an
                 action outside the supported schema.

@@ -1,6 +1,6 @@
 # Security Checklist
 
-Every new feature should be reviewed against the five concerns below before opening a PR. Each section names the canonical implementation in the codebase — reuse it rather than rolling your own. Linked file:line numbers are stable references; if a function moves, update this doc.
+Every new feature should be reviewed against the six concerns below before opening a PR. Each section names the canonical implementation in the codebase — reuse it rather than rolling your own. Linked file:line numbers are stable references; if a function moves, update this doc.
 
 ## Input sanitization
 
@@ -55,6 +55,10 @@ Every server-side tool wrapper must call [`operation_logger.log_operation`](../.
 
 This produces a record of what the server actually did — useful for debugging, for confirming that destructive operations were preceded by elicitation, and for users who want to inspect what an LLM caused to happen on their behalf. Each entry is kept in memory for the process and appended as one JSON line to `audit.jsonl` under the data home (`APPLE_MAIL_MCP_HOME`, default `~/.apple_mail_mcp`); the file is the record that outlives the process, since every agent session runs its own server. Send-path entries carry the recipients, subject and `from_account` as asked, never the body; entries for the other mutations carry what identifies the thing acted on and what was done to it (the message ids and the destination of a move, the conditions and actions of a rule, the counts asked for and achieved), so the file can answer what the server did to the user's mail without the session that did it. The file rolls over at `AUDIT_ROTATE_BYTES` with one previous generation kept, so it is bounded on disk. A log that cannot be written is reported as a warning and the operation it records still stands. The file is personal data at rest — see "User Data on Disk" in `.claude/CLAUDE.md` for how it is handled.
 
+## The outbound allowlist
+
+Any path by which mail leaves must meet the outbound allowlist in [`outbound_allowlist.py`](../../src/apple_mail_mcp/outbound_allowlist.py) before it is taken, at the connector as well as at the tool, and fail closed when the policy cannot be read. "Leaves" is judged by consequence, not by whether the code calls `send`: a send now, a draft sent later, and a rule whose `forward_to` has Mail send on every match are all the same act. Every recipient is checked, each entry must be exactly one address, and a recipient Mail would derive on its own (a reply's `to`, a reply-all's `cc`) must be made explicit or read back from Mail and checked, never trusted. The gates are `assert_recipients_allowed_for_send` for a send and `assert_forward_targets_allowed` for a rule; the response for a refusal is `outbound_disallowed`, or `allowlist_unavailable` when the policy is unreadable. The forwarding rule was the path this concern was written from: it met an email-syntax check and nothing else until 2026-09-11.
+
 ## When in doubt
 
-Search for an existing tool wrapper that does something analogous to what you're building (e.g. another mutation tool, another file-I/O tool) and copy its gate sequence. The five concerns above are addressed in roughly the same order in every tool — reusing the established pattern is much safer than reinventing it.
+Search for an existing tool wrapper that does something analogous to what you're building (e.g. another mutation tool, another file-I/O tool) and copy its gate sequence. The six concerns above are addressed in roughly the same order in every tool — reusing the established pattern is much safer than reinventing it.

@@ -646,6 +646,89 @@ class TestUpdateRule:
         assert result["error_type"] == "unsupported_rule_action"
 
 
+class TestAForwardingRuleMeetsTheAllowlistAtTheTool:
+    """A rule's ``forward_to`` is a standing send, so the tools hold it to
+    the outbound allowlist before anything is asked of the user or of
+    Mail, and answer with the same error types a blocked send gets. The
+    connector re-checks; this is the fail-fast in front of the prompt."""
+
+    _CONDITIONS = [{"field": "subject", "operator": "contains", "value": "X"}]
+
+    def test_create_refuses_an_off_list_target(
+        self, mock_mail: MagicMock
+    ) -> None:
+        result = create_rule(
+            name="Forward it",
+            conditions=self._CONDITIONS,
+            actions={"forward_to": ["outsider@other.com"]},
+        )
+        assert result["success"] is False
+        assert result["error_type"] == "outbound_disallowed"
+        assert "outsider@other.com" in result["error"]
+        mock_mail.create_rule.assert_not_called()
+
+    def test_create_fails_closed_when_the_policy_is_unreadable(
+        self, mock_mail: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(
+            "APPLE_MAIL_MCP_COMMS_CONFIG", "/nonexistent/comms.yaml"
+        )
+        monkeypatch.delenv("MAIL_TEST_MODE", raising=False)
+        result = create_rule(
+            name="Forward it",
+            conditions=self._CONDITIONS,
+            actions={"forward_to": ["a@example.com"]},
+        )
+        assert result["success"] is False
+        assert result["error_type"] == "allowlist_unavailable"
+        mock_mail.create_rule.assert_not_called()
+
+    def test_create_with_on_list_targets_proceeds(
+        self, mock_mail: MagicMock
+    ) -> None:
+        mock_mail.create_rule.return_value = 3
+        result = create_rule(
+            name="Forward it",
+            conditions=self._CONDITIONS,
+            actions={"forward_to": ["a@example.com"]},
+        )
+        assert result["success"] is True
+
+    async def test_update_refuses_an_off_list_target_before_the_prompt(
+        self, mock_mail: MagicMock, mock_ctx_accept: MagicMock
+    ) -> None:
+        """The user is not asked to confirm a change that will then be
+        refused."""
+        mock_mail.list_rules.return_value = [
+            {"index": 1, "name": "Junk filter", "enabled": True},
+        ]
+        result = await update_rule(
+            rule_index=1,
+            actions={"forward_to": ["outsider@other.com"]},
+            ctx=mock_ctx_accept,
+        )
+        assert result["success"] is False
+        assert result["error_type"] == "outbound_disallowed"
+        mock_ctx_accept.elicit.assert_not_awaited()
+        mock_mail.update_rule.assert_not_called()
+
+    def test_in_test_mode_a_forward_is_confined_to_reserved_domains(
+        self, mock_mail: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The test-mode gate sees the forward targets as it sees a
+        send's recipients; the rule-name prefix alone does not pass it."""
+        monkeypatch.setenv("MAIL_TEST_MODE", "true")
+        monkeypatch.setenv("MAIL_TEST_ACCOUNT", "TestAccount")
+        result = create_rule(
+            name="[apple-mail-mcp-test] forward",
+            conditions=self._CONDITIONS,
+            actions={"forward_to": ["a@example.com", "outsider@other.com"]},
+        )
+        assert result["success"] is False
+        assert result["error_type"] == "safety_violation"
+        mock_mail.create_rule.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # 1. list_mailboxes
 # ---------------------------------------------------------------------------
