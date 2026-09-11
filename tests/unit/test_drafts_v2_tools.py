@@ -1022,3 +1022,79 @@ class TestDraftSendHtml:
         assert result["success"] is False
         assert result["error_type"] == "outbound_disallowed"
         mock_mail._send_html_email.assert_not_called()
+
+
+class TestEmailSendHtmlIsConfinedInTestMode:
+    """Under MAIL_TEST_MODE the preferred send tool is held to RFC 2606
+    reserved domains like the draft tools, before the connector is
+    reached. An allowlisted address on a real domain is the case that
+    used to pass: the allowlist admitted it and the test-mode gate never
+    looked."""
+
+    @pytest.fixture
+    def allowlisted_real_domain(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+    ) -> None:
+        cfg = tmp_path / "comms.yaml"
+        cfg.write_text(
+            "email:\n  allowed_outbound:\n"
+            "    - '*@example.com'\n"
+            "    - '*@partner.com'\n"
+        )
+        monkeypatch.setenv("APPLE_MAIL_MCP_COMMS_CONFIG", str(cfg))
+        monkeypatch.setenv("MAIL_TEST_MODE", "true")
+        monkeypatch.setenv("MAIL_TEST_ACCOUNT", "TestAccount")
+
+    @pytest.mark.asyncio
+    async def test_an_allowlisted_real_domain_is_refused(
+        self,
+        isolated_drafts: None,
+        mock_mail: MagicMock,
+        allowlisted_real_domain: None,
+    ) -> None:
+        from apple_mail_mcp.server import email_send_html
+
+        result = await email_send_html(
+            to=["someone@partner.com"], subject="s", body="<p>b</p>",
+        )
+        assert result["success"] is False
+        assert result["error_type"] == "safety_violation"
+        assert "someone@partner.com" in result["error"]
+        mock_mail._send_html_email.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_reply_with_derived_recipients_is_refused(
+        self,
+        isolated_drafts: None,
+        mock_mail: MagicMock,
+        allowlisted_real_domain: None,
+    ) -> None:
+        """Outside test mode the connector reads the derived set back
+        from Mail and gates it; in test mode nothing can vouch for it
+        before the send, so it must be explicit."""
+        from apple_mail_mcp.server import email_send_html
+
+        result = await email_send_html(
+            reply_to="12345", body="<p>b</p>",
+        )
+        assert result["success"] is False
+        assert result["error_type"] == "safety_violation"
+        mock_mail._send_html_email.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_reserved_domain_still_sends(
+        self,
+        isolated_drafts: None,
+        mock_mail: MagicMock,
+        allowlisted_real_domain: None,
+    ) -> None:
+        from apple_mail_mcp.server import email_send_html
+
+        mock_mail._send_html_email.return_value = {
+            "draft_id": "", "sent_message_id": "",
+        }
+        result = await email_send_html(
+            to=["someone@example.com"], subject="s", body="<p>b</p>",
+        )
+        assert result["success"] is True
+        mock_mail._send_html_email.assert_called_once()

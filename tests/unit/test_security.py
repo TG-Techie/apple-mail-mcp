@@ -784,3 +784,41 @@ class TestAForwardingRuleIsConfinedLikeASend:
             )
             is None
         )
+
+
+class TestEverySendPathIsConfinedInTestMode:
+    """In test mode a send may reach only RFC 2606 reserved domains. The
+    set that says which operations are sends was hand-kept and named the
+    two draft tools, not email_send_html, the preferred send tool; its
+    recipients passed this gate unexamined, so an integration run could
+    mail anyone on the allowlist. The parametrize below is the list; a
+    tool added later that sends belongs in it."""
+
+    @pytest.mark.parametrize(
+        "operation", ["create_draft", "update_draft", "email_send_html"],
+    )
+    def test_a_send_to_a_real_domain_is_refused(
+        self, operation: str, monkeypatch: Any
+    ) -> None:
+        monkeypatch.setenv("MAIL_TEST_MODE", "true")
+        monkeypatch.setenv("MAIL_TEST_ACCOUNT", "TestAccount")
+        result = check_test_mode_safety(
+            operation, recipients=["test@example.com", "real@person.com"],
+        )
+        assert result is not None, f"{operation} is not a gated send"
+        assert result["error_type"] == "safety_violation"
+        assert "real@person.com" in result["error"]
+
+    @pytest.mark.parametrize(
+        "operation", ["create_draft", "update_draft", "email_send_html"],
+    )
+    def test_a_send_with_no_explicit_recipients_is_refused(
+        self, operation: str, monkeypatch: Any
+    ) -> None:
+        """A reply with nothing explicit lets Mail derive the recipients
+        at send time, past this gate."""
+        monkeypatch.setenv("MAIL_TEST_MODE", "true")
+        monkeypatch.setenv("MAIL_TEST_ACCOUNT", "TestAccount")
+        result = check_test_mode_safety(operation, recipients=[])
+        assert result is not None, f"{operation} is not a gated send"
+        assert result["error_type"] == "safety_violation"

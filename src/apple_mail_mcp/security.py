@@ -331,13 +331,16 @@ ACCOUNT_REQUIRED_MUTATIONS = {
     "delete_messages",
 }
 
+# Every operation that delivers mail. In test mode each is confined to
+# RFC 2606 reserved domains and must name its recipients explicitly.
+# create_draft / update_draft are sends only when send_now=True; the
+# server-tool wrappers call check_test_mode_safety with the full
+# recipient list whenever send_now is in play. A tool added later that
+# sends belongs here, or test mode never sees where its mail goes.
 SEND_OPERATIONS = {
-    # Drafts lifecycle (#134): create_draft / update_draft trigger the
-    # send-safety gate only when send_now=True. The server-tool wrappers
-    # are responsible for calling check_test_mode_safety with the full
-    # recipient list when send_now is in play.
     "create_draft",
     "update_draft",
+    "email_send_html",
 }
 
 # Rule-mutation operations: in test mode, may only target rules whose
