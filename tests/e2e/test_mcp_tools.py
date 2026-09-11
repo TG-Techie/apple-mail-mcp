@@ -349,6 +349,37 @@ class TestDraftUpdateInvocation:
         mock_mail.create_draft.assert_called_once()
 
 
+class TestSaveTemplateInvocation:
+    """save_template writes to disk rather than through the connector,
+    so it does not fit the single-method table. The pair that matters
+    at the dispatch layer: a taken name is refused, and overwrite=True
+    is the one way through."""
+
+    @pytest.fixture(autouse=True)
+    def _isolated_templates(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("APPLE_MAIL_MCP_HOME", str(tmp_path))
+
+    async def test_taken_name_is_refused_until_overwrite_is_named(self) -> None:
+        first = await server.mcp.call_tool("save_template", {"name": "t", "body": "v1\n"})
+        assert first.structured_content is not None
+        assert first.structured_content["created"] is True
+
+        refused = await server.mcp.call_tool("save_template", {"name": "t", "body": "v2\n"})
+        assert refused.structured_content is not None
+        assert refused.structured_content["success"] is False
+        assert refused.structured_content["error_type"] == "template_exists"
+
+        replaced = await server.mcp.call_tool(
+            "save_template", {"name": "t", "body": "v2\n", "overwrite": True}
+        )
+        assert replaced.structured_content is not None
+        assert replaced.structured_content == {"success": True, "name": "t", "created": False}
+
+        current = await server.mcp.call_tool("get_template", {"name": "t"})
+        assert current.structured_content is not None
+        assert current.structured_content["body"] == "v2\n"
+
+
 class TestConfirmationAnsweredByARealClient:
     """The gate, answered over the wire by a client that can elicit.
 

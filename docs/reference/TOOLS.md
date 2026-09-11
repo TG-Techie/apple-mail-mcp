@@ -1342,8 +1342,9 @@ body, and the sorted list of placeholders found across subject + body.
 
 ### save_template
 
-Create or overwrite a template. Returns `created: true` for new
-templates, `created: false` when an existing template was overwritten.
+Create a template, or replace one when explicitly asked to. Returns
+`created: true` for new templates, `created: false` when an existing
+template was replaced.
 
 ```python
 save_template(
@@ -1351,10 +1352,18 @@ save_template(
     body="Hi {recipient_name},\n\nUnfortunately I won't be able to take this on.\n",
     subject="Re: {original_subject}",
 )
+
+# A name that is already taken is refused unless the caller says so:
+save_template(name="polite-decline", body="...", overwrite=True)
 ```
 
-No confirmation prompt — additive (or self-overwrite, which is the
-explicit intent of an idempotent save). Names must match
+Without `overwrite=True`, saving to a name that already exists returns
+`error_type: "template_exists"` and nothing on disk changes; the check
+and the write are one exclusive create, so two callers racing on the
+same name cannot both believe they created it.
+
+No confirmation prompt: creating is additive, and replacing requires
+the caller to name that intent. Names must match
 `^[a-zA-Z0-9_-]{1,64}$`; anything outside that range (spaces, slashes,
 dots, oversized) raises `invalid_template_name`.
 

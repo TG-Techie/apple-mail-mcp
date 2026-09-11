@@ -230,6 +230,13 @@ class MailTemplateNotFoundError(MailTemplateError):
     pass
 
 
+class MailTemplateExistsError(MailTemplateError):
+    """A template with the requested name already exists and the save
+    did not ask to overwrite it. Nothing on disk was changed."""
+
+    pass
+
+
 class MailTemplateInvalidNameError(MailTemplateError):
     """Template name fails validation (path traversal, invalid chars,
     too long, or empty). Names must match ^[a-zA-Z0-9_-]{1,64}$."""

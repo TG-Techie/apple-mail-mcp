@@ -29,6 +29,7 @@ from .exceptions import (
     MailRuleChangedError,
     MailRuleNotFoundError,
     MailTemplateError,
+    MailTemplateExistsError,
     MailTemplateInvalidFormatError,
     MailTemplateInvalidNameError,
     MailTemplateMissingVariableError,
@@ -1951,6 +1952,8 @@ def _template_error_response(e: MailTemplateError) -> dict[str, Any]:
     response shape."""
     if isinstance(e, MailTemplateNotFoundError):
         et = "template_not_found"
+    elif isinstance(e, MailTemplateExistsError):
+        et = "template_exists"
     elif isinstance(e, MailTemplateInvalidNameError):
         et = "invalid_template_name"
     elif isinstance(e, MailTemplateInvalidFormatError):
@@ -2025,21 +2028,27 @@ def get_template(name: str) -> dict[str, Any]:
 
 @mcp.tool()
 def save_template(
-    name: str, body: str, subject: str | None = None
+    name: str,
+    body: str,
+    subject: str | None = None,
+    overwrite: bool = False,
 ) -> dict[str, Any]:
-    """Create or overwrite a template.
+    """Create a template, or replace one when explicitly asked to.
 
     Args:
         name: Template name (alphanumerics, underscore, hyphen; 1-64 chars).
         body: Template body text. May contain {placeholder} tokens.
         subject: Optional subject template. May also contain placeholders.
+        overwrite: Replace an existing template of the same name. Without
+            it, a name that is already taken is refused with
+            `template_exists` and nothing on disk changes.
 
     Returns:
         Dictionary with the template name and a `created` flag (true for
-        new templates, false when an existing template was overwritten).
+        new templates, false when an existing template was replaced).
 
-    No confirmation prompt — additive (or self-overwrite, which is the
-    explicit user intent for an idempotent save).
+    No confirmation prompt: creating is additive, and replacing requires
+    the caller to name that intent with `overwrite=True`.
     """
     try:
         rate_err = check_rate_limit("save_template", {"name": name})
@@ -2056,7 +2065,7 @@ def save_template(
         template = Template(
             name=name, subject=subject, body=normalized_body
         )
-        created = _get_template_store().save(template)
+        created = _get_template_store().save(template, overwrite=overwrite)
         operation_logger.log_operation(
             "save_template", {"name": name, "created": created}, "success"
         )

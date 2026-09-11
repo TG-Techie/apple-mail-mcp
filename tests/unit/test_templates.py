@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from apple_mail_mcp.exceptions import (
+    MailTemplateExistsError,
     MailTemplateInvalidFormatError,
     MailTemplateInvalidNameError,
     MailTemplateMissingVariableError,
@@ -220,16 +221,41 @@ class TestTemplateStore:
         # File on disk:
         assert (tmp_path / "foo.md").exists()
 
-    def test_save_overwrite_returns_created_false(self, tmp_path: Path):
+    def test_save_refuses_to_replace_unless_told_to(self, tmp_path: Path):
+        from apple_mail_mcp.templates import Template
+
+        store = self._store(tmp_path)
+        store.save(Template(name="foo", subject=None, body="v1\n"))
+        with pytest.raises(MailTemplateExistsError, match="overwrite=True"):
+            store.save(Template(name="foo", subject=None, body="v2\n"))
+        assert store.get("foo").body == "v1\n"
+
+    def test_save_overwrite_replaces_and_returns_created_false(self, tmp_path: Path):
         from apple_mail_mcp.templates import Template
 
         store = self._store(tmp_path)
         store.save(Template(name="foo", subject=None, body="v1\n"))
         assert (
-            store.save(Template(name="foo", subject=None, body="v2\n"))
+            store.save(
+                Template(name="foo", subject=None, body="v2\n"),
+                overwrite=True,
+            )
             is False
         )
         assert store.get("foo").body == "v2\n"
+
+    def test_save_overwrite_on_a_free_name_still_creates(self, tmp_path: Path):
+        from apple_mail_mcp.templates import Template
+
+        store = self._store(tmp_path)
+        assert (
+            store.save(
+                Template(name="foo", subject=None, body="v1\n"),
+                overwrite=True,
+            )
+            is True
+        )
+        assert store.get("foo").body == "v1\n"
 
     def test_get_round_trips_through_disk(self, tmp_path: Path):
         from apple_mail_mcp.templates import Template

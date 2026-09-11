@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from .exceptions import (
+    MailTemplateExistsError,
     MailTemplateInvalidFormatError,
     MailTemplateInvalidNameError,
     MailTemplateMissingVariableError,
@@ -230,14 +231,30 @@ class TemplateStore:
         text = path.read_text(encoding="utf-8")
         return parse_template_file(text, name=name)
 
-    def save(self, template: Template) -> bool:
-        """Write template to disk. Returns True if newly created,
-        False if it overwrote an existing template."""
+    def save(self, template: Template, *, overwrite: bool = False) -> bool:
+        """Write template to disk. Returns True if newly created, False
+        if an existing template was replaced.
+
+        Refuses to replace an existing template unless ``overwrite`` is
+        True, raising MailTemplateExistsError with nothing changed. The
+        existence check is the exclusive create itself, so there is no
+        window between checking and writing.
+        """
         path = self._path_for(template.name)
-        existed = path.is_file()
         self.root.mkdir(parents=True, exist_ok=True)
-        path.write_text(serialize_template(template), encoding="utf-8")
-        return not existed
+        content = serialize_template(template)
+        try:
+            with path.open("x", encoding="utf-8") as fh:
+                fh.write(content)
+            return True
+        except FileExistsError:
+            if not overwrite:
+                raise MailTemplateExistsError(
+                    f"a template named {template.name!r} already exists; "
+                    "pass overwrite=True to replace it"
+                ) from None
+        path.write_text(content, encoding="utf-8")
+        return False
 
     def delete(self, name: str) -> None:
         path = self._path_for(name)

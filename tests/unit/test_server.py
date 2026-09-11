@@ -2465,12 +2465,23 @@ class TestSaveTemplate:
         result = save_template(name="new", body="hi\n")
         assert result == {"success": True, "name": "new", "created": True}
 
-    def test_overwrite_returns_created_false(
+    def test_existing_name_is_refused_without_overwrite(
         self, isolated_templates: Any, mock_logger: MagicMock
     ) -> None:
         save_template(name="x", body="v1\n")
         result = save_template(name="x", body="v2\n")
+        assert result["success"] is False
+        assert result["error_type"] == "template_exists"
+        assert "overwrite=True" in result["error"]
+        assert get_template("x")["body"] == "v1\n"
+
+    def test_overwrite_replaces_and_returns_created_false(
+        self, isolated_templates: Any, mock_logger: MagicMock
+    ) -> None:
+        save_template(name="x", body="v1\n")
+        result = save_template(name="x", body="v2\n", overwrite=True)
         assert result == {"success": True, "name": "x", "created": False}
+        assert get_template("x")["body"] == "v2\n"
 
     def test_empty_body_rejected(
         self, isolated_templates: Any, mock_logger: MagicMock
