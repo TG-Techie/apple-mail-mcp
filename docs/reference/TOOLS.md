@@ -80,9 +80,15 @@ When the call commits to the AppleScript path **and** a body/text filter is set,
       "flagged": false
     }
   ],
-  "count": 1
+  "count": 1,
+  "limit": 50,
+  "truncated": false
 }
 ```
+
+`truncated` is `true` when `count` reached `limit`: the result may be
+the first page of more matches, so raise `limit` or narrow the filters
+before treating it as the whole set.
 
 **Row fields:**
 - `id` — path-native: Mail.app internal numeric id when the AppleScript path runs, RFC 5322 Message-ID when the IMAP path runs. Fast for downstream same-path operations.

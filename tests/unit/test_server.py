@@ -700,6 +700,31 @@ class TestListMailboxes:
 
 
 class TestSearchMessages:
+    def test_a_result_that_fills_the_limit_says_so(
+        self, mock_mail: MagicMock, mock_logger: MagicMock
+    ) -> None:
+        """count == limit is the one result a caller cannot read: it may
+        be everything or the first page of much more. The response now
+        echoes the limit and says whether it was reached, so "50 results"
+        is never mistaken for "50 messages match"."""
+        mock_mail.search_messages.return_value = [{"id": str(i)} for i in range(3)]
+
+        result = search_messages("Gmail", subject_contains="x", limit=3)
+
+        assert result["count"] == 3
+        assert result["limit"] == 3
+        assert result["truncated"] is True
+
+    def test_a_result_below_the_limit_is_complete(
+        self, mock_mail: MagicMock, mock_logger: MagicMock
+    ) -> None:
+        mock_mail.search_messages.return_value = [{"id": "1"}]
+
+        result = search_messages("Gmail", subject_contains="x", limit=3)
+
+        assert result["limit"] == 3
+        assert result["truncated"] is False
+
     def test_success_returns_messages_with_count(
         self, mock_mail: MagicMock, mock_logger: MagicMock
     ) -> None:

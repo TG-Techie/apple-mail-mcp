@@ -889,7 +889,7 @@ def search_messages(
 
     Example:
         >>> search_messages("Gmail", sender_contains="john@example.com", read_status=False, limit=10)
-        {"success": True, "messages": [...], "count": 5}
+        {"success": True, "messages": [...], "count": 5, "limit": 10, "truncated": False}
         >>> search_messages(source=["SELECTED"])
         {"success": True, "messages": [...], "count": 2}
         >>> search_messages(source=["12345", "SELECTED"], read_status=False)
@@ -947,6 +947,8 @@ def search_messages(
                 "mailbox": None,
                 "messages": filtered,
                 "count": len(filtered),
+                "limit": limit,
+                "truncated": len(filtered) >= limit,
             }
             if warnings:
                 response["warnings"] = warnings
@@ -1011,12 +1013,16 @@ def search_messages(
             "success"
         )
 
+        # count == limit is the one result a caller cannot read on its own:
+        # everything, or the first page of much more. Say which.
         response = {
             "success": True,
             "account": account,
             "mailbox": mailbox,
             "messages": messages,
             "count": len(messages),
+            "limit": limit,
+            "truncated": len(messages) >= limit,
         }
         if warnings:
             response["warnings"] = warnings
