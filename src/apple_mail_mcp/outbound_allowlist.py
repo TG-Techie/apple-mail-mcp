@@ -222,13 +222,20 @@ def assert_recipients_allowed_for_send(
     bcc: list[str] | None,
     *,
     seed: str = "new",
+    reply_all: bool = False,
 ) -> None:
     """Hard policy gate at the actual-send call site.
 
+    A recipient group left ``None`` on a reply is filled in by Mail.app
+    from the message being replied to, and nothing at this layer ever
+    sees those addresses: a plain reply derives ``to``, a reply-all
+    derives ``to`` and ``cc``. Every group Mail would derive must be
+    explicit (``[]`` is explicit); an on-list address in another group
+    does not vouch for the derived one. A forward derives nothing.
+
     Raises ``MailOutboundDisallowedError`` if:
-      - ``seed`` is ``"reply"`` or ``"forward"`` AND all of (to, cc, bcc)
-        are None — Mail.app would auto-derive recipients we cannot
-        validate at this layer. Caller must pass explicit recipients.
+      - ``seed`` is ``"reply"`` and ``to`` is None, or additionally
+        ``cc`` is None when ``reply_all``.
       - All recipient groups are empty (no one to send to).
       - Any recipient (across to/cc/bcc) is not on the allowlist.
 
@@ -238,17 +245,20 @@ def assert_recipients_allowed_for_send(
 
     Returns None silently when every recipient is on the allowlist.
     """
-    if (
-        seed in ("reply", "forward")
-        and to is None
-        and cc is None
-        and bcc is None
-    ):
-        raise MailOutboundDisallowedError(
-            f"send_now=True on a {seed} requires explicit recipients "
-            "(to/cc/bcc) — Mail.app's auto-derived recipients cannot be "
-            "verified against the outbound allowlist at the send layer."
-        )
+    if seed == "reply":
+        derived = [
+            name
+            for name, group in (("to", to), ("cc", cc))
+            if group is None and (name == "to" or reply_all)
+        ]
+        if derived:
+            raise MailOutboundDisallowedError(
+                f"send_now=True on a {'reply-all' if reply_all else 'reply'} "
+                f"requires explicit {' and '.join(derived)} — Mail.app would "
+                "fill it from the message being replied to, and that cannot "
+                "be verified against the outbound allowlist at the send "
+                "layer. Pass [] to send to nobody in that group."
+            )
 
     all_r: list[str] = []
     for group in (to, cc, bcc):

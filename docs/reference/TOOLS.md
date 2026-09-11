@@ -867,7 +867,7 @@ Create a draft (fresh, reply, or forward). Optionally send immediately.
 | `template_name` | string | No | None | Optional template to render for `subject` + `body`. Caller-supplied `subject`/`body` override the rendered output. |
 | `template_vars` | object | No | None | Variables for the template renderer. Requires `template_name`. |
 | `from_account` | string | No | None | Mail.app account name or UUID. None = Mail's default. Honoured on saved drafts and on reply/forward sends. A fresh message with `send_now=True` goes out through Mail's mailto: handler, which cannot set the sender, and is refused (`from_account_unsupported`) rather than sent from the wrong account. |
-| `send_now` | boolean | No | False | `False` saves as draft. `True` sends immediately and elicits confirmation. |
+| `send_now` | boolean | No | False | `False` saves as draft. `True` sends immediately and elicits confirmation. On a reply sent immediately, `to` must be given explicitly (and `cc` too with `reply_all`), since a group left `None` is filled in by Mail from the original message and cannot be checked against the outbound allowlist; `[]` is explicit. Refused with `outbound_disallowed` otherwise. |
 
 **Returns:**
 

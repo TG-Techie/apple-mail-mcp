@@ -5407,7 +5407,9 @@ end if
         # outbound_allowlist.py for the policy. DO NOT add a bypass
         # without explicit human authorization.
         if send_now:
-            assert_recipients_allowed_for_send(to, cc, bcc, seed=seed)
+            assert_recipients_allowed_for_send(
+                to, cc, bcc, seed=seed, reply_all=reply_all
+            )
 
         # For brand-new messages sent immediately, bypass Mail.app's compose
         # MIME encoding path, which wraps the body in <blockquote type="cite">

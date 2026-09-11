@@ -328,6 +328,53 @@ class TestAssertRecipientsAllowedForSend:
                 to=None, cc=None, bcc=None, seed="reply"
             )
 
+    # A reply whose `to` is left None goes to whoever Mail derives it from,
+    # which is the original sender, and nothing here ever saw that
+    # address. The old rule only fired when every group was None, so an
+    # on-list cc beside a None `to` sailed through with the derived `to`
+    # unchecked. Every group Mail would derive must be explicit; `[]` is
+    # explicit.
+
+    def test_reply_with_an_onlist_cc_but_derived_to_is_refused(
+        self, yaml_cfg: Path
+    ) -> None:
+        with pytest.raises(MailOutboundDisallowedError, match="to"):
+            assert_recipients_allowed_for_send(
+                to=None, cc=["a@partner.example"], bcc=None, seed="reply"
+            )
+
+    def test_reply_all_with_derived_cc_is_refused(
+        self, yaml_cfg: Path
+    ) -> None:
+        with pytest.raises(MailOutboundDisallowedError, match="cc"):
+            assert_recipients_allowed_for_send(
+                to=["a@partner.example"], cc=None, bcc=None,
+                seed="reply", reply_all=True,
+            )
+
+    def test_plain_reply_with_explicit_to_and_no_cc_passes(
+        self, yaml_cfg: Path
+    ) -> None:
+        """A plain reply derives only `to`; cc/bcc left None stay empty."""
+        assert_recipients_allowed_for_send(
+            to=["a@partner.example"], cc=None, bcc=None, seed="reply"
+        )
+
+    def test_reply_all_with_both_explicit_passes(
+        self, yaml_cfg: Path
+    ) -> None:
+        assert_recipients_allowed_for_send(
+            to=["a@partner.example"], cc=[], bcc=None,
+            seed="reply", reply_all=True,
+        )
+
+    def test_forward_derives_nothing_so_any_explicit_group_suffices(
+        self, yaml_cfg: Path
+    ) -> None:
+        assert_recipients_allowed_for_send(
+            to=None, cc=["a@partner.example"], bcc=None, seed="forward"
+        )
+
     def test_forward_seed_without_recipients_raises(
         self, yaml_cfg: Path
     ) -> None:
