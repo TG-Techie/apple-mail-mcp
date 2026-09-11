@@ -1403,7 +1403,10 @@ def save_attachments(
     Args:
         message_id: Message ID from search results
         save_directory: Directory path to save attachments to
-        attachment_indices: Specific attachment indices to save (0-based), None for all
+        attachment_indices: 0-based positions in the message's attachment
+            list, as `get_messages` orders them; empty saves all. An index
+            the message does not have is refused (`validation_error`) and
+            nothing is written.
         overwrite: Replace files already in the directory. Without it, a
             name that is already taken is refused with `file_exists` and
             nothing is written. Attachments sharing a name within the

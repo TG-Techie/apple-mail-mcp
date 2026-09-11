@@ -539,7 +539,7 @@ Save attachments from a message to a directory.
 |-----------|------|----------|---------|-------------|
 | `message_id` | string | Yes | - | Message ID to save attachments from |
 | `save_directory` | string | Yes | - | Directory path to save attachments |
-| `attachment_indices` | list[int] | No | None | Specific attachment indices (None = all) |
+| `attachment_indices` | list[int] | No | None | 0-based positions in the message's attachment list, in the order `get_messages` reports them (None = all). An index the message does not have is refused with `validation_error` and nothing is written. |
 | `overwrite` | boolean | No | false | Replace files already in the directory. Without it, a name that is already taken is refused with `file_exists` and nothing is written. |
 
 **Returns:**
@@ -547,14 +547,14 @@ Save attachments from a message to a directory.
 ```json
 {
   "success": true,
-  "count": 2,
-  "directory": "/Users/me/Downloads",
-  "saved_files": [
-    "report.pdf",
-    "data.xlsx"
-  ]
+  "saved": 2,
+  "directory": "/Users/me/Downloads"
 }
 ```
+
+`saved` is the number of files written. A `warnings` list is present
+when Mail could not read some attachment metadata (the files still
+save); `saved: 0` with warnings means the enumeration itself failed.
 
 **Examples:**
 
@@ -569,7 +569,7 @@ save_attachments(
 save_attachments(
     message_id="12345",
     save_directory="/Users/me/Downloads",
-    attachment_indices=[1, 3]  # Save 1st and 3rd only
+    attachment_indices=[0, 2]  # Save the 1st and 3rd only (0-based)
 )
 ```
 

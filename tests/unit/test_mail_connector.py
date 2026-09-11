@@ -4778,6 +4778,55 @@ class TestSaveAttachmentsDoesNotOverwriteUnasked:
         assert saved == 1
 
 
+class TestSaveAttachmentsRefusesIndicesTheMessageDoesNotHave:
+    """attachment_indices past the end were silently dropped, so asking
+    for attachment 5 of a two-attachment message returned success with
+    nothing saved, and [0, 5] saved one file and said nothing about the
+    other. Indices are 0-based positions in the message's attachment
+    list; one the message does not have is a caller error, refused by
+    name before anything is written."""
+
+    @pytest.fixture
+    def connector(self) -> AppleMailConnector:
+        return AppleMailConnector()
+
+    @staticmethod
+    def _enumeration(*names: str) -> str:
+        rows = ",".join(
+            f'{{"name":"{n}","mime_type":"application/pdf","size":10,"downloaded":true}}'
+            for n in names
+        )
+        return f'{{"attachments":[{rows}],"warnings":[]}}'
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_an_index_past_the_end_is_refused_by_name(
+        self, mock_run: MagicMock, connector: AppleMailConnector, tmp_path: Path
+    ) -> None:
+        mock_run.side_effect = [self._enumeration("a.pdf", "b.pdf")]
+        with pytest.raises(ValueError, match=r"index 5 .*2 attachments.*0 to 1"):
+            connector.save_attachments("12345", tmp_path, attachment_indices=[5])
+        assert mock_run.call_count == 1, "pass 2 must not run"
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_a_bad_index_beside_good_ones_writes_nothing(
+        self, mock_run: MagicMock, connector: AppleMailConnector, tmp_path: Path
+    ) -> None:
+        mock_run.side_effect = [self._enumeration("a.pdf", "b.pdf")]
+        with pytest.raises(ValueError, match=r"index -1"):
+            connector.save_attachments("12345", tmp_path, attachment_indices=[0, -1])
+        assert mock_run.call_count == 1
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_a_message_with_no_attachments_still_reports_zero(
+        self, mock_run: MagicMock, connector: AppleMailConnector, tmp_path: Path
+    ) -> None:
+        """No attachments at all is not a bad index: the existing
+        (0, warnings) contract for that case stands."""
+        mock_run.side_effect = [self._enumeration()]
+        saved, _ = connector.save_attachments("12345", tmp_path, attachment_indices=[0])
+        assert saved == 0
+
+
 class TestAttachmentPropertyGuards:
     """One unreadable attachment PROPERTY must not kill the whole walk.
 

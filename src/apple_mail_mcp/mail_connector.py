@@ -2910,9 +2910,12 @@ class AppleMailConnector:
             message_id: Mail.app internal numeric id, or RFC 5322
                 Message-ID (with or without angle brackets).
             save_directory: Directory to save attachments to.
-            attachment_indices: 0-based indices of attachments to
-                save. ``None`` saves all. Out-of-range indices are
-                silently dropped (matches list-slicing semantics).
+            attachment_indices: 0-based positions in the message's
+                attachment list (the order ``get_messages`` reports).
+                ``None`` saves all. An index the message does not have
+                is refused with ``ValueError`` before anything is
+                written; a message with no attachments at all returns
+                ``(0, warnings)`` whatever was asked for.
             overwrite: Replace files already in ``save_directory``.
                 Without it, a name that is already taken is refused
                 with ``FileExistsError`` before anything is written.
@@ -2978,9 +2981,15 @@ class AppleMailConnector:
         if attachment_indices is None:
             selected_zero_based = list(range(n))
         else:
-            selected_zero_based = [
-                i for i in attachment_indices if 0 <= i < n
-            ]
+            missing = [i for i in attachment_indices if not 0 <= i < n]
+            if missing:
+                raise ValueError(
+                    "attachment index "
+                    + ", ".join(str(i) for i in missing)
+                    + f" is out of range: message {message_id!r} has {n} "
+                    f"attachments (indices 0 to {n - 1}); nothing was saved"
+                )
+            selected_zero_based = list(attachment_indices)
         if not selected_zero_based:
             return 0, warnings
 
