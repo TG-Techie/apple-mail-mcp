@@ -1565,8 +1565,17 @@ def create_mailbox(
             {"account": account, "mailbox": name, "parent": parent_mailbox},
             "success" if success else "failure",
         )
+        if not success:
+            return {
+                "success": False,
+                "error": (
+                    f"Mail did not confirm creating mailbox {name!r} in "
+                    f"account {account!r}; check Mail.app before retrying"
+                ),
+                "error_type": "applescript_error",
+            }
         return {
-            "success": success,
+            "success": True,
             "account": account,
             "mailbox": name,
             "parent": parent_mailbox,
@@ -1691,9 +1700,17 @@ def update_mailbox(
              "new_name": new_name, "new_parent": new_parent},
             "success" if success else "failure",
         )
-
+        if not success:
+            return {
+                "success": False,
+                "error": (
+                    f"Mail did not confirm updating mailbox {name!r} in "
+                    f"account {account!r}; check Mail.app before retrying"
+                ),
+                "error_type": "applescript_error",
+            }
         return {
-            "success": success,
+            "success": True,
             "account": account,
             "name": name,
             "new_name": new_name,

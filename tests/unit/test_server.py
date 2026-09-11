@@ -1909,6 +1909,23 @@ class TestSaveAttachments:
 
 
 class TestCreateMailbox:
+    def test_a_false_from_the_connector_is_a_typed_error(
+        self, mock_mail: MagicMock, mock_logger: MagicMock
+    ) -> None:
+        """The connector answers False when Mail's script finished without
+        its success marker. That came back as success: false with no
+        error and no error_type, the one response shape nothing else in
+        this server produces, so a caller had nothing to act on."""
+        mock_mail.create_mailbox.return_value = False
+
+        result = create_mailbox("Gmail", "Projects")
+
+        assert result["success"] is False
+        assert result["error_type"] == "applescript_error"
+        assert "Projects" in result["error"]
+        op, _, status = mock_logger.log_operation.call_args.args
+        assert (op, status) == ("create_mailbox", "failure")
+
     def test_success(self, mock_mail: MagicMock) -> None:
         mock_mail.create_mailbox.return_value = True
 
@@ -1977,6 +1994,20 @@ class TestCreateMailbox:
 
 class TestUpdateMailboxTool:
     """Tests for the update_mailbox MCP tool (rename only — #102)."""
+
+    def test_a_false_from_the_connector_is_a_typed_error(
+        self, mock_mail: MagicMock, mock_logger: MagicMock
+    ) -> None:
+        from apple_mail_mcp.server import update_mailbox
+
+        mock_mail.update_mailbox.return_value = False
+        result = update_mailbox(account="Gmail", name="Old", new_name="New")
+
+        assert result["success"] is False
+        assert result["error_type"] == "applescript_error"
+        assert "Old" in result["error"]
+        op, _, status = mock_logger.log_operation.call_args.args
+        assert (op, status) == ("update_mailbox", "failure")
 
     def test_rename_success(
         self, mock_mail: MagicMock, mock_logger: MagicMock

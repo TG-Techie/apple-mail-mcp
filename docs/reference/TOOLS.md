@@ -337,9 +337,14 @@ Combined patches (move + read, read + flag, etc.) and any patch with `flag_color
 ```json
 {
   "success": true,
-  "count": 3
+  "updated": 3,
+  "requested": 3
 }
 ```
+
+`updated` is how many messages Mail actually changed; compare it with
+`requested`, since an id that matched nothing is skipped rather than
+reported.
 
 **Examples:**
 
