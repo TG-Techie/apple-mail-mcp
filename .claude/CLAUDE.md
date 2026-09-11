@@ -100,7 +100,7 @@ surface.
 ## User Data on Disk
 
 - All persistent user data lives under `~/.apple_mail_mcp/`. Override the location with `APPLE_MAIL_MCP_HOME=/some/path` (the subdirectory layout is appended automatically).
-- Current subdirs: `templates/` (one `<name>.md` file per email template, see `src/apple_mail_mcp/templates.py`).
+- Current layout: `templates/` (one `<name>.md` file per email template, see `src/apple_mail_mcp/templates.py`), `drafts/` (seed metadata per draft, `src/apple_mail_mcp/drafts.py`), `audit.jsonl` (one line per logged operation, `audit_log_path()` in `src/apple_mail_mcp/security.py`), and `mail_automation.lock` (the cross-process Mail automation lock).
 - Names that get used as filename stems must be regex-validated **before** building any path — see `_validate_name` in `templates.py` for the path-traversal-safe pattern. Don't `Path(user_input)` directly.
 - Storage objects should resolve their root at use time, not import time, so env-var overrides and test-time monkeypatching are honored. Example: `_get_template_store()` in `server.py`.
 

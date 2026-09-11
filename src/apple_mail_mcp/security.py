@@ -2,6 +2,7 @@
 Security utilities for Apple Mail MCP.
 """
 
+import json
 import logging
 import os
 import subprocess
@@ -9,6 +10,7 @@ import time
 from collections import deque
 from datetime import datetime
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 from .utils import validate_email
@@ -16,8 +18,24 @@ from .utils import validate_email
 logger = logging.getLogger(__name__)
 
 
+def audit_log_path() -> Path:
+    """Where the durable audit log lives: ``audit.jsonl`` under the data
+    home (``APPLE_MAIL_MCP_HOME``, default ``~/.apple_mail_mcp``).
+    Resolved at call time so env-var overrides and test-time
+    monkeypatching are honoured."""
+    home_override = os.environ.get("APPLE_MAIL_MCP_HOME")
+    base = Path(home_override).expanduser() if home_override else Path.home() / ".apple_mail_mcp"
+    return base / "audit.jsonl"
+
+
 class OperationLogger:
-    """Log operations for audit trail."""
+    """Log operations for audit trail.
+
+    Every entry is kept in memory for the life of the process and
+    appended, as one JSON line, to ``audit_log_path()``. The file is the
+    record that outlives the process: each agent session runs its own
+    server, so without it nothing on disk says what the server did.
+    """
 
     def __init__(self) -> None:
         self.operations: list[dict[str, Any]] = []
@@ -40,7 +58,20 @@ class OperationLogger:
             "result": result,
         }
         self.operations.append(entry)
+        self._append_to_file(entry)
         logger.info(f"Operation logged: {operation} - {result}")
+
+    @staticmethod
+    def _append_to_file(entry: dict[str, Any]) -> None:
+        """Append one line; a log that cannot be written is reported, not
+        raised, because the operation it records has already happened."""
+        path = audit_log_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(entry, default=str) + "\n")
+        except OSError as e:
+            logger.warning("audit log not written to %s: %s", path, e)
 
     def get_recent_operations(self, limit: int = 10) -> list[dict[str, Any]]:
         """

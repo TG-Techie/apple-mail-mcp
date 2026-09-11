@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
@@ -45,6 +46,74 @@ class TestOperationLogger:
         recent = logger.get_recent_operations(limit=5)
         assert len(recent) == 5
         assert recent[-1]["operation"] == "op_19"
+
+
+class TestOperationLogIsDurable:
+    """The in-memory record dies with the server process, and every agent
+    session runs its own. Until now nothing on disk said what the server
+    had done, so "did any mail go out from the wrong account" could only
+    be answered from callers' transcripts. Each entry is now also
+    appended, as one JSON line, to audit.jsonl under the data home."""
+
+    def test_each_operation_is_appended_as_one_json_line(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import json
+
+        from apple_mail_mcp.security import audit_log_path
+
+        monkeypatch.setenv("APPLE_MAIL_MCP_HOME", str(tmp_path))
+        logger = OperationLogger()
+        logger.log_operation("email_send_html", {"to": ["a@example.com"]}, "success")
+        logger.log_operation("delete_rule", {"rule_index": 1}, "cancelled")
+
+        path = audit_log_path()
+        assert path == tmp_path / "audit.jsonl"
+        lines = path.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 2
+        first, second = (json.loads(line) for line in lines)
+        assert first["operation"] == "email_send_html"
+        assert first["parameters"] == {"to": ["a@example.com"]}
+        assert first["result"] == "success"
+        assert first["timestamp"]
+        assert second["operation"] == "delete_rule"
+        assert second["result"] == "cancelled"
+
+    def test_the_path_follows_the_data_home_at_call_time(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from apple_mail_mcp.security import audit_log_path
+
+        monkeypatch.delenv("APPLE_MAIL_MCP_HOME", raising=False)
+        assert audit_log_path() == Path.home() / ".apple_mail_mcp" / "audit.jsonl"
+        monkeypatch.setenv("APPLE_MAIL_MCP_HOME", str(tmp_path / "elsewhere"))
+        assert audit_log_path() == tmp_path / "elsewhere" / "audit.jsonl"
+
+    def test_non_json_parameters_are_still_recorded(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import json
+
+        from apple_mail_mcp.security import audit_log_path
+
+        monkeypatch.setenv("APPLE_MAIL_MCP_HOME", str(tmp_path))
+        OperationLogger().log_operation("save_attachments", {"dir": tmp_path}, "success")
+        entry = json.loads(audit_log_path().read_text(encoding="utf-8"))
+        assert entry["parameters"] == {"dir": str(tmp_path)}
+
+    def test_an_unwritable_log_warns_and_does_not_break_the_operation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
+        blocker = tmp_path / "audit.jsonl"
+        blocker.mkdir()  # a directory where the file should be: open() fails
+        monkeypatch.setenv("APPLE_MAIL_MCP_HOME", str(tmp_path))
+        logger = OperationLogger()
+        with caplog.at_level(logging.WARNING, logger="apple_mail_mcp.security"):
+            logger.log_operation("list_accounts", {}, "success")
+        assert logger.get_recent_operations(limit=1)[0]["operation"] == "list_accounts"
+        assert any("audit log" in r.getMessage() for r in caplog.records)
 
 
 class TestValidateSendOperation:

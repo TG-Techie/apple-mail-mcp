@@ -2906,6 +2906,11 @@ async def create_draft(
                 "seed_id": seed_id,
                 "send_now": send_now,
                 "draft_id": draft_id,
+                "to": to,
+                "cc": cc,
+                "bcc": bcc,
+                "subject": subject,
+                "from_account": from_account,
             },
             "success",
         )
@@ -3087,6 +3092,11 @@ async def update_draft(
                 "old_draft_id": draft_id,
                 "new_draft_id": new_draft_id,
                 "send_now": send_now,
+                "to": final_to,
+                "cc": final_cc,
+                "bcc": final_bcc,
+                "subject": final_subject,
+                "from_account": final_from,
             },
             "success",
         )
@@ -3676,7 +3686,14 @@ async def email_send_html(
         )
         operation_logger.log_operation(
             "email_send_html",
-            {"to": to, "subject": subject},
+            {
+                "to": to,
+                "cc": cc_list,
+                "bcc": bcc_list,
+                "subject": subject,
+                "from_account": from_account,
+                "reply_to": reply_to,
+            },
             "success",
         )
         return {
