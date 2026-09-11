@@ -165,6 +165,41 @@ drafts deleted through `first message of drafts mailbox whose id is …`.
 Whether the `delete` on the walk's item reference errors, or is
 accepted and lost, was not separated.
 
+## Observation 9 — the class failure's error text, and the spread of the re-save (2026-09-11, later)
+
+Running the drafts lifecycle class on the iCloud test account, one
+test in nine failed, in `get_draft_state`, during the walk of the
+aggregate drafts mailbox:
+
+```
+MailMessageNotFoundError: 250:258: execution error: Mail got an error:
+Can't get message id 2359 of mailbox "Drafts" of account id "…". (-1728)
+```
+
+The walk evaluates `messages of drafts mailbox` once and then reads
+`id of d` for each item; a draft that is gone by the time the walk
+reaches it raises there. Which draft 2359 was — the test's own, or a
+copy from an earlier test in the class — was not captured. The same
+test's shape run alone, four times (create with the test account as
+sender, read the state, delete by id, then watch for the copy):
+
+```
+run 0: created 2380 @3.6s; state ok @4.3s; delete @4.4s; copy 2382 appeared @28.3s
+run 1: created 2384 @2.8s; state ok @3.6s; delete @3.7s; copy 2386 appeared @12.3s
+run 2: created 2388 @2.8s; state ok @3.5s; delete @3.6s; copy 2390 appeared @25.7s
+run 3: created 2392 @3.0s; state ok @3.7s; delete @3.8s; copy 2394 appeared @8.5s
+```
+
+Four for four alone; the copy came 8.5–28.3 s after creation, and a
+fifth measurement the same hour gave 30.6 s. Observation 3 had 12–19 s.
+Ninety seconds of watching after a sweep that deleted such copies
+showed none returning: deleting a copy does not start another re-save.
+
+The walks in `get_draft_state` and `extract_draft_attachments` now
+read each id inside a `try` and skip an item that raises. Whether that
+is what the class failure needed is a derivation from the error text,
+not a re-run under the same conditions.
+
 ## Derivations, mine
 
 - On an iCloud account, the id `draft_create` returns is transient. In
@@ -214,8 +249,11 @@ accepted and lost, was not separated.
   change. Queued.
 - The integration suite cleans up by the id it created (Observation
   8), so every test that names a sender leaves its draft behind under
-  the re-saved id. A cleanup that finds the class's drafts by subject
-  prefix and deletes each by id would not; not built.
+  the re-saved id. `tests/integration/conftest.py` now sweeps the test
+  account's `ZZZ-AMM-INTEG-` drafts by id before the first test and,
+  after the last, keeps sweeping until none has appeared for a quiet
+  period (Observation 9's spread is why it is a quiet period and not
+  a fixed wait).
 
 ## Not tried
 
