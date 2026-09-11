@@ -1050,7 +1050,11 @@ Two modes:
 (`get_thread`/`get_messages`) and pass them explicitly via `to`/`cc`.
 Every recipient — derived or explicit — is validated against the outbound
 allowlist with no exceptions; one off-list participant blocks the entire
-send (the compose window is discarded; nothing partial is sent).
+send (the compose window is discarded; nothing partial is sent). A
+recipient entry must be exactly one address (`addr@host` or
+`Name <addr@host>`); an entry carrying two addresses, or none, is
+off-list by definition, whichever addresses it contains. This holds on
+every send path.
 
 **Parameters:**
 

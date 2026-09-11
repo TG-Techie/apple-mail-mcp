@@ -29,30 +29,97 @@ from apple_mail_mcp.outbound_allowlist import (
     allowlist_patterns,
     assert_recipients_allowed_for_send,
     disallowed_recipients,
-    extract_email,
+    single_address,
 )
 
 _NO_YAML = "/nonexistent/comms.yaml"
 
 
-class TestExtractEmail:
+class TestSingleAddress:
     def test_bare_address(self) -> None:
-        assert extract_email("alice@example.com") == "alice@example.com"
+        assert single_address("alice@example.com") == "alice@example.com"
 
     def test_display_name_wrapped(self) -> None:
         assert (
-            extract_email("Alice A <alice@example.com>")
+            single_address("Alice A <alice@example.com>")
             == "alice@example.com"
         )
 
     def test_angle_only(self) -> None:
-        assert extract_email("<alice@example.com>") == "alice@example.com"
+        assert single_address("<alice@example.com>") == "alice@example.com"
 
     def test_uppercase_normalized(self) -> None:
-        assert extract_email("Alice@Example.COM") == "alice@example.com"
+        assert single_address("Alice@Example.COM") == "alice@example.com"
 
     def test_whitespace_trimmed(self) -> None:
-        assert extract_email("  alice@example.com  ") == "alice@example.com"
+        assert single_address("  alice@example.com  ") == "alice@example.com"
+
+    def test_two_addresses_are_none(self) -> None:
+        assert single_address("a@example.com, b@example.com") is None
+
+    def test_no_address_is_none(self) -> None:
+        assert single_address("Alice") is None
+
+
+class TestARecipientStringIsOneAddress:
+    """The gate matched the first angle-bracketed address in a recipient
+    string and let the whole string through on that. A string carrying
+    two addresses ("Ok <a@allowed.example>, evil@other.com") therefore
+    passed on its allowed half, and the mailto: send path splits on the
+    comma (RFC 6068), so both would have been addressed. A recipient
+    is now allowed only if it parses as exactly one well-formed address
+    and that address is on the list; anything else is disallowed, since
+    what Mail would do with it is not something this layer can vouch for."""
+
+    @pytest.fixture
+    def yaml_cfg(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> Path:
+        cfg = tmp_path / "comms.yaml"
+        cfg.write_text("email:\n  allowed_outbound:\n    - '*@partner.example'\n")
+        monkeypatch.setenv(COMMS_CONFIG_ENV, str(cfg))
+        monkeypatch.delenv("MAIL_TEST_MODE", raising=False)
+        return cfg
+
+    @pytest.mark.parametrize(
+        "recipient",
+        [
+            "Ok <a@partner.example>, evil@other.com",
+            "a@partner.example,evil@other.com",
+            "a@partner.example evil@other.com",
+            "a@partner.example; evil@other.com",
+            "a@partner.example\nevil@other.com",
+            "a@partner.example\n@partner.example",
+            "not-an-address",
+            "",
+            "<>",
+        ],
+    )
+    def test_anything_but_one_address_is_disallowed(
+        self, yaml_cfg: Path, recipient: str
+    ) -> None:
+        assert disallowed_recipients([recipient]) == [recipient]
+
+    @pytest.mark.parametrize(
+        "recipient",
+        [
+            "a@partner.example",
+            "Alice <a@partner.example>",
+            "<a@partner.example>",
+            "  A@Partner.Example  ",
+            '"Alice, A." <a@partner.example>',
+        ],
+    )
+    def test_one_well_formed_address_on_the_list_is_allowed(
+        self, yaml_cfg: Path, recipient: str
+    ) -> None:
+        assert disallowed_recipients([recipient]) == []
+
+    def test_a_display_name_that_looks_like_an_address_does_not_vouch(
+        self, yaml_cfg: Path
+    ) -> None:
+        r = '"a@partner.example" <evil@other.com>'
+        assert disallowed_recipients([r]) == [r]
 
 
 class TestNoHardcodedPolicy:

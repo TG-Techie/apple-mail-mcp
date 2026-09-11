@@ -44,6 +44,7 @@ import logging
 import os
 import re
 from collections.abc import Iterable
+from email.utils import getaddresses
 from pathlib import Path
 
 import yaml
@@ -61,7 +62,6 @@ _log = logging.getLogger(__name__)
 COMMS_CONFIG_ENV = "APPLE_MAIL_MCP_COMMS_CONFIG"
 _COMMS_CONFIG_DEFAULT = "~/iCloud/AgentAccessConfig/comms.yaml"
 
-_EMAIL_EXTRACT_RE = re.compile(r"<([^>]+)>")
 
 # Mirror security.RESERVED_TEST_* here to avoid a circular import. Keep in
 # sync if those change.
@@ -69,19 +69,30 @@ _RESERVED_TEST_DOMAINS = frozenset({"example.com", "example.net", "example.org"}
 _RESERVED_TEST_TLDS = frozenset({".example", ".test", ".invalid", ".localhost"})
 
 
-def extract_email(recipient: str) -> str:
-    """Pull the bare ``addr@host`` out of a recipient string.
+# One address, nothing else: no whitespace, no separators, one "@" with
+# something on both sides and a dot in the domain. Stricter than RFC
+# 5322 on purpose; the gate refuses what it cannot vouch for.
+_ONE_ADDRESS_RE = re.compile(r"^[^\s@,;<>\"]+@[^\s@,;<>\"]+\.[^\s@,;<>\"]+$")
 
-    Handles:
-      - ``"alice@example.com"`` → ``"alice@example.com"``
-      - ``"Alice A <alice@example.com>"`` → ``"alice@example.com"``
-      - ``"<alice@example.com>"`` → ``"alice@example.com"``
-    Strings without ``<...>`` are returned trimmed/lowercased as-is.
+
+def single_address(recipient: str) -> str | None:
+    """The one address a recipient string names, lowercased, or None.
+
+    None when the string parses as anything other than exactly one
+    well-formed address: two addresses joined by a comma or a space, a
+    display name with no address, an address with a newline in it. The
+    mailto: send path splits on commas (RFC 6068) and Mail's compose
+    path accepts whatever text it is handed, so a string that is not one
+    address is one this layer cannot say where it would go.
     """
-    m = _EMAIL_EXTRACT_RE.search(recipient)
-    if m:
-        return m.group(1).strip().lower()
-    return recipient.strip().lower()
+    parsed = getaddresses([recipient])
+    if len(parsed) != 1:
+        return None
+    addr = parsed[0][1].strip().lower()
+    if not _ONE_ADDRESS_RE.fullmatch(addr):
+        return None
+    return addr
+
 
 
 def allowlist_patterns() -> list[str]:
@@ -193,7 +204,10 @@ def disallowed_recipients(recipients: list[str]) -> list[str]:
         patterns = []
     bad: list[str] = []
     for r in recipients:
-        addr = extract_email(r)
+        addr = single_address(r)
+        if addr is None:
+            bad.append(r)
+            continue
         if test_mode and _is_reserved_test_domain(addr):
             continue
         if not _matches_any(addr, patterns):
