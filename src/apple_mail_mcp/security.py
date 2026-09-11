@@ -18,11 +18,24 @@ from .utils import validate_email
 logger = logging.getLogger(__name__)
 
 
+# The audit file rolls over once it reaches this size; one previous
+# generation (``audit.jsonl.1``) is kept, so the store on disk is bounded
+# at about twice this. Entries run a few hundred bytes, so a cap of 5 MiB
+# is on the order of ten thousand operations per generation.
+AUDIT_ROTATE_BYTES = 5 * 1024 * 1024
+
+
 def audit_log_path() -> Path:
     """Where the durable audit log lives: ``audit.jsonl`` under the data
     home (``APPLE_MAIL_MCP_HOME``, default ``~/.apple_mail_mcp``).
     Resolved at call time so env-var overrides and test-time
-    monkeypatching are honoured."""
+    monkeypatching are honoured.
+
+    The file is a record of who the user corresponds with and about
+    what. It is personal data at rest: it lives outside the repository
+    and is never committed, never pasted into a message, and not
+    something an agent reads to answer a question about someone else's
+    mail."""
     home_override = os.environ.get("APPLE_MAIL_MCP_HOME")
     base = Path(home_override).expanduser() if home_override else Path.home() / ".apple_mail_mcp"
     return base / "audit.jsonl"
@@ -63,11 +76,14 @@ class OperationLogger:
 
     @staticmethod
     def _append_to_file(entry: dict[str, Any]) -> None:
-        """Append one line; a log that cannot be written is reported, not
-        raised, because the operation it records has already happened."""
+        """Append one line, rolling the file over at ``AUDIT_ROTATE_BYTES``.
+        A log that cannot be written is reported, not raised, because the
+        operation it records has already happened."""
         path = audit_log_path()
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
+            if path.is_file() and path.stat().st_size >= AUDIT_ROTATE_BYTES:
+                path.replace(path.with_name(path.name + ".1"))
             with path.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(entry, default=str) + "\n")
         except OSError as e:

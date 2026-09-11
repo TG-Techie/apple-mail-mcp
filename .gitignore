@@ -57,6 +57,10 @@ dmypy.json
 *.log
 .env
 .env.local
+# The audit log lives under APPLE_MAIL_MCP_HOME, never in the repo; this
+# is a backstop for a data home pointed inside the checkout.
+audit.jsonl
+audit.jsonl.*
 
 # Documentation builds
 docs/_build/

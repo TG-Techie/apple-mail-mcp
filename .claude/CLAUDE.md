@@ -100,7 +100,8 @@ surface.
 ## User Data on Disk
 
 - All persistent user data lives under `~/.apple_mail_mcp/`. Override the location with `APPLE_MAIL_MCP_HOME=/some/path` (the subdirectory layout is appended automatically).
-- Current layout: `templates/` (one `<name>.md` file per email template, see `src/apple_mail_mcp/templates.py`), `drafts/` (seed metadata per draft, `src/apple_mail_mcp/drafts.py`), `audit.jsonl` (one line per logged operation, `audit_log_path()` in `src/apple_mail_mcp/security.py`), and `mail_automation.lock` (the cross-process Mail automation lock).
+- Current layout: `templates/` (one `<name>.md` file per email template, see `src/apple_mail_mcp/templates.py`), `drafts/` (seed metadata per draft, `src/apple_mail_mcp/drafts.py`), `audit.jsonl` plus one rotated generation `audit.jsonl.1` (one line per logged operation, `audit_log_path()` in `src/apple_mail_mcp/security.py`), and `mail_automation.lock` (the cross-process Mail automation lock).
+- **`audit.jsonl` is personal data at rest**, not ordinary logging: it records who the user corresponds with and about what (recipients, subjects, sender account; never bodies). It lives outside the repository and is never committed, never pasted into a message or a report, and not something an agent reads to answer a question about the user's mail. It is bounded at about twice `AUDIT_ROTATE_BYTES` on disk.
 - Names that get used as filename stems must be regex-validated **before** building any path — see `_validate_name` in `templates.py` for the path-traversal-safe pattern. Don't `Path(user_input)` directly.
 - Storage objects should resolve their root at use time, not import time, so env-var overrides and test-time monkeypatching are honored. Example: `_get_template_store()` in `server.py`.
 

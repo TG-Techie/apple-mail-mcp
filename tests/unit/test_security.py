@@ -101,6 +101,33 @@ class TestOperationLogIsDurable:
         entry = json.loads(audit_log_path().read_text(encoding="utf-8"))
         assert entry["parameters"] == {"dir": str(tmp_path)}
 
+    def test_the_file_is_rotated_at_the_size_cap_keeping_one_generation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Bounded on disk: when the current file reaches the cap it
+        becomes audit.jsonl.1 (replacing the previous .1) and a new file
+        starts, so the store holds at most about two caps' worth."""
+        from apple_mail_mcp import security
+
+        monkeypatch.setenv("APPLE_MAIL_MCP_HOME", str(tmp_path))
+        monkeypatch.setattr(security, "AUDIT_ROTATE_BYTES", 300)
+        logger = OperationLogger()
+        for i in range(12):
+            logger.log_operation(f"op_{i}", {"n": i}, "success")
+
+        current = security.audit_log_path()
+        previous = current.with_name("audit.jsonl.1")
+        assert previous.is_file()
+        kept = previous.read_text().splitlines() + current.read_text().splitlines()
+        longest_line = max(len(line) + 1 for line in kept)
+        # Rotation happens on the append that finds the file at the cap, so
+        # a generation is at most the cap plus one entry.
+        assert 300 <= previous.stat().st_size < 300 + longest_line
+        assert current.stat().st_size < 300 + longest_line
+        # The newest entry is in the current file, and no third generation exists.
+        assert any('"op_11"' in line for line in current.read_text().splitlines())
+        assert not current.with_name("audit.jsonl.2").exists()
+
     def test_an_unwritable_log_warns_and_does_not_break_the_operation(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
