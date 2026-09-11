@@ -1375,6 +1375,7 @@ def save_attachments(
     message_id: str,
     save_directory: str,
     attachment_indices: list[int] = [],  # noqa: B006 — coerced to None below
+    overwrite: bool = False,
 ) -> dict[str, Any]:
     """
     Save attachments from a message to a directory.
@@ -1383,6 +1384,10 @@ def save_attachments(
         message_id: Message ID from search results
         save_directory: Directory path to save attachments to
         attachment_indices: Specific attachment indices to save (0-based), None for all
+        overwrite: Replace files already in the directory. Without it, a
+            name that is already taken is refused with `file_exists` and
+            nothing is written. Attachments sharing a name within the
+            message are always saved to distinct files (`name (2).ext`).
 
     Returns:
         Dictionary indicating success and number of attachments saved
@@ -1427,6 +1432,7 @@ def save_attachments(
             message_id=message_id,
             save_directory=save_path,
             attachment_indices=attachment_indices,
+            overwrite=overwrite,
         )
 
         operation_logger.log_operation(
@@ -1451,6 +1457,12 @@ def save_attachments(
             response["warnings"] = warnings
         return response
 
+    except FileExistsError as e:
+        return {
+            "success": False,
+            "error": f"{e}; nothing was written. Pass overwrite=True to replace it.",
+            "error_type": "file_exists",
+        }
     except (FileNotFoundError, ValueError) as e:
         logger.error(f"Validation error: {e}")
         return {

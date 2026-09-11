@@ -1754,6 +1754,26 @@ class TestSaveAttachments:
             "attachment enumeration failed for message 1: ... (error -10000)"
         ]
 
+    def test_existing_file_is_a_typed_error(
+        self, mock_mail: MagicMock, mock_logger: MagicMock, tmp_path: Any
+    ) -> None:
+        mock_mail.save_attachments.side_effect = FileExistsError(
+            "already in the directory: report.pdf"
+        )
+        result = save_attachments("12345", str(tmp_path))
+        assert result["success"] is False
+        assert result["error_type"] == "file_exists"
+        assert "report.pdf" in result["error"]
+        assert "overwrite=True" in result["error"]
+
+    def test_overwrite_is_passed_through(
+        self, mock_mail: MagicMock, mock_logger: MagicMock, tmp_path: Any
+    ) -> None:
+        mock_mail.save_attachments.return_value = (1, [])
+        result = save_attachments("12345", str(tmp_path), overwrite=True)
+        assert result["success"] is True
+        assert mock_mail.save_attachments.call_args.kwargs["overwrite"] is True
+
     def test_directory_not_found(
         self, mock_mail: MagicMock, mock_logger: MagicMock, tmp_path: Any
     ) -> None:

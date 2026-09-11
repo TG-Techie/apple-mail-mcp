@@ -1645,6 +1645,30 @@ class TestAttachmentPropertyGuardIntegration:
                 f"whole-walk failure resurfaced on {msg_id}: {w}"
             )
 
+    def test_save_refuses_to_replace_what_is_already_there(
+        self, connector: AppleMailConnector, test_account: str, tmp_path: Path
+    ) -> None:
+        """Mail's ``save`` replaces an existing file silently (probed live
+        2026-09-11), so the refusal has to come from us: a second save
+        into the same directory is refused with nothing written, and
+        overwrite=True is the one way through."""
+        msg_id = self._first_message_with_attachments(connector, test_account)
+        if msg_id is None:
+            pytest.skip("test inbox has no messages with attachments")
+
+        saved, _ = connector.save_attachments(msg_id, tmp_path)
+        assert saved >= 1
+        first = sorted(p for p in tmp_path.iterdir() if p.is_file())[0]
+        first.write_bytes(b"SENTINEL")
+
+        with pytest.raises(FileExistsError, match=first.name):
+            connector.save_attachments(msg_id, tmp_path)
+        assert first.read_bytes() == b"SENTINEL", "a refused save must write nothing"
+
+        saved_again, _ = connector.save_attachments(msg_id, tmp_path, overwrite=True)
+        assert saved_again == saved
+        assert first.read_bytes() != b"SENTINEL", "overwrite=True must replace the file"
+
     def test_save_succeeds_despite_property_warnings(
         self, connector: AppleMailConnector, test_account: str, tmp_path: Path
     ) -> None:

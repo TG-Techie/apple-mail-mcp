@@ -8,6 +8,7 @@ from apple_mail_mcp.exceptions import MailAppleScriptError
 from apple_mail_mcp.utils import (
     applescript_account_clause,
     applescript_iso_date_statements,
+    distinct_filenames,
     escape_applescript_string,
     format_applescript_list,
     get_flag_index,
@@ -461,6 +462,32 @@ class TestGetFlagIndex:
         assert get_flag_index("RED") == 0
         assert get_flag_index("Red") == 0
         assert get_flag_index("oRaNgE") == 1
+
+
+class TestDistinctFilenames:
+    """Two attachments in one message may share a name; writing both to
+    one directory otherwise leaves one file where two were reported."""
+
+    def test_distinct_names_are_unchanged(self) -> None:
+        assert distinct_filenames(["a.pdf", "b.pdf"]) == ["a.pdf", "b.pdf"]
+
+    def test_repeats_are_numbered_before_the_extension(self) -> None:
+        assert distinct_filenames(["r.pdf", "r.pdf", "r.pdf"]) == [
+            "r.pdf", "r (2).pdf", "r (3).pdf"
+        ]
+
+    def test_no_extension_and_dotfiles_are_numbered_at_the_end(self) -> None:
+        assert distinct_filenames(["notes", "notes"]) == ["notes", "notes (2)"]
+        assert distinct_filenames([".env", ".env"]) == [".env", ".env (2)"]
+
+    def test_generated_names_are_reserved(self) -> None:
+        # A literal "r (2).pdf" arriving after a generated one steps past it.
+        assert distinct_filenames(["r.pdf", "r.pdf", "r (2).pdf"]) == [
+            "r.pdf", "r (2).pdf", "r (2) (2).pdf"
+        ]
+
+    def test_order_is_preserved(self) -> None:
+        assert distinct_filenames(["b", "a", "b"]) == ["b", "a", "b (2)"]
 
 
 class TestSafeAttachmentFilename:

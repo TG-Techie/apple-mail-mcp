@@ -44,6 +44,7 @@ from .outbound_allowlist import assert_recipients_allowed_for_send
 from .utils import (
     applescript_account_clause,
     applescript_iso_date_statements,
+    distinct_filenames,
     escape_applescript_string,
     get_flag_index,
     parse_applescript_json,
@@ -2854,11 +2855,43 @@ class AppleMailConnector:
 
         return thread
 
+    @staticmethod
+    def _destination_names(
+        attachments: list[dict[str, Any]],
+        selected_zero_based: list[int],
+        save_directory: Path,
+        overwrite: bool,
+    ) -> list[str]:
+        """What each selected attachment will be called on disk, and that
+        those names are free to take.
+
+        Each declared name is reduced to a safe filename (sender-controlled
+        text never reaches a path expression), the batch is made distinct
+        so two attachments sharing a name land in two files, and unless
+        ``overwrite`` is set every name is checked against the directory
+        before anything is written. Raises ``FileExistsError`` naming the
+        taken files.
+        """
+        names = distinct_filenames([
+            safe_attachment_filename(
+                attachments[i].get("name"), f"attachment-{i + 1}"
+            )
+            for i in selected_zero_based
+        ])
+        if overwrite:
+            return names
+        taken = [n for n in names if (save_directory / n).exists()]
+        if taken:
+            raise FileExistsError("already in the directory: " + ", ".join(taken))
+        return names
+
     def save_attachments(
         self,
         message_id: str,
         save_directory: Path,
         attachment_indices: list[int] | None = None,
+        *,
+        overwrite: bool = False,
     ) -> tuple[int, list[str]]:
         """
         Save attachments from a message to a directory.
@@ -2880,6 +2913,16 @@ class AppleMailConnector:
             attachment_indices: 0-based indices of attachments to
                 save. ``None`` saves all. Out-of-range indices are
                 silently dropped (matches list-slicing semantics).
+            overwrite: Replace files already in ``save_directory``.
+                Without it, a name that is already taken is refused
+                with ``FileExistsError`` before anything is written.
+                Mail's ``save`` replaces an existing file without a word
+                (probed live 2026-09-11), so the check is made here, in
+                Python, before pass 2 runs; a file created by someone
+                else in the moment between that check and Mail's save
+                is the one window this does not cover. Attachments that
+                share a name within the message are always written to
+                distinct files (``name (2).ext``).
 
         Returns:
             ``(saved_count, warnings)``.
@@ -2894,6 +2937,8 @@ class AppleMailConnector:
 
         Raises:
             FileNotFoundError: save_directory doesn't exist.
+            FileExistsError: a destination name is already taken and
+                ``overwrite`` is False. Nothing was written.
             ValueError: save_directory path validation failed.
             MailMessageNotFoundError: id resolves to no message.
         """
@@ -2970,12 +3015,9 @@ class AppleMailConnector:
         # `attachment-N` fallback: an unreadable name arrives here as a
         # non-string and takes the same fallback, and pass 1 has already
         # emitted its own warning about it.
-        safe_names = [
-            safe_attachment_filename(
-                attachments[i].get("name"), f"attachment-{i + 1}"
-            )
-            for i in selected_zero_based
-        ]
+        safe_names = self._destination_names(
+            attachments, selected_zero_based, save_directory, overwrite
+        )
         safe_names_literal = ", ".join(
             f'"{escape_applescript_string(n)}"' for n in safe_names
         )

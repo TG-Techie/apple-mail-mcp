@@ -4693,6 +4693,91 @@ class TestSaveAttachmentsPathTraversal:
         assert '\\"hi\\"' in script or '\\"' in script
 
 
+class TestSaveAttachmentsDoesNotOverwriteUnasked:
+    """Mail's ``save ... in`` replaces an existing file without a word
+    (probed live 2026-09-11: a sentinel written over a saved attachment
+    was back to the attachment's bytes after a second save). So a
+    directory the user already had files in was silently clobbered, and
+    two attachments sharing a name inside one message collapsed into one
+    while ``saved_count`` said two.
+
+    Names are made unique within the batch before the script runs, and a
+    name that already exists in the directory is refused before anything
+    is written unless ``overwrite=True``.
+    """
+
+    @pytest.fixture
+    def connector(self) -> AppleMailConnector:
+        return AppleMailConnector(timeout=30)
+
+    @staticmethod
+    def _enumeration(*names: str) -> str:
+        import json
+
+        return json.dumps(
+            {
+                "attachments": [
+                    {"name": n, "mime_type": "application/pdf", "size": 1, "downloaded": True}
+                    for n in names
+                ],
+                "warnings": [],
+            }
+        )
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_duplicate_names_in_one_message_get_distinct_files(
+        self, mock_run: MagicMock, connector: AppleMailConnector, tmp_path: Path
+    ) -> None:
+        mock_run.side_effect = [
+            self._enumeration("report.pdf", "report.pdf", "notes"),
+            '{"saved":3,"warnings":[]}',
+        ]
+        connector.save_attachments("12345", tmp_path)
+        script = mock_run.call_args_list[1][0][0]
+        assert '"report.pdf"' in script
+        assert '"report (2).pdf"' in script
+        assert '"notes"' in script
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_an_existing_file_is_refused_before_the_save_script_runs(
+        self, mock_run: MagicMock, connector: AppleMailConnector, tmp_path: Path
+    ) -> None:
+        (tmp_path / "report.pdf").write_bytes(b"mine")
+        mock_run.side_effect = [self._enumeration("report.pdf", "other.pdf")]
+        with pytest.raises(FileExistsError, match="report.pdf"):
+            connector.save_attachments("12345", tmp_path)
+        assert mock_run.call_count == 1, "pass 2 must not run"
+        assert (tmp_path / "report.pdf").read_bytes() == b"mine"
+        assert not (tmp_path / "other.pdf").exists(), "nothing is written on a refusal"
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_overwrite_true_replaces_an_existing_file(
+        self, mock_run: MagicMock, connector: AppleMailConnector, tmp_path: Path
+    ) -> None:
+        (tmp_path / "report.pdf").write_bytes(b"mine")
+        mock_run.side_effect = [
+            self._enumeration("report.pdf"),
+            '{"saved":1,"warnings":[]}',
+        ]
+        saved, warnings = connector.save_attachments("12345", tmp_path, overwrite=True)
+        assert saved == 1
+        assert mock_run.call_count == 2
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_only_the_selected_indices_are_checked(
+        self, mock_run: MagicMock, connector: AppleMailConnector, tmp_path: Path
+    ) -> None:
+        """A collision on an attachment the caller did not ask for is not
+        a collision."""
+        (tmp_path / "report.pdf").write_bytes(b"mine")
+        mock_run.side_effect = [
+            self._enumeration("report.pdf", "other.pdf"),
+            '{"saved":1,"warnings":[]}',
+        ]
+        saved, _ = connector.save_attachments("12345", tmp_path, attachment_indices=[1])
+        assert saved == 1
+
+
 class TestAttachmentPropertyGuards:
     """One unreadable attachment PROPERTY must not kill the whole walk.
 

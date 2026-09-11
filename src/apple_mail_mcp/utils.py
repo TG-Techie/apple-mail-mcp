@@ -489,6 +489,32 @@ def walk_thread_graph(
     return accepted
 
 
+def distinct_filenames(names: list[str]) -> list[str]:
+    """Make a batch of filenames distinct from each other, in order.
+
+    The first occurrence keeps its name; later ones take ``name (2)``,
+    ``name (3)`` and so on, before the extension, the way Finder does.
+    Two attachments in one message may share a name, and writing both to
+    one directory otherwise leaves one file where the caller was told
+    two were saved. The generated names are themselves reserved, so a
+    later literal ``report (2).pdf`` does not collide with one.
+    """
+    taken: set[str] = set()
+    out: list[str] = []
+    for name in names:
+        candidate = name
+        stem, dot, ext = name.rpartition(".")
+        if not stem:  # no extension, or a dotfile
+            stem, dot, ext = name, "", ""
+        n = 2
+        while candidate in taken:
+            candidate = f"{stem} ({n}){dot}{ext}"
+            n += 1
+        taken.add(candidate)
+        out.append(candidate)
+    return out
+
+
 def safe_attachment_filename(raw: object, fallback: str) -> str:
     """Reduce an attachment's declared name to a bare, safe filename.
 

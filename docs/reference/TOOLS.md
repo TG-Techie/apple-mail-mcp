@@ -540,6 +540,7 @@ Save attachments from a message to a directory.
 | `message_id` | string | Yes | - | Message ID to save attachments from |
 | `save_directory` | string | Yes | - | Directory path to save attachments |
 | `attachment_indices` | list[int] | No | None | Specific attachment indices (None = all) |
+| `overwrite` | boolean | No | false | Replace files already in the directory. Without it, a name that is already taken is refused with `file_exists` and nothing is written. |
 
 **Returns:**
 
@@ -576,7 +577,9 @@ save_attachments(
 - Directory must exist and be writable
 - Path traversal attacks prevented
 - Filenames sanitized for safety
-- Existing files will be overwritten
+- Existing files are never replaced unless `overwrite=True`; a collision is
+  refused before anything is written (`file_exists`). Attachments that share
+  a name within one message are saved as `name.ext`, `name (2).ext`, …
 
 ---
 
