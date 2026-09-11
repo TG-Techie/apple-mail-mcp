@@ -84,6 +84,175 @@ class TestDraftCreate:
         assert kwargs["send_now"] is False
 
 
+class TestDraftCreateAttachmentsAreCheckedLikeASend:
+    """A draft is a file handed to Mail as much as a send is: the same
+    three checks (exists, no executable extension, under 25MB) run before
+    the connector is reached. Before this the draft path only checked
+    existence, and only inside the connector."""
+
+    @pytest.mark.asyncio
+    async def test_missing_file_fails_before_connector(
+        self, isolated_drafts: None, mock_mail: MagicMock
+    ) -> None:
+        from apple_mail_mcp.server import draft_create
+
+        result = await draft_create(
+            to=["alice@example.com"], subject="x", body="b",
+            attachment_paths=["/nonexistent/nope.pdf"],
+        )
+        assert result["success"] is False
+        assert result["error_type"] == "file_not_found"
+        mock_mail.create_draft.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_blocked_extension_fails_before_connector(
+        self, isolated_drafts: None, mock_mail: MagicMock, tmp_path: Any
+    ) -> None:
+        from apple_mail_mcp.server import draft_create
+
+        f = tmp_path / "installer.exe"
+        f.write_bytes(b"MZ")
+        result = await draft_create(
+            to=["alice@example.com"], subject="x", body="b",
+            attachment_paths=[str(f)],
+        )
+        assert result["success"] is False
+        assert result["error_type"] == "validation_error"
+        assert "installer.exe" in result["error"]
+        mock_mail.create_draft.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_oversize_fails_before_connector(
+        self, isolated_drafts: None, mock_mail: MagicMock, tmp_path: Any,
+        monkeypatch: Any,
+    ) -> None:
+        from apple_mail_mcp.server import draft_create
+
+        f = tmp_path / "big.bin"
+        f.write_bytes(b"x")
+        real_stat = type(f).stat
+
+        def fake_stat(self, **kw):  # noqa: ANN001, ANN003
+            st = real_stat(self, **kw)
+            if self.name == "big.bin":
+                import os
+                fake = list(st)
+                fake[6] = 26 * 1024 * 1024  # st_size
+                return os.stat_result(fake)
+            return st
+
+        monkeypatch.setattr(type(f), "stat", fake_stat)
+        result = await draft_create(
+            to=["alice@example.com"], subject="x", body="b",
+            attachment_paths=[str(f)],
+        )
+        assert result["success"] is False
+        assert result["error_type"] == "validation_error"
+        assert "25" in result["error"]
+        mock_mail.create_draft.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_an_ordinary_file_still_reaches_the_connector(
+        self, isolated_drafts: None, mock_mail: MagicMock, tmp_path: Any
+    ) -> None:
+        from pathlib import Path
+
+        from apple_mail_mcp.server import draft_create
+
+        f = tmp_path / "report.pdf"
+        f.write_bytes(b"%PDF-1.4 fake")
+        mock_mail.create_draft.return_value = {
+            "draft_id": "ABCD", "sent_message_id": ""
+        }
+        result = await draft_create(
+            to=["alice@example.com"], subject="x", body="b",
+            attachment_paths=[str(f)],
+        )
+        assert result["success"] is True
+        kwargs = mock_mail.create_draft.call_args.kwargs
+        assert kwargs["attachment_paths"] == [Path(str(f))]
+
+
+class TestDraftUpdateAttachmentsAreCheckedLikeASend:
+    """Caller-supplied replacement attachments get the same checks as
+    draft_create, and they run before the existing draft is deleted, so
+    a refused update leaves the draft exactly as it was. Attachments
+    carried over from the existing draft (attachment_paths=None) are
+    Mail's state rather than caller input and are not re-checked."""
+
+    _STATE = {
+        "draft_id": "OLD",
+        "to": ["alice@example.com"], "cc": [], "bcc": [],
+        "subject": "hi", "body": "x",
+        "in_reply_to": "", "references": "", "attachment_names": [],
+    }
+
+    @pytest.mark.asyncio
+    async def test_blocked_extension_is_refused_and_the_draft_is_untouched(
+        self, isolated_drafts: None, mock_mail: MagicMock, tmp_path: Any
+    ) -> None:
+        from apple_mail_mcp.server import draft_update
+
+        mock_mail.get_draft_state.return_value = dict(self._STATE)
+        f = tmp_path / "payload.sh"
+        f.write_text("#!/bin/sh\n")
+        result = await draft_update(draft_id="OLD", attachment_paths=[str(f)])
+        assert result["success"] is False
+        assert result["error_type"] == "validation_error"
+        assert "payload.sh" in result["error"]
+        mock_mail.delete_draft.assert_not_called()
+        mock_mail.create_draft.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_missing_file_is_refused_and_the_draft_is_untouched(
+        self, isolated_drafts: None, mock_mail: MagicMock
+    ) -> None:
+        from apple_mail_mcp.server import draft_update
+
+        mock_mail.get_draft_state.return_value = dict(self._STATE)
+        result = await draft_update(
+            draft_id="OLD", attachment_paths=["/nonexistent/nope.pdf"]
+        )
+        assert result["success"] is False
+        assert result["error_type"] == "file_not_found"
+        mock_mail.delete_draft.assert_not_called()
+        mock_mail.create_draft.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_clearing_attachments_needs_no_files(
+        self, isolated_drafts: None, mock_mail: MagicMock
+    ) -> None:
+        from apple_mail_mcp.server import draft_update
+
+        mock_mail.get_draft_state.return_value = dict(self._STATE)
+        mock_mail.create_draft.return_value = {
+            "draft_id": "NEW", "sent_message_id": ""
+        }
+        result = await draft_update(draft_id="OLD", attachment_paths=[])
+        assert result["success"] is True
+        assert mock_mail.create_draft.call_args.kwargs["attachment_paths"] == []
+
+    @pytest.mark.asyncio
+    async def test_carried_over_attachments_are_not_rechecked(
+        self, isolated_drafts: None, mock_mail: MagicMock, tmp_path: Any
+    ) -> None:
+        from pathlib import Path
+
+        from apple_mail_mcp.server import draft_update
+
+        state = dict(self._STATE)
+        state["attachment_names"] = ["old.exe"]
+        mock_mail.get_draft_state.return_value = state
+        extracted = [Path(tmp_path / "old.exe")]
+        mock_mail.extract_draft_attachments.return_value = extracted
+        mock_mail.create_draft.return_value = {
+            "draft_id": "NEW", "sent_message_id": ""
+        }
+        result = await draft_update(draft_id="OLD", body="revised")
+        assert result["success"] is True
+        assert mock_mail.create_draft.call_args.kwargs["attachment_paths"] == extracted
+
+
 class TestDraftUpdate:
     @pytest.mark.asyncio
     async def test_returns_new_draft_id(

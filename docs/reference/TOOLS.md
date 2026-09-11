@@ -840,7 +840,7 @@ Create a draft (fresh, reply, or forward). Optionally send immediately.
 | `bcc` | array[string] | No | None | BCC recipients. |
 | `subject` | string | When fresh | None | Subject. For reply/forward, `None` keeps Mail's `Re:`/`Fwd:` prefix. |
 | `body` | string | No | "" | Body text. For reply/forward, a non-empty body **replaces** Mail's auto-quoted content (the auto-quote isn't readable from AppleScript before save). Empty body leaves Mail's auto-quote intact. |
-| `attachment_paths` | array[string] | No | None | List of file paths to attach. |
+| `attachment_paths` | array[string] | No | None | List of file paths to attach. Each must exist, must not carry an executable extension (`.exe`, `.sh`, …), and must be under 25MB — the same checks as `email_send_html`. |
 | `reply_all` | boolean | No | False | For `reply_to` only — use `reply to all`. |
 | `template_name` | string | No | None | Optional template to render for `subject` + `body`. Caller-supplied `subject`/`body` override the rendered output. |
 | `template_vars` | object | No | None | Variables for the template renderer. Requires `template_name`. |
@@ -898,7 +898,8 @@ create_draft(
 - `validation_error`: Mutually exclusive seeds, missing required fields, or `template_vars` without `template_name`.
 - `message_not_found`: `reply_to` / `forward_of` doesn't match any Mail.app message.
 - `account_not_found`: `from_account` doesn't match.
-- `file_not_found`: An attachment path doesn't exist.
+- `file_not_found` / `validation_error` (attachments): a listed file is
+  missing, has a blocked extension, or exceeds 25MB — no draft was created.
 - `cancelled`: User declined the elicitation prompt (when `send_now=True`).
 - `applescript_error`, `unknown`: Lower-level failures.
 
@@ -923,7 +924,7 @@ after this call. Callers caching the id must re-read the response.
 | `to` / `cc` / `bcc` | array[string] | No | None | Override recipient groups: `None` keeps existing, `[]` clears, populated list replaces. |
 | `subject` | string | No | None | Override subject. `None` keeps existing. |
 | `body` | string | No | None | Override body. `None` keeps existing; non-None replaces (including `""`). |
-| `attachment_paths` | array[string] | No | None | Override attachments: `None` **preserves existing** (extracted to a temp dir and re-attached); `[]` clears; populated list replaces. |
+| `attachment_paths` | array[string] | No | None | Override attachments: `None` **preserves existing** (extracted to a temp dir and re-attached, not re-checked); `[]` clears; populated list replaces, and is checked like a send (exists, no executable extension, under 25MB) before the existing draft is touched — a refused list leaves the draft as it was. |
 | `template_name` / `template_vars` | string / object | No | None | Optional template render. User-supplied `subject`/`body` override the rendered output. |
 | `from_account` | string | No | None | Override sender. |
 | `send_now` | boolean | No | False | `False` saves new draft. `True` sends after eliciting confirmation. |

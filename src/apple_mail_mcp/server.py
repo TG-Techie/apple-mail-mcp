@@ -2312,15 +2312,43 @@ def _fresh_send_attachment_guard(
     }
 
 
-def _validate_html_send_attachments(
+def _check_update_attachments(
+    send_now: bool,
+    seed_kind: str,
+    attachment_paths: list[str] | None,
+    existing_names: list[str],
+) -> dict[str, Any] | None:
+    """May these attachments go on the updated draft? Runs before anything
+    is deleted, so a refusal leaves the draft as it was.
+
+    Two questions, in order: the fresh-send restriction, which applies to
+    carried-over attachments as much as new ones; then the file checks on
+    a replacement list, which is caller input. ``None`` (carry over) and
+    ``[]`` (clear) hand in no files and get no file checks.
+    """
+    guard_err = _fresh_send_attachment_guard(
+        send_now, seed_kind, attachment_paths, existing_names
+    )
+    if guard_err:
+        return guard_err
+    if attachment_paths:
+        return _validate_attachment_files(attachment_paths)
+    return None
+
+
+def _validate_attachment_files(
     attachment_paths: list[str],
 ) -> dict[str, Any] | None:
-    """Validate attachment files for email_send_html BEFORE any compose.
+    """Validate files the caller asks to attach, before anything is composed.
 
     Checks per the security checklist: file exists, extension not in the
     executable blocklist, size within the 25MB cap. Returns an error
-    response dict, or None when all files pass. (The draft path predates
-    these checks and only verifies existence — see #TODO in TOOLS.md.)
+    response dict, or None when all files pass. Every path that takes
+    attachment paths from the caller runs this — email_send_html,
+    create_draft and update_draft alike — so a draft cannot carry what a
+    send would refuse. Attachments update_draft carries over from the
+    existing draft are Mail's state, not caller input, and are not
+    re-checked here.
     """
     from pathlib import Path as _P
 
@@ -2700,7 +2728,9 @@ async def create_draft(
         body: Body text. For reply/forward, a non-empty body REPLACES
             Mail's auto-quoted content; an empty body leaves the
             auto-quote intact (matches Mail.app's default reply behavior).
-        attachment_paths: List of file paths to attach.
+        attachment_paths: List of file paths to attach. Each must exist,
+            must not carry an executable extension, and must be under
+            25MB — the same checks as a send.
         reply_all: For ``reply_to`` only — use ``reply to all``.
         template_name: Optional template to render for ``subject`` and
             ``body``. Caller-supplied ``subject``/``body`` override the
@@ -2754,6 +2784,11 @@ async def create_draft(
         fresh_err = _validate_fresh_seed_fields(seed_kind, to, subject)
         if fresh_err:
             return fresh_err
+
+        if attachment_paths:
+            attach_err = _validate_attachment_files(attachment_paths)
+            if attach_err:
+                return attach_err
 
         # ----------------------------------------------------------------
         # Send-only checks (drafts are local — no rate limit / safety).
@@ -2860,7 +2895,10 @@ async def update_draft(
         body: Override body. None keeps existing. Non-None replaces
             (including the empty string, which clears).
         attachment_paths: Override attachments. None preserves existing
-            via temp-dir extraction; [] clears; list replaces.
+            via temp-dir extraction; [] clears; list replaces. A
+            replacement list gets the same checks as a send (exists, no
+            executable extension, under 25MB) before the existing draft
+            is touched.
         template_name / template_vars: Optional template render. User-
             supplied subject/body override the rendered output.
         from_account: Override sender.
@@ -2889,12 +2927,12 @@ async def update_draft(
             draft_id, state, store
         )
 
-        guard_err = _fresh_send_attachment_guard(
+        attach_err = _check_update_attachments(
             send_now, seed_kind, attachment_paths,
             state.get("attachment_names", []) or [],
         )
-        if guard_err:
-            return guard_err
+        if attach_err:
+            return attach_err
 
         try:
             final_subject, final_body = _resolve_update_subject_body(
@@ -3105,7 +3143,8 @@ async def draft_create(
             reply/forward (None keeps Mail's auto-derived prefix).
         body: Body text. For reply/forward, replaces Mail's auto-quoted
             content if non-empty.
-        attachment_paths: File paths to attach. Each must exist.
+        attachment_paths: File paths to attach. Each must exist, must
+            not carry an executable extension, and must be under 25MB.
         reply_all: For ``reply_to`` only — use Mail's reply-all logic.
         template_name / template_vars: Optional template render.
         from_account: Mail.app account name or UUID. None uses Mail's
@@ -3170,7 +3209,9 @@ async def draft_update(
         subject: Subject override. None=keep.
         body: Body override. None=keep; empty string=clear.
         attachment_paths: Attachment override (None=keep, []=clear,
-            list=replace).
+            list=replace). A replacement list is checked like a send
+            (exists, no executable extension, under 25MB) before the
+            existing draft is touched.
         template_name / template_vars: Optional template render.
         from_account: Sender override.
 
@@ -3373,7 +3414,7 @@ def _validate_html_send_request(
             "error_type": "attachments_unsupported",
         }
     if attachment_paths:
-        attach_err = _validate_html_send_attachments(attachment_paths)
+        attach_err = _validate_attachment_files(attachment_paths)
         if attach_err:
             return attach_err
 
