@@ -1010,6 +1010,12 @@ update_draft(draft_id="161055", body="Final version", send_now=True)
 Move a draft to Trash. One-way discard for the lifecycle; Mail.app no
 longer treats trashed drafts as editable.
 
+A draft id names a draft in any account. The tool reads the draft's
+account back from Mail before acting (the audit entry carries it), so
+under `MAIL_TEST_MODE` a draft outside the test account is refused with
+`safety_violation` and left as it is; `draft_update` and `draft_send`
+do the same.
+
 **Parameters:**
 
 | Parameter | Type | Required | Default | Description |

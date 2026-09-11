@@ -5560,6 +5560,25 @@ class TestGetDraftState:
         assert "|sender|:" in script
 
     @patch.object(AppleMailConnector, "_run_applescript")
+    def test_reads_the_account_back(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        """A draft id names a draft in any account. The account the draft
+        sits in is part of its state, read from the mailbox Mail resolves
+        the draft to, so a tool acting by id can say which account it is
+        about to touch."""
+        mock_run.return_value = (
+            '{"found":true,"draft_id":"x","to":[],"cc":[],"bcc":[],'
+            '"subject":"","body":"","in_reply_to":"","references":"",'
+            '"attachment_names":[],"sender":"","account":"Work"}'
+        )
+        state = connector.get_draft_state("x")
+        assert state["account"] == "Work"
+        script = mock_run.call_args.args[0]
+        assert "name of account of mailbox of foundDraft" in script
+        assert "|account|:" in script
+
+    @patch.object(AppleMailConnector, "_run_applescript")
     def test_not_found_raises(
         self, mock_run: MagicMock, connector: AppleMailConnector
     ) -> None:

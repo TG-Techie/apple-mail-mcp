@@ -1113,6 +1113,7 @@ class TestANamedSenderIsConfinedInTestMode:
         "subject": "hi", "body": "x",
         "in_reply_to": "", "references": "", "attachment_names": [],
         "sender": "Agent <agent@example.com>",
+        "account": "TestAccount",
     }
 
     @pytest.fixture
@@ -1193,3 +1194,111 @@ class TestANamedSenderIsConfinedInTestMode:
         assert result["success"] is False
         assert result["error_type"] == "safety_violation"
         mock_mail._send_html_email.assert_not_called()
+
+
+class TestADraftIdReachesEveryAccountInTestMode:
+    """A draft id names a draft in any account, and draft_delete,
+    draft_update and draft_send take nothing else. Under MAIL_TEST_MODE
+    each now reads the draft's account back from Mail and acts only if
+    it is the test account; a draft whose account Mail cannot name is
+    not in the test account either. Before, the ids an integration run
+    held were the only thing keeping it off a real account's drafts."""
+
+    @staticmethod
+    def _state(account: str) -> dict[str, Any]:
+        return {
+            "draft_id": "OLD",
+            "to": ["alice@example.com"], "cc": [], "bcc": [],
+            "subject": "hi", "body": "x",
+            "in_reply_to": "", "references": "", "attachment_names": [],
+            "sender": "", "account": account,
+        }
+
+    @pytest.fixture
+    def test_mode(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from apple_mail_mcp.security import _get_test_account_identifiers
+
+        _get_test_account_identifiers.cache_clear()
+        monkeypatch.setenv("MAIL_TEST_MODE", "true")
+        monkeypatch.setenv("MAIL_TEST_ACCOUNT", "TestAccount")
+
+    def test_delete_of_a_draft_in_another_account_is_refused(
+        self, isolated_drafts: None, mock_mail: MagicMock, test_mode: None,
+    ) -> None:
+        from apple_mail_mcp.server import draft_delete
+
+        mock_mail.get_draft_state.return_value = self._state("Work")
+        result = draft_delete(draft_id="OLD")
+        assert result["success"] is False
+        assert result["error_type"] == "safety_violation"
+        mock_mail.delete_draft.assert_not_called()
+
+    def test_delete_of_a_draft_with_no_account_is_refused(
+        self, isolated_drafts: None, mock_mail: MagicMock, test_mode: None,
+    ) -> None:
+        from apple_mail_mcp.server import draft_delete
+
+        mock_mail.get_draft_state.return_value = self._state("")
+        result = draft_delete(draft_id="OLD")
+        assert result["success"] is False
+        assert result["error_type"] == "safety_violation"
+        mock_mail.delete_draft.assert_not_called()
+
+    def test_delete_of_a_draft_in_the_test_account_proceeds(
+        self, isolated_drafts: None, mock_mail: MagicMock, test_mode: None,
+    ) -> None:
+        from apple_mail_mcp.server import draft_delete
+
+        mock_mail.get_draft_state.return_value = self._state("TestAccount")
+        result = draft_delete(draft_id="OLD")
+        assert result["success"] is True
+        mock_mail.delete_draft.assert_called_once_with("OLD")
+
+    def test_delete_of_a_missing_draft_is_still_not_found(
+        self, isolated_drafts: None, mock_mail: MagicMock, test_mode: None,
+    ) -> None:
+        from apple_mail_mcp.exceptions import MailDraftNotFoundError
+        from apple_mail_mcp.server import draft_delete
+
+        mock_mail.get_draft_state.side_effect = MailDraftNotFoundError("no")
+        result = draft_delete(draft_id="OLD")
+        assert result["success"] is False
+        assert result["error_type"] == "draft_not_found"
+
+    def test_outside_test_mode_delete_does_not_care_where_the_draft_is(
+        self,
+        isolated_drafts: None,
+        mock_mail: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from apple_mail_mcp.server import draft_delete
+
+        monkeypatch.delenv("MAIL_TEST_MODE", raising=False)
+        mock_mail.get_draft_state.return_value = self._state("")
+        assert draft_delete(draft_id="OLD")["success"] is True
+
+    @pytest.mark.asyncio
+    async def test_update_of_a_draft_in_another_account_is_refused(
+        self, isolated_drafts: None, mock_mail: MagicMock, test_mode: None,
+    ) -> None:
+        from apple_mail_mcp.server import draft_update
+
+        mock_mail.get_draft_state.return_value = self._state("Work")
+        result = await draft_update(draft_id="OLD", body="revised")
+        assert result["success"] is False
+        assert result["error_type"] == "safety_violation"
+        mock_mail.create_draft.assert_not_called()
+        mock_mail.delete_draft.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_send_of_a_draft_in_another_account_is_refused(
+        self, isolated_drafts: None, mock_mail: MagicMock, test_mode: None,
+    ) -> None:
+        from apple_mail_mcp.server import draft_send
+
+        mock_mail.get_draft_state.return_value = self._state("Work")
+        result = await draft_send(draft_id="OLD")
+        assert result["success"] is False
+        assert result["error_type"] == "safety_violation"
+        mock_mail.create_draft.assert_not_called()
+        mock_mail.delete_draft.assert_not_called()

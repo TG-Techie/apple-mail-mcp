@@ -542,6 +542,27 @@ class TestDraftsLifecycleIntegration:
         finally:
             connector.delete_draft(draft_id)
 
+    def test_state_reads_the_account_back(
+        self, connector: AppleMailConnector, test_account: str
+    ) -> None:
+        """A draft saved from the test account reports that account as
+        the one it sits in, resolved through Mail's aggregate drafts
+        mailbox. This is what test mode confines draft_delete,
+        draft_update and draft_send with."""
+        result = connector.create_draft(
+            seed="new",
+            to=["target@example.com"],
+            subject="ZZZ-AMM-INTEG-ACCOUNT",
+            body="whose draft is this",
+            from_account=test_account,
+        )
+        draft_id = result["draft_id"]
+        try:
+            state = connector.get_draft_state(draft_id)
+            assert state["account"] == test_account, state["account"]
+        finally:
+            connector.delete_draft(draft_id)
+
     def test_update_keeps_the_draft_in_its_account(
         self,
         connector: AppleMailConnector,

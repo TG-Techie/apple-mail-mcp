@@ -413,7 +413,16 @@ class TestCheckTestModeSafety:
     # none given it stood aside, and test mode did not confine a delete
     # or a move to the test account at all.
 
-    @pytest.mark.parametrize("operation", ["delete_messages", "update_message"])
+    @pytest.mark.parametrize(
+        "operation",
+        [
+            "delete_messages", "update_message",
+            # A draft id likewise names a draft in any account; the tools
+            # read the draft's account back and pass it here, and one Mail
+            # cannot name (a local draft) is not the test account.
+            "delete_draft", "update_draft",
+        ],
+    )
     def test_a_mutation_without_an_account_is_refused_in_test_mode(
         self, monkeypatch: Any, operation: str
     ) -> None:
@@ -695,6 +704,8 @@ class TestAccountGateCoversEveryAccountScopedMutation:
             "create_draft",
             "update_draft",
             "email_send_html",
+            # The account a draft named by id sits in.
+            "delete_draft",
         ],
     )
     def test_mutation_on_another_account_is_refused(
@@ -712,6 +723,7 @@ class TestAccountGateCoversEveryAccountScopedMutation:
         [
             "update_mailbox", "delete_mailbox", "delete_messages",
             "create_draft", "update_draft", "email_send_html",
+            "delete_draft",
         ],
     )
     def test_mutation_on_the_test_account_is_allowed(
@@ -811,7 +823,9 @@ class TestEverySendPathIsConfinedInTestMode:
         monkeypatch.setenv("MAIL_TEST_MODE", "true")
         monkeypatch.setenv("MAIL_TEST_ACCOUNT", "TestAccount")
         result = check_test_mode_safety(
-            operation, recipients=["test@example.com", "real@person.com"],
+            operation,
+            account="TestAccount",
+            recipients=["test@example.com", "real@person.com"],
         )
         assert result is not None, f"{operation} is not a gated send"
         assert result["error_type"] == "safety_violation"
@@ -827,6 +841,9 @@ class TestEverySendPathIsConfinedInTestMode:
         at send time, past this gate."""
         monkeypatch.setenv("MAIL_TEST_MODE", "true")
         monkeypatch.setenv("MAIL_TEST_ACCOUNT", "TestAccount")
-        result = check_test_mode_safety(operation, recipients=[])
+        result = check_test_mode_safety(
+            operation, account="TestAccount", recipients=[],
+        )
         assert result is not None, f"{operation} is not a gated send"
+        assert "explicit recipients" in result["error"]
         assert result["error_type"] == "safety_violation"

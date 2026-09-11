@@ -326,6 +326,8 @@ ACCOUNT_GATED_OPERATIONS = {
     "create_draft",
     "update_draft",
     "email_send_html",
+    # The account the draft named by id sits in.
+    "delete_draft",
 }
 
 # Of those, the ones that change mail and can be called without naming an
@@ -335,6 +337,11 @@ ACCOUNT_GATED_OPERATIONS = {
 ACCOUNT_REQUIRED_MUTATIONS = {
     "update_message",
     "delete_messages",
+    # A draft id likewise names a draft in any account. The tools read the
+    # draft's account back from Mail and pass it; one Mail cannot name (a
+    # local draft) is not the test account.
+    "update_draft",
+    "delete_draft",
 }
 
 # Every operation that delivers mail. In test mode each is confined to
@@ -457,6 +464,8 @@ def check_test_mode_safety(
     - Account-gated operations must target MAIL_TEST_ACCOUNT.
     - delete_messages and update_message must name the test account;
       with no account they would act on message ids from any account.
+      delete_draft and update_draft likewise: the tools pass the account
+      the draft was found in, and a draft with none is refused.
     - Send operations, on a call that sends, must send only to RFC 2606
       reserved domains and must name every recipient. ``recipients``
       says whether the call sends: None means nothing is sent by this

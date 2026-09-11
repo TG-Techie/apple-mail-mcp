@@ -117,7 +117,7 @@ surface.
 
 **Hard rule:** If you wrote or modified AppleScript in the connector, integration tests must cover it before merge.
 
-**Integration test safety:** When running tests via `server.py` tools, set `MAIL_TEST_MODE=true` and `MAIL_TEST_ACCOUNT=<test account name>`. The safety gate blocks destructive operations on non-test accounts (and refuses `delete_messages`/`update_message` that name no account at all, since message ids reach every account), refuses a `from_account` that is not the test account on the draft and send tools, and blocks sends to non-reserved recipient domains (must be @example.com, .test, .invalid, .localhost, etc.) on every send path, a rule's `forward_to` included. See `check_test_mode_safety` in [src/apple_mail_mcp/security.py](src/apple_mail_mcp/security.py).
+**Integration test safety:** When running tests via `server.py` tools, set `MAIL_TEST_MODE=true` and `MAIL_TEST_ACCOUNT=<test account name>`. The safety gate blocks destructive operations on non-test accounts (and refuses `delete_messages`/`update_message` that name no account at all, since message ids reach every account), refuses a `from_account` that is not the test account on the draft and send tools, refuses `draft_delete`/`draft_update`/`draft_send` on a draft that sits in another account (or one whose account Mail cannot name), and blocks sends to non-reserved recipient domains (must be @example.com, .test, .invalid, .localhost, etc.) on every send path, a rule's `forward_to` included. See `check_test_mode_safety` in [src/apple_mail_mcp/security.py](src/apple_mail_mcp/security.py).
 
 ## Operating Discipline
 

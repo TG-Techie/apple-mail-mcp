@@ -3981,9 +3981,14 @@ class AppleMailConnector:
         attachment names from a saved draft.
 
         Used by ``update_draft`` to merge the caller's overrides with
-        the draft's current state before delete-and-recreate. The sender
+        the draft's current state before recreate-and-delete. The sender
         is read back so the recreated draft stays in the account the
-        draft was saved from rather than moving to Mail's default.
+        draft was saved from rather than moving to Mail's default. The
+        account is the one Mail resolves the draft's mailbox to (the
+        aggregate ``drafts mailbox`` yields the concrete per-account
+        message), so a tool acting on a draft by id can say which
+        account it is about to touch; it is ``""`` for a draft whose
+        mailbox has no account (a local one).
 
         Iterates Mail's aggregate ``drafts mailbox`` manually (rather than
         `whose id is`) because newly-created drafts can take a moment to
@@ -4003,6 +4008,7 @@ class AppleMailConnector:
                 "references": "<msg-id> ..." | "",
                 "attachment_names": ["foo.pdf", ...],
                 "sender": "Name <email>" | "email" | "",
+                "account": "<account name>" | "",
             }``
 
         Raises:
@@ -4075,8 +4081,12 @@ class AppleMailConnector:
                 try
                     set draftSender to (sender of foundDraft)
                 end try
+                set draftAccount to ""
+                try
+                    set draftAccount to (name of account of mailbox of foundDraft)
+                end try
 
-                set resultData to {{|found|:true, |draft_id|:targetId, |to|:toList, |cc|:ccList, |bcc|:bccList, |subject|:draftSubject, |body|:draftBody, |in_reply_to|:inReplyTo, |references|:refs, |attachment_names|:attNames, |sender|:draftSender}}
+                set resultData to {{|found|:true, |draft_id|:targetId, |to|:toList, |cc|:ccList, |bcc|:bccList, |subject|:draftSubject, |body|:draftBody, |in_reply_to|:inReplyTo, |references|:refs, |attachment_names|:attNames, |sender|:draftSender, |account|:draftAccount}}
             end if
         end tell
         """

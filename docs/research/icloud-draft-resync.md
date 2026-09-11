@@ -132,6 +132,39 @@ The aggregate `drafts mailbox` and the per-account mailbox listed a
 new draft at the same poll in every comparison (bulk `id of every
 message`, and a `repeat` walk, both ways).
 
+## Observation 8 — the re-save on the Gmail account, and what a cleanup by id leaves (2026-09-11, afternoon)
+
+Create with `from_account` naming the Gmail test account (not Mail's
+default sender), then list every draft whose subject carries the probe
+prefix, with its id and the account its mailbox resolves to, once a
+second for 45 s:
+
+```
+created 2276 t=2.9s
+t=  3.9s drafts matching: [2276@<gmail test account>]
+t=  8.1s drafts matching: [2277@<gmail test account>]
+```
+
+One re-save, 4–5 s after creation, no further change to 45 s. Two
+earlier runs of the same shape, read through `get_draft_state`
+instead of the list, lost the original id sooner: at 1.2 s after the
+create returned in one, between 5 and 10 s in the other. Observation 4
+had no re-save on this account in 30 s; that probe set no sender.
+
+Deleting by the original id, as the integration suite's `finally`
+blocks do, therefore removes nothing once the re-save has happened,
+and the copy under the new id stays. After one run of the drafts
+lifecycle class on the iCloud test account, six drafts with the
+class's `ZZZ-AMM-INTEG-` subjects remained, all under ids the tests
+never held. They were removed by id through `delete_draft`; a listing
+20 s later showed none.
+
+A walk of the form `repeat with d in messages of drafts mailbox … delete
+d` inside a `try` deleted nothing and reported 0, three runs; the same
+drafts deleted through `first message of drafts mailbox whose id is …`.
+Whether the `delete` on the walk's item reference errors, or is
+accepted and lost, was not separated.
+
 ## Derivations, mine
 
 - On an iCloud account, the id `draft_create` returns is transient. In
@@ -179,6 +212,10 @@ message`, and a `repeat` walk, both ways).
   saved with a non-default sender remains: a draft key that survives
   Mail's re-save, or a way to close the compose window, is a design
   change. Queued.
+- The integration suite cleans up by the id it created (Observation
+  8), so every test that names a sender leaves its draft behind under
+  the re-saved id. A cleanup that finds the class's drafts by subject
+  prefix and deletes each by id would not; not built.
 
 ## Not tried
 

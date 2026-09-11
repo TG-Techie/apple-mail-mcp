@@ -2678,12 +2678,16 @@ async def _run_send_now_gates(
     summary: str,
     elicit_extra: dict[str, Any],
     *,
+    account: str | None,
     validate_recipient_shape: bool = False,
     validate_args: tuple[Any, ...] = (),
 ) -> dict[str, Any] | None:
     """Run the standard send_now gate chain (#191):
 
-    1. ``check_test_mode_safety(operation, recipients=recipients)``
+    1. ``check_test_mode_safety(operation, account=account,
+       recipients=recipients)`` — ``account`` is the one the send goes
+       out under, as far as the caller can name it: the sender it was
+       given, or the account the draft being sent sits in.
     2. ``check_rate_limit(operation, rate_params)``
     3. If ``validate_recipient_shape``: ``validate_send_operation(*validate_args)``
     4. ``_elicit_confirmation(ctx, summary, operation, elicit_extra)``
@@ -2694,7 +2698,9 @@ async def _run_send_now_gates(
     (#192) can adopt this helper — its send path inherits recipients
     from existing draft state and doesn't need the shape check.
     """
-    safety_err = check_test_mode_safety(operation, recipients=recipients)
+    safety_err = check_test_mode_safety(
+        operation, account=account, recipients=recipients,
+    )
     if safety_err:
         return safety_err
     rate_err = check_rate_limit(operation, rate_params)
@@ -2907,6 +2913,7 @@ async def _gate_create_draft_send(
         rate_params={"subject": subject, "to": to},
         summary=summary,
         elicit_extra={"subject": subject, "to": to, "seed_kind": seed_kind},
+        account=from_account,
         # Only validate recipient shape when caller supplied any —
         # for reply with no overrides, recipients come from Mail.
         validate_recipient_shape=(
@@ -2920,6 +2927,7 @@ async def _gate_update_draft_send(
     *,
     seed_kind: str,
     draft_id: str,
+    account: str | None,
     to: list[str],
     cc: list[str],
     bcc: list[str],
@@ -2931,8 +2939,9 @@ async def _gate_update_draft_send(
 
     The recipient groups are the merged ones — the draft's own state
     with the caller's overrides — so their shape is not re-validated
-    here (#175 + #192); everything else is as for ``create_draft``.
-    Returns the first gate's error, or None when every gate passed.
+    here (#175 + #192); ``account`` is the one the draft sits in;
+    everything else is as for ``create_draft``. Returns the first
+    gate's error, or None when every gate passed.
     """
     summary = _build_draft_send_summary(seed_kind, to, cc, bcc, subject, body)
     return await _run_send_now_gates(
@@ -2942,7 +2951,27 @@ async def _gate_update_draft_send(
         rate_params={"draft_id": draft_id, "subject": subject},
         summary=summary,
         elicit_extra={"draft_id": draft_id, "send_now": True},
+        account=account,
     )
+
+
+def _gate_update_draft_accounts(
+    draft_account: str | None, from_account: str | None
+) -> dict[str, Any] | None:
+    """The test-mode account gate for an update: the draft's own account,
+    which the update deletes from and, absent an override, recreates in,
+    and the override when the caller gave one. A draft whose account
+    Mail could not name is passed as None and refused in test mode.
+    Returns the first gate's error, or None.
+    """
+    touched = [draft_account]
+    if from_account is not None:
+        touched.append(from_account)
+    for account in touched:
+        safety_err = check_test_mode_safety("update_draft", account=account)
+        if safety_err:
+            return safety_err
+    return None
 
 
 async def create_draft(
@@ -3210,16 +3239,17 @@ async def update_draft(
                 "error_type": "validation_error",
             }
 
-        # Only the caller's override is an account named here; the sender
-        # carried over from the draft's own state is where it already is.
-        safety_err = check_test_mode_safety("update_draft", account=from_account)
-        if safety_err:
-            return safety_err
-
         try:
             state = mail.get_draft_state(draft_id)
         except MailDraftError as e:
             return _draft_error_response(e)
+
+        # A draft id names a draft in any account; the state read says
+        # which, and the update must stay in the test account.
+        draft_account = cast(str, state.get("account") or "") or None
+        safety_err = _gate_update_draft_accounts(draft_account, from_account)
+        if safety_err:
+            return safety_err
 
         store = _get_draft_state_store()
         seed_kind, seed_id, reply_all = _resolve_draft_seed(
@@ -3256,7 +3286,7 @@ async def update_draft(
 
         if send_now:
             gate_err = await _gate_update_draft_send(
-                seed_kind=seed_kind, draft_id=draft_id,
+                seed_kind=seed_kind, draft_id=draft_id, account=draft_account,
                 to=final_to, cc=final_cc, bcc=final_bcc,
                 subject=final_subject, body=final_body or "", ctx=ctx,
             )
@@ -3346,10 +3376,19 @@ def delete_draft(draft_id: str) -> dict[str, Any]:
         no draft with that id exists.
     """
     try:
+        # A draft id names a draft in any account; read which before
+        # acting, so test mode can keep the delete in the test account.
+        state = mail.get_draft_state(draft_id)
+        safety_err = check_test_mode_safety(
+            "delete_draft", account=cast(str, state.get("account") or "") or None,
+        )
+        if safety_err:
+            return safety_err
         mail.delete_draft(draft_id)
         _get_draft_state_store().delete(draft_id)
         operation_logger.log_operation(
-            "delete_draft", {"draft_id": draft_id}, "success"
+            "delete_draft", {"draft_id": draft_id, "account": state.get("account")},
+            "success",
         )
         return {"success": True, "draft_id": draft_id}
     except MailDraftError as e:
@@ -3858,10 +3897,6 @@ async def email_send_html(
     attachment_paths = attachment_paths or []
     all_recipients = list(to) + list(cc_list) + list(bcc_list)
 
-    safety_err = check_test_mode_safety("email_send_html", account=from_account)
-    if safety_err:
-        return safety_err
-
     err = _validate_html_send_request(
         to=to, cc_list=cc_list, bcc_list=bcc_list, subject=subject,
         reply_to=reply_to, from_account=from_account,
@@ -3881,6 +3916,7 @@ async def email_send_html(
         rate_params={"subject": subject, "to": to},
         summary=summary,
         elicit_extra={"subject": subject, "to": to},
+        account=from_account,
     )
     if gate_err:
         return gate_err

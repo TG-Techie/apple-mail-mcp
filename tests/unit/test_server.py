@@ -3764,6 +3764,7 @@ class TestDraftToolErrorPaths:
             "id": "draft-1", "to": [], "cc": [], "bcc": [],
             "subject": "Re: hi", "body": "stub",
             "attachments": [], "seed_kind": "reply",
+            "account": "TestAccount",
         }
         result = await update_draft(
             draft_id="draft-1", body="x", send_now=True,
