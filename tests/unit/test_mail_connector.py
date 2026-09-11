@@ -5573,6 +5573,24 @@ class TestCreateDraft:
             )
 
     @patch.object(AppleMailConnector, "_run_applescript")
+    def test_new_send_with_from_account_raises_before_any_script(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        """The mailto: path composes from Mail's default account and has
+        no sender to set. Asking for one is refused rather than ignored:
+        before this it sent from the wrong account and reported success."""
+        with pytest.raises(NotImplementedError, match="sending account"):
+            connector.create_draft(
+                seed="new",
+                to=["a@example.com"],
+                subject="hi",
+                body="x",
+                send_now=True,
+                from_account="Work",
+            )
+        mock_run.assert_not_called()
+
+    @patch.object(AppleMailConnector, "_run_applescript")
     def test_new_with_from_account_sets_display_name_sender(
         self, mock_run: MagicMock, connector: AppleMailConnector
     ) -> None:
@@ -6571,6 +6589,25 @@ class TestSendHtmlEmail:
                 attachment_paths=[Path("/tmp/file.pdf")],
             )
         assert not called, "_run_applescript must not be called for reply+attachments"
+
+    def test_html_fresh_with_from_account_raises_before_any_script(
+        self, connector: AppleMailConnector
+    ) -> None:
+        """A fresh HTML send composes through mailto: and cannot set the
+        sender; asking for one is refused, not ignored. Replies honour
+        it (TestSendHtmlReply)."""
+        called: list[bool] = []
+        connector._run_applescript = lambda _: (called.append(True), "SENT")[1]  # type: ignore[method-assign]
+        with pytest.raises(NotImplementedError, match="sending account"):
+            connector._send_html_email(
+                to=["test@example.com"],
+                cc=None,
+                bcc=None,
+                subject="Hi",
+                body="<p>x</p>",
+                from_account="Work",
+            )
+        assert not called, "_run_applescript must not be called for fresh+from_account"
 
     def test_html_send_fresh_carries_cc_bcc_in_mailto(
         self, connector: AppleMailConnector

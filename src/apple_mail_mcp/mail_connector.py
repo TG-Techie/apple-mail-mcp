@@ -4284,7 +4284,7 @@ class AppleMailConnector:
         bcc: list[str] | None,
         subject: str,
         body: str,
-        from_account: str | None,  # noqa: ARG002 — see TODO below
+        from_account: str | None,
         attachment_paths: list[Path] | None,
     ) -> dict[str, str]:
         """Send a brand-new message via Mail.app's mailto: URL handler.
@@ -4318,13 +4318,21 @@ class AppleMailConnector:
         Limitations
         -----------
         * Attachments not supported — mailto: carries no binary payload.
-        * ``from_account`` is currently ignored; Mail uses its default sender.
-          TODO: add System Events From-popup manipulation for multi-account
-          support.
+        * ``from_account`` not supported — Mail's URL handler composes
+          from the default account and exposes no sender to set. Both
+          raise ``NotImplementedError`` before anything is composed; the
+          server-layer guard refuses them up front so this is a backstop.
 
         Called only from ``create_draft`` when ``seed="new"`` and
         ``send_now=True``.  The outbound allowlist gate has already run.
         """
+        if from_account is not None:
+            raise NotImplementedError(
+                "mailto-send path cannot choose the sending account; Mail "
+                "composes from its default account. Save the draft without "
+                "send_now (it keeps the chosen sender) and send it from "
+                "Mail.app, or omit from_account."
+            )
         if attachment_paths:
             raise NotImplementedError(
                 "mailto-send path does not support attachments. "
@@ -4906,7 +4914,7 @@ end tell
         bcc: list[str] | None,
         subject: str,
         body: str,  # HTML string
-        from_account: str | None,  # noqa: ARG002 — see TODO below
+        from_account: str | None,
         attachment_paths: list[Path] | None = None,
         reply_to: str | None = None,
     ) -> dict[str, str]:
@@ -4919,10 +4927,14 @@ end tell
 
         Limitations
         -----------
-        * Attachments not supported.
-        * ``from_account`` is currently ignored; Mail uses its default sender.
-          TODO: add System Events From-popup manipulation for multi-account
-          support.
+        * Attachments on replies not supported (fresh messages with
+          attachments take ``_send_html_new_with_attachments``).
+        * ``from_account`` is honoured on replies only, where the sender is
+          set on the outgoing message. Fresh messages compose through
+          mailto: (or ``make new outgoing message`` with no sender set)
+          and raise ``NotImplementedError`` when one is asked for, before
+          anything is composed; the server-layer guard refuses it up
+          front so this is a backstop.
 
         Args:
             to: List of recipient email addresses.
@@ -4930,17 +4942,25 @@ end tell
             bcc: Optional BCC recipient list.
             subject: Email subject line.
             body: HTML string for the email body.
-            from_account: Currently ignored.
-            attachment_paths: Must be None or empty (raises NotImplementedError).
+            from_account: Account name or UUID to send from. Replies only.
+            attachment_paths: Fresh messages only.
 
         Returns:
             ``{"draft_id": "", "sent_message_id": ""}`` on success.
 
         Raises:
-            NotImplementedError: If attachment_paths is non-empty.
+            NotImplementedError: attachments on a reply, or from_account
+                on a fresh message.
             MailAppleScriptError: If the compose window's body area is not
                 found (NO_BODY_AREA) or any other non-SENT result.
         """
+        if from_account is not None and reply_to is None:
+            raise NotImplementedError(
+                "HTML send cannot choose the sending account on a fresh "
+                "message; Mail composes from its default account. Omit "
+                "from_account, or save a draft (it keeps the chosen "
+                "sender) and send it from Mail.app."
+            )
         if attachment_paths and reply_to is not None:
             raise NotImplementedError(
                 "HTML replies with attachments are not supported yet — "

@@ -844,7 +844,7 @@ Create a draft (fresh, reply, or forward). Optionally send immediately.
 | `reply_all` | boolean | No | False | For `reply_to` only — use `reply to all`. |
 | `template_name` | string | No | None | Optional template to render for `subject` + `body`. Caller-supplied `subject`/`body` override the rendered output. |
 | `template_vars` | object | No | None | Variables for the template renderer. Requires `template_name`. |
-| `from_account` | string | No | None | Mail.app account name or UUID. None = Mail's default. |
+| `from_account` | string | No | None | Mail.app account name or UUID. None = Mail's default. Honoured on saved drafts and on reply/forward sends. A fresh message with `send_now=True` goes out through Mail's mailto: handler, which cannot set the sender, and is refused (`from_account_unsupported`) rather than sent from the wrong account. |
 | `send_now` | boolean | No | False | `False` saves as draft. `True` sends immediately and elicits confirmation. |
 
 **Returns:**
@@ -898,6 +898,12 @@ create_draft(
 - `validation_error`: Mutually exclusive seeds, missing required fields, or `template_vars` without `template_name`.
 - `message_not_found`: `reply_to` / `forward_of` doesn't match any Mail.app message.
 - `account_not_found`: `from_account` doesn't match.
+- `from_account_unsupported`: `from_account` with `send_now=True` on a
+  fresh message — refused before the confirmation prompt; nothing was
+  composed or sent.
+- `attachments_unsupported`: `attachment_paths` with `send_now=True` on a
+  fresh message — the mailto: path carries none; refused before the
+  confirmation prompt.
 - `file_not_found` / `validation_error` (attachments): a listed file is
   missing, has a blocked extension, or exceeds 25MB — no draft was created.
 - `cancelled`: User declined the elicitation prompt (when `send_now=True`).
@@ -926,7 +932,7 @@ after this call. Callers caching the id must re-read the response.
 | `body` | string | No | None | Override body. `None` keeps existing; non-None replaces (including `""`). |
 | `attachment_paths` | array[string] | No | None | Override attachments: `None` **preserves existing** (extracted to a temp dir and re-attached, not re-checked); `[]` clears; populated list replaces, and is checked like a send (exists, no executable extension, under 25MB) before the existing draft is touched — a refused list leaves the draft as it was. |
 | `template_name` / `template_vars` | string / object | No | None | Optional template render. User-supplied `subject`/`body` override the rendered output. |
-| `from_account` | string | No | None | Override sender. |
+| `from_account` | string | No | None | Override sender. With `send_now=True` on a fresh draft it is refused (`from_account_unsupported`) before anything is deleted — the mailto: send path cannot set it — and the draft is left as it was. |
 | `send_now` | boolean | No | False | `False` saves new draft. `True` sends after eliciting confirmation. |
 
 **Returns:**
@@ -1024,7 +1030,7 @@ send (the compose window is discarded; nothing partial is sent).
 | `body` | string | Yes | - | HTML string for the email body. |
 | `cc` | array | No | `[]` | CC recipients (replace derived CC when replying). |
 | `bcc` | array | No | `[]` | BCC recipients. |
-| `from_account` | string | No | null | Mail.app account name or UUID. Null uses Mail's default sender. |
+| `from_account` | string | No | null | Mail.app account name or UUID. Null uses Mail's default sender. **Replies only**: the sender is set on the outgoing message. A fresh message composes through mailto:, which cannot set it, and is refused (`from_account_unsupported`) rather than sent from the wrong account. |
 | `reply_to` | string | No | null | Message id to reply to; enables reply mode. |
 | `attachment_paths` | array | No | `[]` | File paths to attach. **Fresh mode only** (not supported with `reply_to`). Each file must exist, must not carry an executable extension (`.exe`, `.sh`, …), and must be under 25MB. |
 
@@ -1039,6 +1045,9 @@ send (the compose window is discarded; nothing partial is sent).
 - `outbound_disallowed`: one or more recipients off the allowlist —
   nothing was sent; in reply mode the compose window was discarded.
 - `validation_error`: missing `to`/`subject` in fresh mode.
+- `from_account_unsupported`: `from_account` on a fresh message —
+  nothing was sent. Omit it, or save a draft (which keeps the chosen
+  sender) and send from Mail.app.
 - `attachments_unsupported`: `attachment_paths` combined with
   `reply_to` — nothing was sent.
 - `file_not_found` / `validation_error` (attachments): a listed file is

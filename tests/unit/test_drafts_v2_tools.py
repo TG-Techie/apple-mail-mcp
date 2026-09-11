@@ -253,6 +253,141 @@ class TestDraftUpdateAttachmentsAreCheckedLikeASend:
         assert mock_mail.create_draft.call_args.kwargs["attachment_paths"] == extracted
 
 
+class TestAFreshSendCannotChooseTheSender:
+    """A fresh message sent immediately goes out through Mail's mailto:
+    handler, which composes from Mail's default account and offers no way
+    to pick another. Until now from_account was accepted on those paths
+    and silently ignored: the mail went out from the wrong account and
+    the call reported success. Now the call is refused before anything
+    is composed, deleted, or put in front of the user to confirm. Replies
+    set the sender on the outgoing message and keep honouring it; a
+    saved draft keeps its sender for a human to send from Mail.app."""
+
+    _FRESH_STATE = {
+        "draft_id": "OLD",
+        "to": ["alice@example.com"], "cc": [], "bcc": [],
+        "subject": "hi", "body": "x",
+        "in_reply_to": "", "references": "", "attachment_names": [],
+    }
+
+    @pytest.mark.asyncio
+    async def test_email_send_html_fresh_is_refused_before_compose(
+        self, isolated_drafts: None, mock_mail: MagicMock
+    ) -> None:
+        from apple_mail_mcp.server import email_send_html
+
+        result = await email_send_html(
+            to=["alice@example.com"], subject="x", body="<p>b</p>",
+            from_account="Work",
+        )
+        assert result["success"] is False
+        assert result["error_type"] == "from_account_unsupported"
+        assert "from_account" in result["error"]
+        mock_mail._send_html_email.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_email_send_html_reply_still_honours_it(
+        self, isolated_drafts: None, mock_mail: MagicMock
+    ) -> None:
+        from apple_mail_mcp.server import email_send_html
+
+        mock_mail._send_html_email.return_value = {
+            "draft_id": "", "sent_message_id": ""
+        }
+        result = await email_send_html(
+            to=["alice@example.com"], body="<p>b</p>",
+            reply_to="msg-1", from_account="Work",
+        )
+        assert result["success"] is True
+        assert mock_mail._send_html_email.call_args.kwargs["from_account"] == "Work"
+
+    @pytest.mark.asyncio
+    async def test_draft_create_send_now_fresh_is_refused_before_the_prompt(
+        self, isolated_drafts: None, mock_mail: MagicMock
+    ) -> None:
+        from apple_mail_mcp.server import create_draft
+
+        ctx = MagicMock()
+        ctx.elicit = AsyncMock()
+        result = await create_draft(
+            to=["alice@example.com"], subject="x", body="b",
+            from_account="Work", send_now=True, ctx=ctx,
+        )
+        assert result["success"] is False
+        assert result["error_type"] == "from_account_unsupported"
+        ctx.elicit.assert_not_called()
+        mock_mail.create_draft.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_draft_create_send_now_fresh_with_attachments_is_refused_before_the_prompt(
+        self, isolated_drafts: None, mock_mail: MagicMock, tmp_path: Any
+    ) -> None:
+        """Same guard, other limit of the mailto: path. Before this the
+        user confirmed the send and the connector then refused it."""
+        from apple_mail_mcp.server import create_draft
+
+        f = tmp_path / "report.pdf"
+        f.write_bytes(b"%PDF-1.4 fake")
+        ctx = MagicMock()
+        ctx.elicit = AsyncMock()
+        result = await create_draft(
+            to=["alice@example.com"], subject="x", body="b",
+            attachment_paths=[str(f)], send_now=True, ctx=ctx,
+        )
+        assert result["success"] is False
+        assert result["error_type"] == "attachments_unsupported"
+        ctx.elicit.assert_not_called()
+        mock_mail.create_draft.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_draft_create_saved_keeps_the_sender(
+        self, isolated_drafts: None, mock_mail: MagicMock
+    ) -> None:
+        from apple_mail_mcp.server import draft_create
+
+        mock_mail.create_draft.return_value = {
+            "draft_id": "ABCD", "sent_message_id": ""
+        }
+        result = await draft_create(
+            to=["alice@example.com"], subject="x", body="b",
+            from_account="Work",
+        )
+        assert result["success"] is True
+        assert mock_mail.create_draft.call_args.kwargs["from_account"] == "Work"
+
+    @pytest.mark.asyncio
+    async def test_draft_update_send_now_fresh_is_refused_and_the_draft_is_untouched(
+        self, isolated_drafts: None, mock_mail: MagicMock
+    ) -> None:
+        from apple_mail_mcp.server import update_draft
+
+        mock_mail.get_draft_state.return_value = dict(self._FRESH_STATE)
+        ctx = MagicMock()
+        ctx.elicit = AsyncMock()
+        result = await update_draft(
+            draft_id="OLD", from_account="Work", send_now=True, ctx=ctx,
+        )
+        assert result["success"] is False
+        assert result["error_type"] == "from_account_unsupported"
+        ctx.elicit.assert_not_called()
+        mock_mail.delete_draft.assert_not_called()
+        mock_mail.create_draft.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_draft_update_saved_keeps_the_sender(
+        self, isolated_drafts: None, mock_mail: MagicMock
+    ) -> None:
+        from apple_mail_mcp.server import draft_update
+
+        mock_mail.get_draft_state.return_value = dict(self._FRESH_STATE)
+        mock_mail.create_draft.return_value = {
+            "draft_id": "NEW", "sent_message_id": ""
+        }
+        result = await draft_update(draft_id="OLD", from_account="Work")
+        assert result["success"] is True
+        assert mock_mail.create_draft.call_args.kwargs["from_account"] == "Work"
+
+
 class TestDraftUpdate:
     @pytest.mark.asyncio
     async def test_returns_new_draft_id(

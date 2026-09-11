@@ -2272,25 +2272,48 @@ def _resolve_draft_seed(
     return "new", None, False
 
 
-def _fresh_send_attachment_guard(
+_FROM_ACCOUNT_UNSUPPORTED_ON_FRESH_SEND = (
+    "a fresh message sent immediately goes out through Mail's mailto: "
+    "handler, which always composes from Mail's default account, so "
+    "from_account cannot be honoured on this path. Nothing was sent. "
+    "Omit from_account to send from the default account, or save the "
+    "draft without send_now — a saved draft keeps the chosen sender — "
+    "and send it from Mail.app."
+)
+
+
+def _fresh_send_guard(
     send_now: bool,
     seed_kind: str,
+    *,
+    from_account: str | None,
     attachment_paths: list[str] | None,
     existing_names: list[str],
 ) -> dict[str, Any] | None:
-    """Refuse send_now on a fresh-seed draft that would carry attachments.
+    """Refuse send_now on a fresh-seed draft asking for what the mailto:
+    dispatch path cannot carry: a chosen sender, or attachments.
 
     Fresh drafts sent immediately dispatch via the mailto: URL path
-    (connector ``_send_new_via_eml``), which cannot carry attachments.
-    Without this guard the delete-and-recreate ran first, so the
-    NotImplementedError from the connector landed AFTER the draft was
-    deleted — destroying it (drafts 1390/1393, 2026-08-24). Must be
-    called BEFORE any destructive op or attachment extraction.
+    (connector ``_send_new_via_eml``). Mail's URL handler composes from
+    the default account and carries no attachments, so a call asking
+    for either would go out wrong while reporting success; it is
+    refused here instead. Must be called BEFORE any destructive op,
+    attachment extraction, or confirmation prompt: without that, the
+    delete-and-recreate ran first and the connector's refusal landed
+    AFTER the draft was deleted — destroying it (drafts 1390/1393,
+    2026-08-24).
 
     Returns an error response, or None to proceed.
     """
     if not send_now or seed_kind != "new":
         return None
+    if from_account is not None:
+        return {
+            "success": False,
+            "error": _FROM_ACCOUNT_UNSUPPORTED_ON_FRESH_SEND
+            + " The draft, if any, is unchanged.",
+            "error_type": "from_account_unsupported",
+        }
     will_have_attachments = (
         bool(attachment_paths)
         if attachment_paths is not None
@@ -2312,22 +2335,29 @@ def _fresh_send_attachment_guard(
     }
 
 
-def _check_update_attachments(
+def _update_draft_preflight(
     send_now: bool,
     seed_kind: str,
+    *,
+    from_account: str | None,
     attachment_paths: list[str] | None,
     existing_names: list[str],
 ) -> dict[str, Any] | None:
-    """May these attachments go on the updated draft? Runs before anything
-    is deleted, so a refusal leaves the draft as it was.
+    """Can the updated draft be built, and sent if asked, as requested?
+    Runs before anything is deleted, so a refusal leaves the draft as it
+    was.
 
-    Two questions, in order: the fresh-send restriction, which applies to
-    carried-over attachments as much as new ones; then the file checks on
-    a replacement list, which is caller input. ``None`` (carry over) and
-    ``[]`` (clear) hand in no files and get no file checks.
+    Two questions, in order: what a fresh immediate send cannot carry,
+    which applies to carried-over attachments as much as new ones; then
+    the file checks on a replacement attachment list, which is caller
+    input. ``None`` (carry over) and ``[]`` (clear) hand in no files and
+    get no file checks.
     """
-    guard_err = _fresh_send_attachment_guard(
-        send_now, seed_kind, attachment_paths, existing_names
+    guard_err = _fresh_send_guard(
+        send_now, seed_kind,
+        from_account=from_account,
+        attachment_paths=attachment_paths,
+        existing_names=existing_names,
     )
     if guard_err:
         return guard_err
@@ -2653,15 +2683,27 @@ async def _gate_create_draft_send(
     bcc: list[str] | None,
     subject: str | None,
     body: str,
+    from_account: str | None,
+    attachment_paths: list[str] | None,
     ctx: Context | None,
 ) -> dict[str, Any] | None:
     """The gate chain for a draft that is to be sent as it is created.
 
-    Assembles what ``_run_send_now_gates`` needs from the draft's
+    First refuses what the fresh send path cannot carry, so the user is
+    never asked to confirm a send that would then go out wrong. Then
+    assembles what ``_run_send_now_gates`` needs from the draft's
     recipient groups — the flat recipient list, the summary the user
     confirms, and whether recipient shape is the caller's to validate —
     and returns the first gate's error, or None when every gate passed.
     """
+    guard_err = _fresh_send_guard(
+        True, seed_kind,
+        from_account=from_account,
+        attachment_paths=attachment_paths,
+        existing_names=[],
+    )
+    if guard_err:
+        return guard_err
     all_recipients = (to or []) + (cc or []) + (bcc or [])
     summary = _build_draft_send_summary(seed_kind, to, cc, bcc, subject, body)
     return await _run_send_now_gates(
@@ -2738,7 +2780,11 @@ async def create_draft(
         template_vars: Variables to pass to the template renderer.
             Requires ``template_name``.
         from_account: Mail.app account name or UUID. ``None`` uses Mail's
-            default.
+            default. Honoured on saved drafts and on reply/forward sends;
+            a fresh message with ``send_now=True`` goes through mailto:,
+            which cannot set it, and is refused
+            (``from_account_unsupported``) rather than sent from the
+            wrong account.
         send_now: ``False`` (default) saves as draft. ``True`` sends
             immediately and elicits user confirmation.
 
@@ -2797,7 +2843,8 @@ async def create_draft(
         if send_now:
             gate_err = await _gate_create_draft_send(
                 seed_kind=seed_kind, to=to, cc=cc, bcc=bcc,
-                subject=subject, body=body, ctx=ctx,
+                subject=subject, body=body, from_account=from_account,
+                attachment_paths=attachment_paths, ctx=ctx,
             )
             if gate_err:
                 return gate_err
@@ -2901,7 +2948,9 @@ async def update_draft(
             is touched.
         template_name / template_vars: Optional template render. User-
             supplied subject/body override the rendered output.
-        from_account: Override sender.
+        from_account: Override sender. Refused (``from_account_unsupported``)
+            when ``send_now=True`` on a fresh draft, which sends through
+            mailto: and cannot set it; the draft is left as it was.
         send_now: ``False`` (default) saves new draft. ``True`` sends
             after eliciting confirmation.
 
@@ -2927,12 +2976,14 @@ async def update_draft(
             draft_id, state, store
         )
 
-        attach_err = _check_update_attachments(
-            send_now, seed_kind, attachment_paths,
-            state.get("attachment_names", []) or [],
+        preflight_err = _update_draft_preflight(
+            send_now, seed_kind,
+            from_account=from_account,
+            attachment_paths=attachment_paths,
+            existing_names=state.get("attachment_names", []) or [],
         )
-        if attach_err:
-            return attach_err
+        if preflight_err:
+            return preflight_err
 
         try:
             final_subject, final_body = _resolve_update_subject_body(
@@ -3148,7 +3199,7 @@ async def draft_create(
         reply_all: For ``reply_to`` only — use Mail's reply-all logic.
         template_name / template_vars: Optional template render.
         from_account: Mail.app account name or UUID. None uses Mail's
-            default sender for the seed message.
+            default sender for the seed message. A saved draft keeps it.
 
     Returns:
         ``{"success": True, "draft_id": "<id>"}`` on success.
@@ -3213,7 +3264,7 @@ async def draft_update(
             (exists, no executable extension, under 25MB) before the
             existing draft is touched.
         template_name / template_vars: Optional template render.
-        from_account: Sender override.
+        from_account: Sender override. A saved draft keeps it.
 
     Returns:
         ``{"success": True, "draft_id": "<NEW_ID>"}``. The id is new.
@@ -3369,6 +3420,41 @@ async def draft_send(
     )
 
 
+def _validate_html_send_content(
+    *,
+    reply_to: str | None,
+    from_account: str | None,
+    attachment_paths: list[str],
+) -> dict[str, Any] | None:
+    """What may go on an email_send_html message, given which compose path
+    it takes. A reply sets the sender on the outgoing message and honours
+    from_account but cannot take attachments; a fresh message takes
+    attachments but composes through mailto:, which cannot set the
+    sender. Files that are allowed at all get the send-path file checks.
+    Returns an error response, or None to proceed.
+    """
+    if from_account is not None and reply_to is None:
+        return {
+            "success": False,
+            "error": "email_send_html: " + _FROM_ACCOUNT_UNSUPPORTED_ON_FRESH_SEND,
+            "error_type": "from_account_unsupported",
+        }
+    if attachment_paths and reply_to is not None:
+        return {
+            "success": False,
+            "error": (
+                "email_send_html: attachments are not supported on "
+                "replies yet — send them in a fresh message, or save a "
+                "reply draft via draft_create and send manually from "
+                "Mail.app."
+            ),
+            "error_type": "attachments_unsupported",
+        }
+    if attachment_paths:
+        return _validate_attachment_files(attachment_paths)
+    return None
+
+
 def _validate_html_send_request(
     *,
     to: list[str],
@@ -3376,12 +3462,14 @@ def _validate_html_send_request(
     bcc_list: list[str],
     subject: str,
     reply_to: str | None,
+    from_account: str | None,
     attachment_paths: list[str],
     all_recipients: list[str],
 ) -> dict[str, Any] | None:
     """All pre-gate validation for email_send_html: required fields,
-    attachment rules, and the hard outbound-allowlist policy gate (same
-    as draft_send). Returns an error response, or None to proceed.
+    sender and attachment rules, and the hard outbound-allowlist policy
+    gate (same as draft_send). Returns an error response, or None to
+    proceed.
 
     Reply mode with no explicit recipients defers the allowlist check to
     the connector, which reads Mail's DERIVED recipients back from the
@@ -3402,21 +3490,12 @@ def _validate_html_send_request(
             "error_type": "validation_error",
         }
 
-    if attachment_paths and reply_to is not None:
-        return {
-            "success": False,
-            "error": (
-                "email_send_html: attachments are not supported on "
-                "replies yet — send them in a fresh message, or save a "
-                "reply draft via draft_create and send manually from "
-                "Mail.app."
-            ),
-            "error_type": "attachments_unsupported",
-        }
-    if attachment_paths:
-        attach_err = _validate_attachment_files(attachment_paths)
-        if attach_err:
-            return attach_err
+    content_err = _validate_html_send_content(
+        reply_to=reply_to, from_account=from_account,
+        attachment_paths=attachment_paths,
+    )
+    if content_err:
+        return content_err
 
     # Hard allowlist policy gate — same as draft_send.
     from .exceptions import OutboundAllowlistUnavailableError
@@ -3515,7 +3594,12 @@ async def email_send_html(
             The send is verified end-to-end: each attachment must be
             visible in the compose window before Send is clicked, and the
             Sent-mailbox copy is checked for the attachment count.
-        from_account: Mail.app account name or UUID. None uses Mail's default.
+        from_account: Mail.app account name or UUID. None uses Mail's
+            default. Honoured on replies, where the sender is set on the
+            outgoing message. A fresh message composes through mailto:,
+            which cannot set it, and is refused
+            (``from_account_unsupported``) rather than sent from the
+            wrong account.
         reply_to: Message id to reply to. Enables reply mode.
 
     Returns:
@@ -3528,8 +3612,8 @@ async def email_send_html(
 
     err = _validate_html_send_request(
         to=to, cc_list=cc_list, bcc_list=bcc_list, subject=subject,
-        reply_to=reply_to, attachment_paths=attachment_paths,
-        all_recipients=all_recipients,
+        reply_to=reply_to, from_account=from_account,
+        attachment_paths=attachment_paths, all_recipients=all_recipients,
     )
     if err:
         return err
