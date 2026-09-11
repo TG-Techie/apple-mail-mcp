@@ -5284,8 +5284,11 @@ class TestDeleteDraft:
         connector.delete_draft("160991")
         script = mock_run.call_args[0][0]
         assert 'whose id is "160991"' in script
-        # Lookup must be scoped to Drafts mailboxes only (perf + correctness).
-        assert 'name of mb contains "Drafts"' in script
+        # Scoped to Mail's own aggregate drafts mailbox, which covers every
+        # account's drafts under whatever name the locale gives it; not to
+        # mailboxes whose English name happens to contain "Drafts".
+        assert "message of drafts mailbox" in script
+        assert 'contains "Drafts"' not in script
 
     @patch.object(AppleMailConnector, "_run_applescript")
     def test_delete_draft_not_found_raises(
@@ -5540,8 +5543,10 @@ class TestGetDraftState:
         except MailDraftNotFoundError:
             pass
         script = mock_run.call_args[0][0]
-        # Lookup should be scoped to Drafts mailboxes.
-        assert 'name of mb contains "Drafts"' in script
+        # Scoped to Mail's aggregate drafts mailbox (locale-independent),
+        # not to mailboxes named "Drafts" in English.
+        assert "messages of drafts mailbox" in script
+        assert 'contains "Drafts"' not in script
         # Should use as-text id comparison (probes showed numeric whose
         # clauses are unreliable on IMAP-backed Drafts).
         assert "(id of d as text) is targetId" in script
@@ -5607,6 +5612,37 @@ class TestCreateDraft:
             body="hello",
         )
         assert result == {"draft_id": "161055", "sent_message_id": ""}
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_a_save_whose_draft_never_appears_is_an_error(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        """The new draft's id is found by diffing Drafts before and after
+        the save, and the draft takes a moment to appear (measured: none
+        of three lookups saw it at 0.5 s, all did by 1.5 s). The script
+        now polls for it with a bound; if it still has not appeared, that
+        is reported, not returned as success with an empty id that every
+        later call rejects."""
+        from apple_mail_mcp.exceptions import MailDraftNotSettledError
+
+        mock_run.return_value = ""
+        with pytest.raises(MailDraftNotSettledError, match="did not appear"):
+            connector.create_draft(
+                seed="new", to=["a@example.com"], subject="hi", body="hello",
+            )
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_the_save_script_polls_for_the_new_draft(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        mock_run.return_value = "161055"
+        connector.create_draft(
+            seed="new", to=["a@example.com"], subject="hi", body="hello",
+        )
+        script = mock_run.call_args[0][0]
+        assert "delay 0.5\n" not in script, "a fixed delay is a guess"
+        assert "repeat with attempt from 1 to" in script
+        assert "id of every message of drafts mailbox" in script
 
     @patch.object(AppleMailConnector, "_run_applescript")
     def test_new_send_returns_empty_ids(

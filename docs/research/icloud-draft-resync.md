@@ -1,4 +1,4 @@
-# A freshly saved draft on an iCloud account is not the draft you get back
+# A freshly saved draft is not yet the draft you get back
 
 Observations first with the commands that produced them, derivations
 labeled and last, gaps named. Same shape as `paste-focus-failed.md`,
@@ -83,6 +83,55 @@ window taken by direct reference from `every window whose name starts
 with …` returned without error for both, and both were still in the
 window list with the count unchanged at 26.
 
+## Observation 6 — the compose order decides whether the first copy has recipients (2026-09-11, later)
+
+Raw AppleScript against the Gmail test account, `make new outgoing
+message` then `save`, polling the aggregate `drafts mailbox` every
+0.5 s for a new id and printing only on change:
+
+```
+connector order (set sender, set content, delete/make to recipient):
+  1.5s: id=2023 to=0
+ 12.0s: id=2025 to=1
+no sender at all:
+  0.5s: id=2026 to=1            (nothing else in 20 s)
+recipient first, sender last:
+ 10.5s: id=2028 to=1
+ 17.0s: id=2030 to=1
+```
+
+Then with the sender set last, varying only the sender value, printing
+the account each copy landed in:
+
+```
+sender = the default account's bare address:   0.5s id=2031 to=1 (iCloud); nothing else in 25 s
+no sender:                                     0.5s id=2033 to=1 (iCloud); nothing else in 25 s
+sender = the other account's bare address:     2.0s id=2034 to=1 (Gmail);  19.0s id=2035 to=1 (Gmail)
+sender = default account, "Name <addr>" form:  0.5s id=2037 to=1 (iCloud); 18.0s id=2038 to=1 (iCloud)
+```
+
+## Observation 7 — appearing is not settling
+
+Create with no sender, poll the aggregate id list every 0.25 s, and
+delete the draft (through `first message of drafts mailbox whose id
+is …`) after an extra wait; then poll for it to vanish:
+
+```
+extra-wait=0s appeared-at=0.25s id=2054 gone-after=never   (16 polls, 8 s)
+extra-wait=1s appeared-at=0.25s id=2056 gone-after=0.5s
+extra-wait=3s appeared-at=0.25s id=2058 gone-after=0.5s
+```
+
+Deleting through the per-account mailbox reference instead of the
+aggregate made no difference at 0 s (`id=2048 gone after never`).
+Sampling `message size`, `to recipients` count, `message id` and
+`was forwarded` every 0.25 s over the first 3 s after appearance
+showed no change in any of them (`source` raised throughout).
+
+The aggregate `drafts mailbox` and the per-account mailbox listed a
+new draft at the same poll in every comparison (bulk `id of every
+message`, and a `repeat` walk, both ways).
+
 ## Derivations, mine
 
 - On an iCloud account, the id `draft_create` returns is transient. In
@@ -98,13 +147,26 @@ window list with the count unchanged at 26.
   (Observation 3), so persisting it at create time would not let a
   later call find the replacement. Subject plus sender plus body would
   match, and is not a key.
-- What triggers the replacement is **not established**. The open
-  compose window (Observation 5) is the obvious candidate — Mail
-  re-saving the outgoing message — but closing the window by name did
-  not stop it, and it is not known whether that `close` reached the
-  window at all, since the outgoing-message count did not move.
-- Why Gmail differs is not established either. The 30 s Gmail probe may
-  simply have been shorter than that account's replacement delay.
+- The first saved copy lacking recipients (Observations 2, 3) came from
+  the connector setting `sender` before content and recipients
+  (Observation 6, four runs to=0 that way, three runs to=1 with the
+  sender last). The connector now sets the sender last.
+- The replacement under a new id is tied to the sender: none in 25 s
+  with no sender or with the default account's bare address; present
+  at 12-19 s with the other account's address or with the default
+  account in "Name <addr>" form (Observation 6). That is consistent
+  with the open compose window (Observation 5) being autosaved when
+  its sender differs from what Mail would have chosen, and is **not
+  established**: the window cannot be closed by script to test it.
+  It is not an iCloud-versus-Gmail difference; the earlier Gmail probe
+  used no sender.
+- A draft listed in Drafts is not yet a draft Mail will act on: a
+  delete at the moment of listing is lost, one a second later is not,
+  and nothing readable on the draft distinguishes the two states
+  (Observation 7). `create_draft` now polls for the listing and then
+  waits `_DRAFT_SETTLE_S` (1 s) before returning the id; that number
+  is a measured bound, not a signal, and is recorded as such in the
+  code.
 
 ## What this bears on
 
@@ -112,15 +174,18 @@ window list with the count unchanged at 26.
   added this file), so the Observation 1 failure leaves the caller's
   draft in Drafts instead of in Trash. That is the failure the reorder
   exists for; it does not make the read-back correct.
-- The fix for the read-back and the id churn is a design change, not a
-  patch: a draft key that survives Mail's re-save, or a wait-until-
-  settled step after save that is measured rather than guessed. Queued.
+- The read-back is fixed by the compose order and the settle wait
+  (same commit as Observations 6 and 7). The id churn for a draft
+  saved with a non-default sender remains: a draft key that survives
+  Mail's re-save, or a way to close the compose window, is a design
+  change. Queued.
 
 ## Not tried
 
 - Closing the compose window through its `outgoing message` object
   rather than through the window; closing it through the UI.
-- A Gmail probe longer than 30 s.
+- Whether the re-save happens when the sender is set inside the
+  `make new outgoing message` properties rather than afterwards.
 - Reading the draft through the IMAP path instead of AppleScript inside
   the window.
 - Any account type other than these two.

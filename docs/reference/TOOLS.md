@@ -922,6 +922,9 @@ create_draft(
   confirmation prompt.
 - `file_not_found` / `validation_error` (attachments): a listed file is
   missing, has a blocked extension, or exceeds 25MB — no draft was created.
+- `draft_not_settled`: Mail accepted the save but the new draft had not
+  appeared in Drafts within 10 s, so there is no id to return. Nothing
+  was sent; look for the draft in Mail.app before saving again.
 - `cancelled`: User declined the elicitation prompt (when `send_now=True`).
 - `applescript_error`, `unknown`: Lower-level failures.
 

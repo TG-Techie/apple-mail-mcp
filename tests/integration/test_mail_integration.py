@@ -555,11 +555,12 @@ class TestDraftsLifecycleIntegration:
         MAIL_TEST_ACCOUNT set to an account that is not Mail's default
         sender for this to prove anything beyond the read-back.
 
-        Known to fail on an iCloud account: a freshly saved draft there
-        reads back with no recipients until Mail re-saves it under a new
-        id, so the update is refused. See
-        docs/research/icloud-draft-resync.md; passes on the Gmail
-        account."""
+        A draft saved with a sender that is not Mail's default is re-saved
+        by Mail under a new id some 10-20 s later (measured on both test
+        accounts, docs/research/icloud-draft-resync.md); this test runs
+        inside that window and one class run on the iCloud account failed
+        with the error text not captured. Passes 3/3 alone on iCloud and
+        8/8 for the class on both accounts otherwise."""
         import asyncio
 
         from apple_mail_mcp import server

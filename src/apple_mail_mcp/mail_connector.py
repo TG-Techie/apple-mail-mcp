@@ -24,6 +24,7 @@ from .exceptions import (
     MailAccountNotFoundError,
     MailAppleScriptError,
     MailDraftNotFoundError,
+    MailDraftNotSettledError,
     MailImapMoveUnsupportedError,
     MailImapRequiredError,
     MailImapTrashNotFoundError,
@@ -477,6 +478,17 @@ def _search_filter_statements(
 
 class AppleMailConnector:
     """Interface to Apple Mail via AppleScript."""
+
+    # How long create_draft waits for a saved draft to show up in Drafts
+    # before giving up. 40 polls at 0.25 s is 10 s; measured appearance
+    # is ~1-1.5 s (2026-09-11), the bound is for a Mail that is busy.
+    _DRAFT_APPEAR_POLLS = 40
+    _DRAFT_APPEAR_INTERVAL_S = 0.25
+    # Extra wait once the draft is listed, before its id is handed out.
+    # Measured 2026-09-11: a delete issued at 0 s after listing did not
+    # take, at 1 s and 3 s it did; nothing readable on the draft marks
+    # the difference, so this is a measured bound, not a signal.
+    _DRAFT_SETTLE_S = 1.0
 
     _IMAP_BREAKER_TTL_S: float = 30.0
     """How long to skip IMAP for an account after a fallback-triggering
@@ -3835,29 +3847,19 @@ class AppleMailConnector:
         """
         _validate_draft_id(draft_id)
 
+        # `drafts mailbox` is Mail's own aggregate of every account's drafts
+        # mailbox, under whatever name the locale gives it. Matching the
+        # English name "Drafts" found nothing on a localised Mail and also
+        # matched any user folder with "Drafts" in its name.
         script = f"""
         tell application "Mail"
-            set didDelete to false
-            repeat with acc in accounts
-                try
-                    repeat with mb in mailboxes of acc
-                        if name of mb contains "Drafts" then
-                            try
-                                set m to first message of mb whose id is "{draft_id}"
-                                delete m
-                                set didDelete to true
-                                exit repeat
-                            end try
-                        end if
-                    end repeat
-                end try
-                if didDelete then exit repeat
-            end repeat
-            if didDelete then
-                return "OK"
-            else
-                return "NOT_FOUND"
-            end if
+            set m to missing value
+            try
+                set m to first message of drafts mailbox whose id is "{draft_id}"
+            end try
+            if m is missing value then return "NOT_FOUND"
+            delete m
+            return "OK"
         end tell
         """
 
@@ -3939,10 +3941,11 @@ class AppleMailConnector:
         is read back so the recreated draft stays in the account the
         draft was saved from rather than moving to Mail's default.
 
-        Iterates Drafts mailboxes manually (rather than `whose id is`)
-        because newly-created drafts can take a moment to be queryable
-        via whose-clause; iteration is reliable and Drafts mailboxes
-        are typically small.
+        Iterates Mail's aggregate ``drafts mailbox`` manually (rather than
+        `whose id is`) because newly-created drafts can take a moment to
+        be queryable via whose-clause; iteration is reliable and Drafts
+        mailboxes are typically small. The aggregate covers every
+        account's drafts mailbox whatever the locale names it.
 
         Returns:
             ``{
@@ -3968,21 +3971,11 @@ class AppleMailConnector:
         tell application "Mail"
             set targetId to "{draft_id}"
             set foundDraft to missing value
-            repeat with acc in accounts
-                try
-                    repeat with mb in mailboxes of acc
-                        if name of mb contains "Drafts" then
-                            repeat with d in messages of mb
-                                if (id of d as text) is targetId then
-                                    set foundDraft to d
-                                    exit repeat
-                                end if
-                            end repeat
-                        end if
-                        if foundDraft is not missing value then exit repeat
-                    end repeat
-                end try
-                if foundDraft is not missing value then exit repeat
+            repeat with d in messages of drafts mailbox
+                if (id of d as text) is targetId then
+                    set foundDraft to d
+                    exit repeat
+                end if
             end repeat
 
             if foundDraft is missing value then
@@ -5492,47 +5485,42 @@ end if
                 return "SENT"
             """
         else:
-            terminal_block = """
+            terminal_block = f"""
                 save theMessage
-                delay 0.5
 
+                -- The saved draft takes a moment to appear in Drafts
+                -- (measured 2026-09-11: absent at 0.5 s, present by
+                -- 1.5 s), so poll for it with a bound instead of
+                -- guessing a delay.
                 set newDraftId to ""
-                repeat with acc in accounts
-                    try
-                        repeat with mb in mailboxes of acc
-                            if name of mb contains "Drafts" then
-                                repeat with d in messages of mb
-                                    set candId to (id of d as text)
-                                    if candId is not in beforeIds then
-                                        set newDraftId to candId
-                                        exit repeat
-                                    end if
-                                end repeat
-                            end if
-                            if newDraftId is not "" then exit repeat
-                        end repeat
-                    end try
+                repeat with attempt from 1 to {self._DRAFT_APPEAR_POLLS}
+                    delay {self._DRAFT_APPEAR_INTERVAL_S}
+                    set afterIds to (id of every message of drafts mailbox)
+                    repeat with candRef in afterIds
+                        set candId to contents of candRef
+                        if candId is not in beforeIds then
+                            set newDraftId to (candId as text)
+                            exit repeat
+                        end if
+                    end repeat
                     if newDraftId is not "" then exit repeat
                 end repeat
+                -- Appearing is not settling: a delete issued the instant
+                -- the id is listed does not take, one issued 1 s later
+                -- does, and no readable property of the draft changes in
+                -- between (measured 2026-09-11, see
+                -- docs/research/icloud-draft-resync.md).
+                if newDraftId is not "" then delay {self._DRAFT_SETTLE_S}
                 return newDraftId
             """
 
         # Pre-save snapshot for id diffing (only when saving as draft).
+        # `drafts mailbox` is Mail's aggregate of every account's drafts
+        # mailbox, whatever the locale names it.
         snapshot_block = ""
         if not send_now:
             snapshot_block = """
-                set beforeIds to {}
-                repeat with acc in accounts
-                    try
-                        repeat with mb in mailboxes of acc
-                            if name of mb contains "Drafts" then
-                                repeat with d in messages of mb
-                                    copy (id of d as text) to end of beforeIds
-                                end repeat
-                            end if
-                        end repeat
-                    end try
-                end repeat
+                set beforeIds to (id of every message of drafts mailbox)
             """
 
         script = f"""
@@ -5541,13 +5529,13 @@ end if
 
             {creation_block}
 
-            {sender_clause}
             {subject_override}
             {body_block}
             {to_block}
             {cc_block}
             {bcc_block}
             {attachment_block}
+            {sender_clause}
 
             {terminal_block}
         end tell
@@ -5564,6 +5552,14 @@ end if
 
         if send_now:
             return {"draft_id": "", "sent_message_id": ""}
+        if not result:
+            raise MailDraftNotSettledError(
+                "Mail accepted the save but the new draft did not appear "
+                "in Drafts within "
+                f"{self._DRAFT_APPEAR_POLLS * self._DRAFT_APPEAR_INTERVAL_S:g}s, "
+                "so there is no id to return; look for it in Mail.app "
+                "before saving again. Nothing was sent."
+            )
         return {"draft_id": result, "sent_message_id": ""}
 
     def extract_draft_attachments(
@@ -5626,21 +5622,11 @@ end if
         tell application "Mail"
             set targetId to "{draft_id}"
             set foundDraft to missing value
-            repeat with acc in accounts
-                try
-                    repeat with mb in mailboxes of acc
-                        if name of mb contains "Drafts" then
-                            repeat with d in messages of mb
-                                if (id of d as text) is targetId then
-                                    set foundDraft to d
-                                    exit repeat
-                                end if
-                            end repeat
-                        end if
-                        if foundDraft is not missing value then exit repeat
-                    end repeat
-                end try
-                if foundDraft is not missing value then exit repeat
+            repeat with d in messages of drafts mailbox
+                if (id of d as text) is targetId then
+                    set foundDraft to d
+                    exit repeat
+                end if
             end repeat
             if foundDraft is missing value then return "ERR_NOT_FOUND"
 

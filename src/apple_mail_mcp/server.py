@@ -21,6 +21,7 @@ from .exceptions import (
     MailDraftError,
     MailDraftInvalidIdError,
     MailDraftNotFoundError,
+    MailDraftNotSettledError,
     MailImapRequiredError,
     MailMailboxNotEmptyError,
     MailMailboxNotFoundError,
@@ -2274,6 +2275,8 @@ def _draft_error_response(e: MailDraftError) -> dict[str, Any]:
         et = "draft_not_found"
     elif isinstance(e, MailDraftInvalidIdError):
         et = "invalid_draft_id"
+    elif isinstance(e, MailDraftNotSettledError):
+        et = "draft_not_settled"
     else:
         et = "draft_error"
     return {"success": False, "error": str(e), "error_type": et}

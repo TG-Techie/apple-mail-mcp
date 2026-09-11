@@ -218,6 +218,14 @@ class MailDraftNotFoundError(MailDraftError):
     pass
 
 
+class MailDraftNotSettledError(MailDraftError):
+    """Mail accepted the save but the new draft had not appeared in Drafts
+    within the bounded wait, so no id can be returned for it. The draft may
+    still turn up; nothing was sent."""
+
+    pass
+
+
 class MailTemplateError(MailError):
     """Base class for email-template errors."""
 
