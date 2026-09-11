@@ -78,7 +78,10 @@ Observation 3 and 26 after it. Mail's window list included one window
 per test subject. `close (every window whose name is "<subject>")
 saving yes` returned without error, left the count at 26, and did not
 change the timing in Observation 3's pattern (a further run: id `1912`
-replaced by `1913` at 19.6 s).
+replaced by `1913` at 19.6 s). Afterwards, `close w saving no` on each
+window taken by direct reference from `every window whose name starts
+with …` returned without error for both, and both were still in the
+window list with the count unchanged at 26.
 
 ## Derivations, mine
 
@@ -116,7 +119,7 @@ replaced by `1913` at 19.6 s).
 ## Not tried
 
 - Closing the compose window through its `outgoing message` object
-  rather than by window name, or with `saving no`.
+  rather than through the window; closing it through the UI.
 - A Gmail probe longer than 30 s.
 - Reading the draft through the IMAP path instead of AppleScript inside
   the window.
