@@ -2598,6 +2598,41 @@ def _merge_draft_recipients(
     )
 
 
+async def _gate_create_draft_send(
+    *,
+    seed_kind: str,
+    to: list[str] | None,
+    cc: list[str] | None,
+    bcc: list[str] | None,
+    subject: str | None,
+    body: str,
+    ctx: Context | None,
+) -> dict[str, Any] | None:
+    """The gate chain for a draft that is to be sent as it is created.
+
+    Assembles what ``_run_send_now_gates`` needs from the draft's
+    recipient groups — the flat recipient list, the summary the user
+    confirms, and whether recipient shape is the caller's to validate —
+    and returns the first gate's error, or None when every gate passed.
+    """
+    all_recipients = (to or []) + (cc or []) + (bcc or [])
+    summary = _build_draft_send_summary(seed_kind, to, cc, bcc, subject, body)
+    return await _run_send_now_gates(
+        operation="create_draft",
+        ctx=ctx,
+        recipients=all_recipients,
+        rate_params={"subject": subject, "to": to},
+        summary=summary,
+        elicit_extra={"subject": subject, "to": to, "seed_kind": seed_kind},
+        # Only validate recipient shape when caller supplied any —
+        # for reply with no overrides, recipients come from Mail.
+        validate_recipient_shape=(
+            to is not None or cc is not None or bcc is not None
+        ),
+        validate_args=(to or [], cc, bcc),
+    )
+
+
 async def create_draft(
     reply_to: str | None = None,
     forward_of: str | None = None,
@@ -2706,25 +2741,9 @@ async def create_draft(
         # #191: gate chain pulled out to _run_send_now_gates.
         # ----------------------------------------------------------------
         if send_now:
-            all_recipients = (to or []) + (cc or []) + (bcc or [])
-            summary = _build_draft_send_summary(
-                seed_kind, to, cc, bcc, subject, body,
-            )
-            gate_err = await _run_send_now_gates(
-                operation="create_draft",
-                ctx=ctx,
-                recipients=all_recipients,
-                rate_params={"subject": subject, "to": to},
-                summary=summary,
-                elicit_extra={
-                    "subject": subject, "to": to, "seed_kind": seed_kind,
-                },
-                # Only validate recipient shape when caller supplied any —
-                # for reply with no overrides, recipients come from Mail.
-                validate_recipient_shape=(
-                    to is not None or cc is not None or bcc is not None
-                ),
-                validate_args=(to or [], cc, bcc),
+            gate_err = await _gate_create_draft_send(
+                seed_kind=seed_kind, to=to, cc=cc, bcc=bcc,
+                subject=subject, body=body, ctx=ctx,
             )
             if gate_err:
                 return gate_err

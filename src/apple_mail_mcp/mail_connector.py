@@ -348,6 +348,130 @@ def _attachment_walk_block(
     return "\n".join(lines)
 
 
+def _search_filter_statements(
+    *,
+    sender_contains: str | None,
+    subject_contains: str | None,
+    read_status: bool | None,
+    is_flagged: bool | None,
+    date_from: str | None,
+    date_to: str | None,
+    has_attachment: bool | None,
+    body_contains: str | None,
+    text_contains: str | None,
+) -> tuple[list[str], list[str]]:
+    """Translate search predicates into per-message AppleScript checks.
+
+    Returns ``(filter_checks, date_setup)``: one ``if … then set
+    includeThis to false`` statement per active predicate, to run inside
+    the message loop, and the date-cutoff statements that must run once
+    before it. Pure: no Mail access, so the translation is testable on
+    its own, and ``_search_messages_applescript`` is left with the loop.
+
+    Raises:
+        ValueError: If date_from or date_to is not ISO 8601 YYYY-MM-DD.
+    """
+    filter_checks: list[str] = []
+    date_setup: list[str] = []
+
+    if sender_contains:
+        sender_safe = escape_applescript_string(sanitize_input(sender_contains))
+        filter_checks.append(
+            f'if (sender of msg) does not contain "{sender_safe}" '
+            f'then set includeThis to false'
+        )
+
+    if subject_contains:
+        subject_safe = escape_applescript_string(sanitize_input(subject_contains))
+        filter_checks.append(
+            f'if (subject of msg) does not contain "{subject_safe}" '
+            f'then set includeThis to false'
+        )
+
+    if read_status is not None:
+        target = "true" if read_status else "false"
+        filter_checks.append(
+            f'if (read status of msg) is not {target} '
+            f'then set includeThis to false'
+        )
+
+    if is_flagged is not None:
+        target = "true" if is_flagged else "false"
+        filter_checks.append(
+            f'if (flagged status of msg) is not {target} '
+            f'then set includeThis to false'
+        )
+
+    if date_from is not None:
+        if not _ISO_DATE_RE.match(date_from):
+            raise ValueError(
+                f"date_from must be ISO 8601 YYYY-MM-DD, got: {date_from!r}"
+            )
+        date_setup.append(
+            applescript_iso_date_statements("dateFromCutoff", date_from)
+        )
+        filter_checks.append(
+            'if (date received of msg) < dateFromCutoff '
+            'then set includeThis to false'
+        )
+
+    if date_to is not None:
+        if not _ISO_DATE_RE.match(date_to):
+            raise ValueError(
+                f"date_to must be ISO 8601 YYYY-MM-DD, got: {date_to!r}"
+            )
+        # Upper bound is exclusive of the day AFTER date_to, so the full
+        # day of date_to is included.
+        next_day = (
+            _date.fromisoformat(date_to) + _timedelta(days=1)
+        ).isoformat()
+        date_setup.append(
+            applescript_iso_date_statements("dateToCutoff", next_day)
+        )
+        filter_checks.append(
+            'if (date received of msg) >= dateToCutoff '
+            'then set includeThis to false'
+        )
+
+    if has_attachment is True:
+        filter_checks.append(
+            "if (count of mail attachments of msg) = 0 "
+            "then set includeThis to false"
+        )
+    elif has_attachment is False:
+        filter_checks.append(
+            "if (count of mail attachments of msg) > 0 "
+            "then set includeThis to false"
+        )
+
+    # Body / text filters (#145). AppleScript `contains` is
+    # case-insensitive by default, matching IMAP `SEARCH BODY`/`TEXT`
+    # semantics. Reading `content of msg` is expensive — see #146 for
+    # the proactive warning surfaced before this script runs.
+    if body_contains:
+        body_safe = escape_applescript_string(sanitize_input(body_contains))
+        filter_checks.append(
+            f'if (content of msg) does not contain "{body_safe}" '
+            f'then set includeThis to false'
+        )
+
+    if text_contains:
+        # `text_contains` is the IMAP `TEXT` predicate — substring match
+        # against headers + body. AppleScript can't easily address all
+        # headers in a per-msg property; we approximate with content +
+        # subject + sender (the practical cases). Recipients omitted —
+        # callers who need recipient matching should use `sender_contains`
+        # or future params. Documented in TOOLS.md.
+        text_safe = escape_applescript_string(sanitize_input(text_contains))
+        filter_checks.append(
+            f'if not ((content of msg) contains "{text_safe}" or '
+            f'(subject of msg) contains "{text_safe}" or '
+            f'(sender of msg) contains "{text_safe}") '
+            f'then set includeThis to false'
+        )
+    return filter_checks, date_setup
+
+
 class AppleMailConnector:
     """Interface to Apple Mail via AppleScript."""
 
@@ -1426,104 +1550,17 @@ class AppleMailConnector:
         # reaches limit. Cost is bounded by `min(filter_misses + limit, N)`
         # times per-message-property-fetch — typically dominated by the
         # first few hundred recent messages, which Mail caches locally.
-        filter_checks: list[str] = []
-        date_setup: list[str] = []
-
-        if sender_contains:
-            sender_safe = escape_applescript_string(sanitize_input(sender_contains))
-            filter_checks.append(
-                f'if (sender of msg) does not contain "{sender_safe}" '
-                f'then set includeThis to false'
-            )
-
-        if subject_contains:
-            subject_safe = escape_applescript_string(sanitize_input(subject_contains))
-            filter_checks.append(
-                f'if (subject of msg) does not contain "{subject_safe}" '
-                f'then set includeThis to false'
-            )
-
-        if read_status is not None:
-            target = "true" if read_status else "false"
-            filter_checks.append(
-                f'if (read status of msg) is not {target} '
-                f'then set includeThis to false'
-            )
-
-        if is_flagged is not None:
-            target = "true" if is_flagged else "false"
-            filter_checks.append(
-                f'if (flagged status of msg) is not {target} '
-                f'then set includeThis to false'
-            )
-
-        if date_from is not None:
-            if not _ISO_DATE_RE.match(date_from):
-                raise ValueError(
-                    f"date_from must be ISO 8601 YYYY-MM-DD, got: {date_from!r}"
-                )
-            date_setup.append(
-                applescript_iso_date_statements("dateFromCutoff", date_from)
-            )
-            filter_checks.append(
-                'if (date received of msg) < dateFromCutoff '
-                'then set includeThis to false'
-            )
-
-        if date_to is not None:
-            if not _ISO_DATE_RE.match(date_to):
-                raise ValueError(
-                    f"date_to must be ISO 8601 YYYY-MM-DD, got: {date_to!r}"
-                )
-            # Upper bound is exclusive of the day AFTER date_to, so the full
-            # day of date_to is included.
-            next_day = (
-                _date.fromisoformat(date_to) + _timedelta(days=1)
-            ).isoformat()
-            date_setup.append(
-                applescript_iso_date_statements("dateToCutoff", next_day)
-            )
-            filter_checks.append(
-                'if (date received of msg) >= dateToCutoff '
-                'then set includeThis to false'
-            )
-
-        if has_attachment is True:
-            filter_checks.append(
-                "if (count of mail attachments of msg) = 0 "
-                "then set includeThis to false"
-            )
-        elif has_attachment is False:
-            filter_checks.append(
-                "if (count of mail attachments of msg) > 0 "
-                "then set includeThis to false"
-            )
-
-        # Body / text filters (#145). AppleScript `contains` is
-        # case-insensitive by default, matching IMAP `SEARCH BODY`/`TEXT`
-        # semantics. Reading `content of msg` is expensive — see #146 for
-        # the proactive warning surfaced before this script runs.
-        if body_contains:
-            body_safe = escape_applescript_string(sanitize_input(body_contains))
-            filter_checks.append(
-                f'if (content of msg) does not contain "{body_safe}" '
-                f'then set includeThis to false'
-            )
-
-        if text_contains:
-            # `text_contains` is the IMAP `TEXT` predicate — substring match
-            # against headers + body. AppleScript can't easily address all
-            # headers in a per-msg property; we approximate with content +
-            # subject + sender (the practical cases). Recipients omitted —
-            # callers who need recipient matching should use `sender_contains`
-            # or future params. Documented in TOOLS.md.
-            text_safe = escape_applescript_string(sanitize_input(text_contains))
-            filter_checks.append(
-                f'if not ((content of msg) contains "{text_safe}" or '
-                f'(subject of msg) contains "{text_safe}" or '
-                f'(sender of msg) contains "{text_safe}") '
-                f'then set includeThis to false'
-            )
+        filter_checks, date_setup = _search_filter_statements(
+            sender_contains=sender_contains,
+            subject_contains=subject_contains,
+            read_status=read_status,
+            is_flagged=is_flagged,
+            date_from=date_from,
+            date_to=date_to,
+            has_attachment=has_attachment,
+            body_contains=body_contains,
+            text_contains=text_contains,
+        )
 
         # Render filter checks each on their own line, indented for the loop.
         filter_block = "\n                ".join(filter_checks) if filter_checks else ""
