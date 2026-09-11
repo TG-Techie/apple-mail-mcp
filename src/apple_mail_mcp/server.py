@@ -1239,14 +1239,12 @@ def update_message(
                 "error_type": "validation_error",
             }
 
-        # Test-mode safety: when account is provided (moves, or narrow-path),
-        # gate against MAIL_TEST_ACCOUNT.
-        if account is not None:
-            safety_err = check_test_mode_safety(
-                "update_message", account=account
-            )
-            if safety_err:
-                return safety_err
+        # Test-mode safety: the gate compares a given account against
+        # MAIL_TEST_ACCOUNT and refuses a missing one, since message ids
+        # reach every account.
+        safety_err = check_test_mode_safety("update_message", account=account)
+        if safety_err:
+            return safety_err
 
         rate_err = check_rate_limit("update_message", {"count": len(message_ids)})
         if rate_err:
@@ -1962,14 +1960,11 @@ def delete_messages(
                 "error_type": "validation_error",
             }
 
-        # Test-mode safety: when account is provided, gate against
-        # MAIL_TEST_ACCOUNT — the same rule update_message applies.
-        if account is not None:
-            safety_err = check_test_mode_safety(
-                "delete_messages", account=account
-            )
-            if safety_err:
-                return safety_err
+        # Test-mode safety: same rule as update_message; a missing account
+        # is refused under test mode, not skipped.
+        safety_err = check_test_mode_safety("delete_messages", account=account)
+        if safety_err:
+            return safety_err
 
         logger.info(f"Deleting {len(message_ids)} message(s) to trash")
 

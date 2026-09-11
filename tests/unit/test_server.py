@@ -1503,6 +1503,18 @@ class TestGetMessages:
 
 
 class TestUpdateMessage:
+    def test_test_mode_refuses_an_update_that_names_no_account(
+        self, mock_mail: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("MAIL_TEST_MODE", "true")
+        monkeypatch.setenv("MAIL_TEST_ACCOUNT", "TestAccount")
+
+        result = update_message(["1"], read_status=True)
+
+        assert result["success"] is False
+        assert result["error_type"] == "safety_violation"
+        mock_mail.update_message.assert_not_called()
+
     def test_the_audit_entry_says_which_messages_went_where(
         self, mock_mail: MagicMock, mock_logger: MagicMock
     ) -> None:
@@ -2426,6 +2438,21 @@ class TestDeleteMailboxTool:
 
 
 class TestDeleteMessages:
+    def test_test_mode_refuses_a_delete_that_names_no_account(
+        self, mock_mail: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The tool consulted the safety gate only when an account was
+        given, so under MAIL_TEST_MODE a delete by id alone was never
+        gated and reached any account."""
+        monkeypatch.setenv("MAIL_TEST_MODE", "true")
+        monkeypatch.setenv("MAIL_TEST_ACCOUNT", "TestAccount")
+
+        result = delete_messages(["1"])
+
+        assert result["success"] is False
+        assert result["error_type"] == "safety_violation"
+        mock_mail.delete_messages.assert_not_called()
+
     def test_success(self, mock_mail: MagicMock) -> None:
         mock_mail.delete_messages.return_value = 2
 
