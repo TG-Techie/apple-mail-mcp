@@ -322,6 +322,15 @@ ACCOUNT_GATED_OPERATIONS = {
     "delete_mailbox",
 }
 
+# Of those, the ones that change mail and can be called without naming an
+# account: they take message ids, which are global across accounts, so an
+# account of None reaches every account. Under test mode they must name
+# the test account; the reads may search everywhere.
+ACCOUNT_REQUIRED_MUTATIONS = {
+    "update_message",
+    "delete_messages",
+}
+
 SEND_OPERATIONS = {
     # Drafts lifecycle (#134): create_draft / update_draft trigger the
     # send-safety gate only when send_now=True. The server-tool wrappers
@@ -437,6 +446,8 @@ def check_test_mode_safety(
 
     In test mode (MAIL_TEST_MODE=true):
     - Account-gated operations must target MAIL_TEST_ACCOUNT.
+    - delete_messages and update_message must name the test account;
+      with no account they would act on message ids from any account.
     - Send operations must send only to RFC 2606 reserved domains
       (when explicit recipients are supplied).
     - Rule-mutation operations must target rules whose names start with
@@ -445,6 +456,16 @@ def check_test_mode_safety(
     """
     if not _is_test_mode_enabled():
         return None
+
+    if operation in ACCOUNT_REQUIRED_MUTATIONS and account is None:
+        test_account = _get_test_account()
+        return _safety_error(
+            operation,
+            f"Test mode: {operation} must name account="
+            f"{test_account!r} (MAIL_TEST_ACCOUNT); message ids reach every "
+            "account, so without it the operation is not confined to the "
+            "test account.",
+        )
 
     # Account-gated operations: verify target account matches MAIL_TEST_ACCOUNT
     # by either name or UUID (per #61, account-gated tools accept both forms).

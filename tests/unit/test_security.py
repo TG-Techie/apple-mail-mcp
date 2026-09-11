@@ -407,6 +407,35 @@ class TestCheckTestModeSafety:
         assert result["error_type"] == "safety_violation"
         assert "MAIL_TEST_ACCOUNT" in result["error"]
 
+    # delete_messages and update_message take message ids, which are
+    # global across accounts, so with account=None they reach any
+    # account. The gate only compared an account that was given; with
+    # none given it stood aside, and test mode did not confine a delete
+    # or a move to the test account at all.
+
+    @pytest.mark.parametrize("operation", ["delete_messages", "update_message"])
+    def test_a_mutation_without_an_account_is_refused_in_test_mode(
+        self, monkeypatch: Any, operation: str
+    ) -> None:
+        monkeypatch.setenv("MAIL_TEST_MODE", "true")
+        monkeypatch.setenv("MAIL_TEST_ACCOUNT", "TestAccount")
+
+        result = check_test_mode_safety(operation, account=None)
+
+        assert result is not None
+        assert result["error_type"] == "safety_violation"
+        assert "TestAccount" in result["error"]
+        assert operation in result["error"]
+
+    @pytest.mark.parametrize("operation", ["search_messages", "list_mailboxes"])
+    def test_a_read_without_an_account_is_still_fine_in_test_mode(
+        self, monkeypatch: Any, operation: str
+    ) -> None:
+        monkeypatch.setenv("MAIL_TEST_MODE", "true")
+        monkeypatch.setenv("MAIL_TEST_ACCOUNT", "TestAccount")
+
+        assert check_test_mode_safety(operation, account=None) is None
+
     def test_account_matches_returns_none(self, monkeypatch: Any) -> None:
         monkeypatch.setenv("MAIL_TEST_MODE", "true")
         monkeypatch.setenv("MAIL_TEST_ACCOUNT", "TestAccount")
@@ -609,11 +638,17 @@ class TestCheckTestModeSafety:
         monkeypatch.setenv("MAIL_TEST_ACCOUNT", "TestAccount")
 
         # delete_messages isn't a send op — the new branch shouldn't fire.
+        # (It names the test account, since a mutation without one is
+        # refused on its own grounds.)
         assert (
-            check_test_mode_safety("delete_messages", recipients=None) is None
+            check_test_mode_safety(
+                "delete_messages", account="TestAccount", recipients=None
+            ) is None
         )
         assert (
-            check_test_mode_safety("delete_messages", recipients=[]) is None
+            check_test_mode_safety(
+                "delete_messages", account="TestAccount", recipients=[]
+            ) is None
         )
 
     def test_non_gated_operation_returns_none(self, monkeypatch: Any) -> None:
