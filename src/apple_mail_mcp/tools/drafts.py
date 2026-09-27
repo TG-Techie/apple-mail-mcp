@@ -69,12 +69,8 @@ def _draft_sender(state: dict[str, Any]) -> str | None:
     """The sender a draft was saved with, as Mail reads it back, or None.
 
     A rebuilt draft is built with it unless the caller names another, so
-    an update does not silently move the draft to Mail's default account
-    (the connector resolves the address to its account). The one path
-    that cannot set a sender is a fresh draft sent through mailto:;
-    draft_send passes none there, and whether that draft's sender matches
-    what Mail's URL handler will use is not knowable here (see
-    DESIGN-QUEUE).
+    an update or a send does not silently move the draft to Mail's
+    default account (the connector resolves the address to its account).
     """
     return cast(str, state.get("sender") or "") or None
 
@@ -213,38 +209,6 @@ def _retire_old_draft(
         )
     store.delete(draft_id)
     return None
-
-
-def _fresh_send_guard(
-    seed_kind: str, attachment_names: list[str]
-) -> dict[str, Any] | None:
-    """Refuse draft_send on a fresh draft that carries attachments, which
-    the mailto: dispatch path cannot.
-
-    Fresh drafts are sent via the mailto: URL path (connector
-    ``_send_new_via_eml``). Mail's URL handler carries no attachments, so
-    such a send is refused here instead of by the connector. Must be
-    called BEFORE any destructive op, attachment extraction, or
-    confirmation prompt: without that, the delete-and-recreate ran first
-    and the connector's refusal landed AFTER the draft was deleted —
-    destroying it (drafts 1390/1393, 2026-08-24).
-
-    Returns an error response, or None to proceed.
-    """
-    if seed_kind != "new" or not attachment_names:
-        return None
-    return {
-        "success": False,
-        "error": (
-            "auto-send of a fresh draft with attachments is not "
-            "supported — the mailto: dispatch path cannot carry "
-            "attachments. The draft is unchanged. Use email_send_html "
-            "with attachment_paths (attachments ARE supported there), "
-            "open Mail.app and press Send manually, or send without "
-            "attachments."
-        ),
-        "error_type": "attachments_unsupported",
-    }
 
 
 def _resolve_draft_attachments(
@@ -793,8 +757,6 @@ def draft_send(
 
     store = _get_draft_state_store()
     source = _resolve_draft_source(draft_id, state, store)
-    if refused := _fresh_send_guard(source.seed_kind, source.attachment_names):
-        return refused
     if refused := send.confirm_send(
         ctx, "draft_send", recipients,
         send.build_send_summary(source.seed_kind, to, cc, bcc, subject, source.body),
@@ -813,8 +775,7 @@ def draft_send(
         bcc=bcc,
         subject=subject,
         body=source.body,
-        # A fresh draft goes out through mailto:, which cannot set one.
-        from_account=None if source.seed_kind == "new" else _draft_sender(state),
+        from_account=_draft_sender(state),
         send_now=True,
     )
     warning = _retire_old_draft(draft_id, store, new_draft_id="", sent=True)

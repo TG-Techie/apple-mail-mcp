@@ -24,16 +24,6 @@ from ..server import _confirm_from_threadpool, _in_tool_threadpool, envelope, mc
 logger = logging.getLogger(__name__)
 
 
-_FROM_ACCOUNT_UNSUPPORTED_ON_FRESH_SEND = (
-    "a fresh message sent immediately goes out through Mail's mailto: "
-    "handler, which always composes from Mail's default account, so "
-    "from_account cannot be honoured on this path. Nothing was sent. "
-    "Omit from_account to send from the default account, or save it "
-    "with draft_create — a saved draft keeps the chosen sender — and "
-    "send it from Mail.app."
-)
-
-
 def validate_attachment_files(attachment_paths: list[str]) -> None:
     """Validate files the caller asks to attach, before anything is composed.
 
@@ -159,17 +149,15 @@ def _validate_html_send_content(
     to: list[str],
     subject: str,
     reply_to: str | None,
-    from_account: str | None,
     attachment_paths: list[str],
-) -> dict[str, Any] | None:
+) -> None:
     """What may go on an email_send_html message, given which compose path
-    it takes. A fresh message needs its recipients and subject; a reply
-    has Mail derive them. A reply sets the sender on the outgoing message
-    and honours from_account but cannot take attachments; a fresh message
-    takes attachments but composes through mailto:, which cannot set the
-    sender. Files that are allowed at all get the send-path file checks.
-    A missing field or a bad file raises ValueError; a path that cannot
-    carry what was asked returns its refusal. None means go on.
+    it takes, checked before anything is composed. A fresh message needs
+    its recipients and subject; a reply has Mail derive them. Both set
+    the sender on the message they compose. A fresh message takes
+    attachments; a reply cannot yet, since what Mail's reply verb does
+    with them is unverified. Files that are allowed get the send-path
+    file checks. Anything else raises ValueError.
     """
     if reply_to is None and not to:
         raise ValueError("email_send_html: 'to' is required unless reply_to is given")
@@ -177,26 +165,14 @@ def _validate_html_send_content(
         raise ValueError(
             "email_send_html: 'subject' is required unless reply_to is given"
         )
-    if from_account is not None and reply_to is None:
-        return {
-            "success": False,
-            "error": "email_send_html: " + _FROM_ACCOUNT_UNSUPPORTED_ON_FRESH_SEND,
-            "error_type": "from_account_unsupported",
-        }
     if attachment_paths and reply_to is not None:
-        return {
-            "success": False,
-            "error": (
-                "email_send_html: attachments are not supported on "
-                "replies yet — send them in a fresh message, or save a "
-                "reply draft via draft_create and send manually from "
-                "Mail.app."
-            ),
-            "error_type": "attachments_unsupported",
-        }
+        raise ValueError(
+            "email_send_html: attachments are not supported on replies "
+            "yet. Nothing was sent. Send them in a fresh message, or save "
+            "a reply draft with draft_create and send it from Mail.app."
+        )
     if attachment_paths:
         validate_attachment_files(attachment_paths)
-    return None
 
 
 @_in_tool_threadpool
@@ -252,11 +228,8 @@ def email_send_html(
             visible in the compose window before Send is clicked, and the
             Sent-mailbox copy is checked for the attachment count.
         from_account: Mail.app account name or UUID. None uses Mail's
-            default. Honoured on replies, where the sender is set on the
-            outgoing message. A fresh message composes through mailto:,
-            which cannot set it, and is refused
-            (``from_account_unsupported``) rather than sent from the
-            wrong account.
+            default. Set as the sender of the message composed, fresh
+            or reply.
         reply_to: Message id to reply to. Enables reply mode.
 
     Returns:
@@ -267,11 +240,10 @@ def email_send_html(
     attachment_paths = attachment_paths or []
     all_recipients = list(to) + list(cc_list) + list(bcc_list)
 
-    if refused := _validate_html_send_content(
+    _validate_html_send_content(
         to=to, subject=subject, reply_to=reply_to,
-        from_account=from_account, attachment_paths=attachment_paths,
-    ):
-        return refused
+        attachment_paths=attachment_paths,
+    )
     # A reply that names no recipients leaves the list empty here: Mail
     # derives them, and the connector checks those at dispatch.
     if refused := outbound_refusal("email_send_html", all_recipients):

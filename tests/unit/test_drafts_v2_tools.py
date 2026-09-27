@@ -11,6 +11,7 @@ tool — draft_send — and so failed sends leave the draft intact for
 review.
 """
 
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -243,17 +244,14 @@ class TestDraftUpdateAttachmentsAreCheckedLikeASend:
         assert mock_mail.create_draft.call_args.kwargs["attachment_paths"] == extracted
 
 
-class TestAFreshSendCannotChooseTheSender:
-    """A fresh message sent immediately goes out through Mail's mailto:
-    handler, which composes from Mail's default account and offers no way
-    to pick another, and carries no attachments. Until now from_account
-    was accepted on those paths and silently ignored: the mail went out
-    from the wrong account and the call reported success. Now
-    email_send_html refuses it before anything is composed, and
-    draft_send refuses a fresh draft with attachments before anything is
-    deleted or put in front of the user to confirm. Replies set the
-    sender on the outgoing message and keep honouring it; a saved draft
-    keeps its sender for a human to send from Mail.app."""
+class TestAFreshSendNamesItsSenderAndCarriesFiles:
+    """A fresh message sent immediately is composed in a window the
+    connector sets the sender on and pastes files into, like a reply's.
+    Until it was, a fresh send went out through Mail's mailto: handler,
+    which composes from the default account and carries no files, so
+    email_send_html refused a fresh from_account and draft_send refused
+    a fresh draft with attachments. Now both go through, to the
+    connector."""
 
     _FRESH_STATE = {
         "draft_id": "OLD",
@@ -263,19 +261,22 @@ class TestAFreshSendCannotChooseTheSender:
     }
 
     @pytest.mark.asyncio
-    async def test_email_send_html_fresh_is_refused_before_compose(
+    async def test_email_send_html_fresh_passes_the_sender_on(
         self, isolated_drafts: None, mock_mail: MagicMock
     ) -> None:
         from apple_mail_mcp.tools.send import email_send_html
 
+        mock_mail._send_html_email.return_value = {
+            "draft_id": "", "sent_message_id": ""
+        }
         result = await email_send_html(
             to=["alice@example.com"], subject="x", body="<p>b</p>",
             from_account="Work",
         )
-        assert result["success"] is False
-        assert result["error_type"] == "from_account_unsupported"
-        assert "from_account" in result["error"]
-        mock_mail._send_html_email.assert_not_called()
+        assert result["success"] is True, result
+        kwargs = mock_mail._send_html_email.call_args.kwargs
+        assert kwargs["from_account"] == "Work"
+        assert kwargs["reply_to"] is None
 
     @pytest.mark.asyncio
     async def test_email_send_html_reply_still_honours_it(
@@ -294,31 +295,29 @@ class TestAFreshSendCannotChooseTheSender:
         assert mock_mail._send_html_email.call_args.kwargs["from_account"] == "Work"
 
     @pytest.mark.asyncio
-    async def test_draft_send_fresh_with_attachments_is_refused_before_the_prompt(
-        self,
-        isolated_drafts: None,
-        mock_mail: MagicMock,
-        monkeypatch: pytest.MonkeyPatch,
+    async def test_draft_send_fresh_with_attachments_sends_them(
+        self, isolated_drafts: None, mock_mail: MagicMock, tmp_path: Path
     ) -> None:
-        """The other limit of the mailto: path. Before this the user
-        confirmed the send and the connector then refused it."""
+        """The draft's files are saved out of Mail and handed to the
+        send, which is built before the old draft is removed."""
         from apple_mail_mcp.tools.drafts import draft_send
 
-        # Without the allowlist bypass the send would be put to the user.
-        monkeypatch.setattr(
-            "apple_mail_mcp.tools.send.all_recipients_allowed", lambda r: False
-        )
         state = dict(self._FRESH_STATE)
         state["attachment_names"] = ["report.pdf"]
         mock_mail.get_draft_state.return_value = state
-        ctx = MagicMock()
-        ctx.elicit = AsyncMock()
-        result = await draft_send(draft_id="OLD", ctx=ctx)
-        assert result["success"] is False
-        assert result["error_type"] == "attachments_unsupported"
-        ctx.elicit.assert_not_called()
-        mock_mail.create_draft.assert_not_called()
-        mock_mail.delete_draft.assert_not_called()
+        extracted = [tmp_path / "report.pdf"]
+        mock_mail.extract_draft_attachments.return_value = extracted
+        mock_mail.create_draft.return_value = {"draft_id": "", "sent_message_id": ""}
+        result = await draft_send(draft_id="OLD")
+        assert result["success"] is True, result
+        listed = mock_mail.extract_draft_attachments.call_args.args
+        assert listed[:2] == ("OLD", ["report.pdf"])
+        kwargs = mock_mail.create_draft.call_args.kwargs
+        assert kwargs["seed"] == "new"
+        assert kwargs["send_now"] is True
+        assert kwargs["attachment_paths"] == extracted
+        calls = [c[0] for c in mock_mail.mock_calls]
+        assert calls.index("create_draft") < calls.index("delete_draft")
 
     def test_draft_create_saved_keeps_the_sender(
         self, isolated_drafts: None, mock_mail: MagicMock
@@ -423,13 +422,13 @@ class TestDraftUpdateKeepsTheDraftInItsAccount:
         )
 
     @pytest.mark.asyncio
-    async def test_a_fresh_draft_sent_now_cannot_carry_it(
+    async def test_a_fresh_draft_sent_now_keeps_its_sender(
         self, isolated_drafts: None, mock_mail: MagicMock
     ) -> None:
-        """The mailto: path composes from Mail's default account and has no
-        sender to set. The carried-over sender is not passed there — the
-        connector would refuse it — and whether that draft's sender matches
-        what mailto: will use is not knowable here (DESIGN-QUEUE)."""
+        """A fresh send sets the sender on the window it composes, as a
+        reply's does, so the draft's own sender reaches it. Before, a
+        fresh draft went out through mailto: from Mail's default account,
+        whatever it had been saved with."""
         from apple_mail_mcp.tools.drafts import draft_send
 
         mock_mail.get_draft_state.return_value = dict(self._STATE)
@@ -438,7 +437,9 @@ class TestDraftUpdateKeepsTheDraftInItsAccount:
         ctx.elicit = AsyncMock()
         result = await draft_send(draft_id="OLD", ctx=ctx)
         assert result["success"] is True, result
-        assert mock_mail.create_draft.call_args.kwargs["from_account"] is None
+        kwargs = mock_mail.create_draft.call_args.kwargs
+        assert kwargs["seed"] == "new"
+        assert kwargs["from_account"] == "Agent <agent@icloud.com>"
 
 
 class TestDraftUpdate:
@@ -607,42 +608,38 @@ class TestDraftSend:
         mock_mail.delete_draft.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_fresh_draft_with_attachments_blocked_intact(
+    async def test_fresh_draft_with_attachments_survives_a_failed_send(
         self,
         isolated_drafts: None,
         mock_mail: MagicMock,
-        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
     ) -> None:
-        """Regression: fresh-seed drafts with attachments cannot be
-        auto-sent (the mailto: dispatch path carries no attachments).
-        Historically the delete-and-recreate ran anyway: the draft was
-        deleted, then the recreate-send raised NotImplementedError —
-        destroying the draft (real incident: draft ids 1390/1393,
-        2026-08-24). The guard must fire BEFORE any destructive op.
-        """
-        monkeypatch.delenv(
-            "APPLE_MAIL_MCP_SEND_ELICITATION_ALLOWLIST", raising=False
-        )
+        """Regression: a fresh draft with attachments was once deleted
+        before its send was attempted, and the send then refused the
+        files, which destroyed the draft (2026-08-24). Such a draft is
+        sent with its files now; when that send fails, the draft is
+        still where the caller left it."""
+        from apple_mail_mcp.exceptions import MailAppleScriptError
         from apple_mail_mcp.tools.drafts import draft_send
 
         mock_mail.get_draft_state.return_value = {
-            "draft_id": "1390",
+            "draft_id": "ABCD",
             "to": ["alice@example.com"], "cc": [], "bcc": [],
-            "subject": "Debrief excerpt", "body": "see attached",
+            "subject": "excerpt", "body": "see attached",
             "in_reply_to": "", "references": "",
-            "attachment_names": ["Debrief_verbatim.txt"],
+            "attachment_names": ["notes.txt"],
         }
-        result = await draft_send(draft_id="1390")
+        mock_mail.extract_draft_attachments.return_value = [tmp_path / "notes.txt"]
+        mock_mail.create_draft.side_effect = MailAppleScriptError(
+            "verified send: 'SEND_DISABLED'"
+        )
+        result = await draft_send(draft_id="ABCD")
         assert result["success"] is False
-        assert result["error_type"] == "attachments_unsupported"
-        # The error must steer to paths that actually work, not to the
-        # flow that just failed.
-        assert "Mail.app" in result["error"]
-        # CRITICAL: the draft survives.
+        assert result["error_type"] == "applescript_error"
+        assert mock_mail.create_draft.call_args.kwargs["attachment_paths"] == [
+            tmp_path / "notes.txt"
+        ]
         mock_mail.delete_draft.assert_not_called()
-        mock_mail.create_draft.assert_not_called()
-        # No pointless attachment extraction either.
-        mock_mail.extract_draft_attachments.assert_not_called()
 
 
 class TestAReplyOrForwardIsRebuiltFromTheCallersOwnText:
@@ -1281,7 +1278,8 @@ class TestDraftSendHtml:
             attachment_paths=[str(f)],
         )
         assert result["success"] is False
-        assert result["error_type"] == "attachments_unsupported"
+        assert result["error_type"] == "validation_error"
+        assert "replies" in result["error"]
         mock_mail._send_html_email.assert_not_called()
 
     @pytest.mark.asyncio

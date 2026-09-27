@@ -594,3 +594,40 @@ def test_draft_create_then_send_arrives_intact(loop: Loopback) -> None:
 
         loop.assert_delivered(arrival, sent, subject)
         assert body in arrival.content
+
+
+def test_a_fresh_draft_with_files_is_sent_with_them(
+    loop: Loopback, tmp_path: Path
+) -> None:
+    """``draft_create`` with two files, then ``draft_send``: the send
+    saves the files out of the draft and composes with them, and with
+    the sender the draft was saved with. draft_send refused such a draft
+    while fresh sends went out through mailto:, which carries no files."""
+    from apple_mail_mcp.tools.drafts import draft_create, draft_send
+
+    hexid = _hex()
+    subject = f"{PREFIX}draft-files-{hexid}"
+    body = f"draft with files marker-{hexid}"
+    files = _two_files(tmp_path, hexid)
+    with MailTrash(loop.connector, loop.account) as trash:
+        trash.windows(subject)
+        trash.drafts(subject)
+        loop.prepare(trash, subject)
+        created = draft_create(
+            to=[loop.address], subject=subject, body=body,
+            attachment_paths=[str(f) for f in files],
+        )
+        assert created["success"] is True, created
+        result = asyncio.run(draft_send(draft_id=created["draft_id"]))
+        assert result["success"] is True, result
+        sent, arrival = loop.receive(trash, subject)
+
+        loop.assert_delivered(arrival, sent, subject)
+        loop.assert_from_named_sender(arrival)
+        assert body in arrival.content
+        assert sorted(arrival.attachment_names) == ["first.txt", "second.txt"]
+        assert arrival.attachment_count == 2
+        assert _attachment_bytes(arrival.source) == {
+            f.name: f.read_bytes() for f in files
+        }
+        assert_not_quoted(arrival.source)

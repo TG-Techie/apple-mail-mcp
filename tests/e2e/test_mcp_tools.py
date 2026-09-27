@@ -385,6 +385,56 @@ class TestOutboundAllowlistGate:
         mock_mail.delete_draft.assert_not_called()
 
 
+class TestAFreshSendNamesItsSenderAndCarriesFiles:
+    """Through the protocol, a fresh email_send_html naming a sender, and
+    draft_send of a fresh draft with files, reach the connector with
+    both. Each was refused while a fresh send went out through Mail's
+    mailto: handler. The recipient is allowlisted by a policy of this
+    class's own, so nothing is put to the user to confirm."""
+
+    @pytest.fixture(autouse=True)
+    def _example_com_allowed(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        policy = tmp_path / "comms.yaml"
+        policy.write_text("email:\n  allowed_outbound:\n    - '*@example.com'\n")
+        monkeypatch.setenv("APPLE_MAIL_MCP_COMMS_CONFIG", str(policy))
+
+    async def test_email_send_html_fresh_names_its_sender(
+        self, mock_mail: MagicMock
+    ) -> None:
+        mock_mail._send_html_email.return_value = {"draft_id": "", "sent_message_id": ""}
+        result = await server.mcp.call_tool(
+            "email_send_html",
+            {"to": ["a@example.com"], "subject": "s", "body": "<p>b</p>",
+             "from_account": "Work"},
+        )
+        body = result.structured_content
+        assert body is not None
+        assert body["success"] is True, body
+        assert mock_mail._send_html_email.call_args.kwargs["from_account"] == "Work"
+
+    async def test_draft_send_fresh_carries_files_and_sender(
+        self, mock_mail: MagicMock, tmp_path: Path
+    ) -> None:
+        mock_mail.get_draft_state.return_value = {
+            "to": ["a@example.com"], "cc": [], "bcc": [],
+            "subject": "s", "body": "b",
+            "attachment_names": ["notes.txt"],
+            "sender": "Work <w@example.com>",
+        }
+        mock_mail.extract_draft_attachments.return_value = [tmp_path / "notes.txt"]
+        mock_mail.create_draft.return_value = {"draft_id": "", "sent_message_id": ""}
+        result = await server.mcp.call_tool("draft_send", {"draft_id": "draft-1"})
+        body = result.structured_content
+        assert body is not None
+        assert body["success"] is True, body
+        kwargs = mock_mail.create_draft.call_args.kwargs
+        assert kwargs["seed"] == "new"
+        assert kwargs["attachment_paths"] == [tmp_path / "notes.txt"]
+        assert kwargs["from_account"] == "Work <w@example.com>"
+
+
 class TestDraftUpdateInvocation:
     """draft_update is delete-and-recreate, so it needs three connector
     calls stubbed and does not fit the single-method table above."""
