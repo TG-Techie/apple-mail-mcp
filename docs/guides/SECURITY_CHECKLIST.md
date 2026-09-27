@@ -4,7 +4,7 @@ Every new feature should be reviewed against the six concerns below before openi
 
 ## Input sanitization
 
-Any string that originates from an MCP tool argument, an environment variable, or any other external source must pass through [`sanitize_input`](../../src/apple_mail_mcp/utils.py#L156) before further processing. It strips null bytes, truncates oversized strings (currently 10000 chars), and coerces non-strings to strings.
+Any string that originates from an MCP tool argument, an environment variable, or any other external source must pass through [`sanitize_input`](../../src/apple_mail_mcp/utils.py#L169) before further processing. It strips null bytes, truncates oversized strings (currently 10000 chars), and coerces non-strings to strings.
 
 This protects against null-byte injection in shell or AppleScript contexts and bounds memory use for pathological inputs. It does **not** make a string safe for interpolation — see *AppleScript escaping* and *Path-traversal-safe name validation* below.
 
@@ -29,7 +29,7 @@ id_list = ", ".join(
 
 ## Path-traversal-safe name validation
 
-Any user-supplied string used as a filename stem must pass a strict regex *before* being handed to `Path()`. The canonical example is [`_validate_name`](../../src/apple_mail_mcp/templates.py#L180) in the templates module:
+Any user-supplied string used as a filename stem must pass a strict regex *before* being handed to `Path()`. The canonical example is [`_validate_name`](../../src/apple_mail_mcp/templates.py#L181) in the templates module:
 
 ```python
 _NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
@@ -53,7 +53,7 @@ There's a unit test in [`test_security.py`](../../tests/unit/test_security.py) (
 
 Every server-side tool wrapper must call [`operation_logger.log_operation`](../../src/apple_mail_mcp/security.py#L55) on its success path with its own tool name as the operation, the params it received, and a status string. Failure paths log via the per-`error_type` return shape; the audit log captures the successful actions.
 
-This produces a record of what the server actually did — useful for debugging, for confirming that destructive operations were preceded by elicitation, and for users who want to inspect what an LLM caused to happen on their behalf. Each entry is kept in memory for the process and appended as one JSON line to `audit.jsonl` under the data home (`APPLE_MAIL_MCP_HOME`, default `~/.apple_mail_mcp`); the file is the record that outlives the process, since every agent session runs its own server. Send-path entries carry the recipients, subject and `from_account` as asked, never the body; entries for the other mutations carry what identifies the thing acted on and what was done to it (the message ids and the destination of a move, the conditions and actions of a rule, the counts asked for and achieved), so the file can answer what the server did to the user's mail without the session that did it. The file rolls over at `AUDIT_ROTATE_BYTES` with one previous generation kept, so it is bounded on disk. A log that cannot be written is reported as a warning and the operation it records still stands. The file is personal data at rest — see "User Data on Disk" in `AGENTS.md` for how it is handled.
+This produces a record of what the server actually did — useful for debugging, for confirming that destructive operations were preceded by elicitation, and for users who want to inspect what an LLM caused to happen on their behalf. Each entry is kept in memory for the process and appended as one JSON line to `audit.jsonl` under the data home (`APPLE_MAIL_MCP_HOME`, default `~/.apple_mail_mcp`); the file is the record that outlives the process, whichever process that is: a session may run its own server or share the resident daemon (`mail-serve`) with every other session, and either way nothing else on disk says what the server did. Send-path entries carry the recipients, subject and `from_account` as asked, never the body; entries for the other mutations carry what identifies the thing acted on and what was done to it (the message ids and the destination of a move, the conditions and actions of a rule, the counts asked for and achieved), so the file can answer what the server did to the user's mail without the session that did it. The file rolls over at `AUDIT_ROTATE_BYTES` with one previous generation kept, so it is bounded on disk. A log that cannot be written is reported as a warning and the operation it records still stands. The file is personal data at rest — see "User Data on Disk" in `AGENTS.md` for how it is handled.
 
 ## The outbound allowlist
 

@@ -328,14 +328,12 @@ User ↔ Claude Desktop ↔ MCP Server ↔ Mail.app
 
 ### Local Storage
 
-The MCP server does NOT store:
-- Email content
-- Credentials
-- Mailbox data
+What the server keeps lives under the data home (`APPLE_MAIL_MCP_HOME`, default `~/.apple_mail_mcp`):
+- Operation logs: kept in memory for the life of the process and appended to `audit.jsonl`, which rolls over with one previous generation (`audit.jsonl.1`) kept. It records recipients and subjects, never bodies.
+- Draft records (`drafts/`): for each reply or forward draft the server creates, the original message's id and the text and attachment names the caller gave, so the draft can be rebuilt without Mail's quoted original.
+- Templates (`templates/`): the templates saved with `save_template`.
 
-Only stored locally:
-- Operation logs (in memory, cleared on restart)
-- Temporary cache (if implemented in future versions)
+The `setup-imap` command stores an IMAP password in the macOS Keychain, and `save_attachments` writes attachments to the directory the caller names. Beyond those, the server writes only a lock file and temporary copies of a draft's attachments while rebuilding it, removed afterwards. It does not keep messages, mailbox contents or Mail.app's credentials.
 
 ### Recommendations
 
