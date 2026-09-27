@@ -695,11 +695,12 @@ class AppleMailConnector:
     def _acquire_mail_lock(self) -> IO[str]:
         """Acquire the cross-process Mail automation lock (2026-07-23).
 
-        Every agent session spawns its own MCP server process; without
-        serialization, concurrent AppleScript against Mail.app collides
-        into AppleEvent timeouts (-1712) and invalid connections (-609)
-        that surface as inscrutable failures for the OTHER agent. A
-        file lock under ``APPLE_MAIL_MCP_HOME`` (default
+        Several callers can drive Mail at once (the resident daemon on
+        behalf of many sessions, any stdio server beside it, a test
+        run); without serialization, concurrent AppleScript against
+        Mail.app collides into AppleEvent timeouts (-1712) and invalid
+        connections (-609) that surface as inscrutable failures for the
+        OTHER agent. A file lock under ``APPLE_MAIL_MCP_HOME`` (default
         ``~/.apple_mail_mcp``) queues callers instead; a caller that
         cannot acquire it within ``lock_timeout`` gets a clear "busy"
         error naming the condition — before any osascript runs.

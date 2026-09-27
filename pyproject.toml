@@ -58,6 +58,8 @@ dev = [
 
 [project.scripts]
 apple-mail-mcp = "apple_mail_mcp.server:main"
+mail-serve = "apple_mail_mcp.serve:main"
+mail-proxy = "apple_mail_mcp.proxy:main"
 
 [project.urls]
 Homepage = "https://github.com/morgancoopercom/apple-mail-mcp"
