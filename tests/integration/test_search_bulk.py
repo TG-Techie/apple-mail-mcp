@@ -2,24 +2,31 @@
 Mail holds, and their fallbacks return the same.
 
 The search reads a criterion's property for the whole mailbox in one
-event and each row property once per run of matched positions (see
+event, the content a body or text filter tests once per run of the
+positions the other criteria kept, and each row property once per run
+of matched positions (see
 ``AppleMailConnector._search_messages_applescript``). These tests hold
-its result against two other readings of the same mail:
+its result against other readings of the same mail:
 
 - each row against ``get_message`` for its id, a different script that
   reads one message by id;
 - a filtered search's ids against the search as it was before the bulk
   reads, one message at a time, written out here as a small script of
-  its own.
+  its own;
+- a content search against itself with each body read in a batch of
+  its own, and with a lower limit.
 
 The fallbacks run against the real Mail by breaking one bulk read in
 the emitted script (a range past the mailbox's end, which Mail refuses,
 or a raised error where Mail answers any index) or one alignment check,
 and must give back the same rows with a warning saying what happened.
+The content searches are bounded by date to the newest messages, so
+they never read every body of the INBOX.
 
 Nothing is sent, saved, moved or deleted, and no window is touched.
 Assertions compare ids and fields between two readings and never print
-a subject or an address.
+a subject or an address (the older tests' whole-row comparisons do
+when they fail).
 
 Run:
 
@@ -146,6 +153,54 @@ def _breaking(
 # A range past the mailbox's end, which Mail refuses, in place of the
 # run's range.
 _PAST_THE_END = "messages runStart thru (runEnd + 1000000) of mailboxRef"
+
+# What the content searches look for: a reserved domain, never a real
+# person's name or address.
+_CONTENT_TEXT = "example.com"
+
+# The content searches start from the day this many messages back in
+# the INBOX was received, so the bodies they read are that day's and
+# newer rather than the whole mailbox's.
+_CONTENT_SPAN = 30
+
+
+def _day_of_position(
+    connector: AppleMailConnector, account: str, mailbox: str, position: int
+) -> str:
+    """The day, YYYY-MM-DD, that the message at ``position`` of
+    ``mailbox`` (the last message, if it holds fewer) was received."""
+    body = f"""
+tell application "Mail"
+    set mb to mailbox "{escape_applescript_string(mailbox)}" of account "{escape_applescript_string(account)}"
+    set n to count of messages of mb
+    set resultData to {{|day|:""}}
+    if n > 0 then
+        set p to {position}
+        if p > n then set p to n
+        set d to date received of message p of mb
+        set resultData to {{|day|:((year of d) as text) & "-" & (text -2 thru -1 of ("0" & ((month of d) as integer))) & "-" & (text -2 thru -1 of ("0" & (day of d)))}}
+    end if
+end tell
+"""
+    raw = connector._run_applescript(_wrap_as_json_script(body, timeout=120))
+    day = str(cast(dict[str, Any], parse_applescript_json(raw))["day"])
+    if not day:
+        pytest.skip(f"{mailbox!r} is empty")
+    return day
+
+
+def _assert_same_rows(
+    got: list[dict[str, Any]], expected: list[dict[str, Any]]
+) -> None:
+    """The same rows in the same order, reported by id and field name
+    only."""
+    assert [r["id"] for r in got] == [r["id"] for r in expected]
+    differing = [
+        (row["id"], [f for f in row if row[f] != other.get(f)])
+        for row, other in zip(got, expected, strict=True)
+        if row != other
+    ]
+    assert differing == []
 
 
 class TestTheRowsAreMailsOwn:
@@ -290,3 +345,84 @@ class TestTheFallbacksGiveTheSameRows:
         )
         assert broken == intact
         assert warnings == [mail_connector._SEARCH_OUT_OF_LINE_WARNING]
+
+
+class TestTheContentIsReadInBulk:
+    """A body or text search reads the content over runs of the
+    positions the other filters kept, in batches no larger than the
+    matches still wanted. Its rows must not depend on how the bodies
+    were batched, or on whether they were read in bulk at all."""
+
+    @pytest.fixture
+    def since(self, connector: AppleMailConnector, test_account: str) -> str:
+        return _day_of_position(connector, test_account, "INBOX", _CONTENT_SPAN)
+
+    @pytest.mark.parametrize("criterion", ["text_contains", "body_contains"])
+    def test_the_rows_of_a_content_read_one_message_at_a_time(
+        self,
+        connector: AppleMailConnector,
+        test_account: str,
+        since: str,
+        monkeypatch: pytest.MonkeyPatch,
+        criterion: str,
+    ) -> None:
+        """Each run's content read refused, as a failed bulk read is:
+        every body is then read by its own event, and the rows are the
+        same."""
+        criteria: dict[str, Any] = {
+            criterion: _CONTENT_TEXT, "date_from": since, "limit": _MARKED_LIMIT,
+        }
+        intact, warnings = _search(connector, test_account, "INBOX", **criteria)
+        assert warnings == []
+        if not intact:
+            pytest.skip(f"no INBOX message since {since} matches {criterion}")
+        _breaking(
+            connector, monkeypatch,
+            "content of messages runStart thru runEnd of mailboxRef",
+            "content of " + _PAST_THE_END,
+        )
+        broken, warnings = _search(connector, test_account, "INBOX", **criteria)
+        _assert_same_rows(broken, intact)
+        assert warnings
+        assert [
+            w.partition(":")[0].rpartition(" ")[0] for w in warnings
+        ] == ["content could not be read in bulk for mailbox positions"] * len(warnings)
+
+    def test_the_rows_do_not_depend_on_how_the_bodies_were_batched(
+        self,
+        connector: AppleMailConnector,
+        test_account: str,
+        since: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A batch of one reads each body by itself, and tests it before
+        the next is read; a lower limit ends the reading sooner. Neither
+        changes which rows come back, only how many."""
+        criteria: dict[str, Any] = {
+            "text_contains": _CONTENT_TEXT, "date_from": since,
+            "limit": _MARKED_LIMIT,
+        }
+        whole, warnings = _search(connector, test_account, "INBOX", **criteria)
+        assert warnings == []
+        if len(whole) < 2:
+            pytest.skip(f"fewer than two INBOX messages since {since} match")
+        monkeypatch.setattr(mail_connector, "_SEARCH_CONTENT_BATCH", 1)
+        one_by_one, warnings = _search(connector, test_account, "INBOX", **criteria)
+        assert warnings == []
+        _assert_same_rows(one_by_one, whole)
+        monkeypatch.undo()
+        fewer, warnings = _search(
+            connector, test_account, "INBOX", **{**criteria, "limit": len(whole) - 1}
+        )
+        assert warnings == []
+        _assert_same_rows(fewer, whole[:-1])
+        # With no date bound the scan has nothing to test and every
+        # position is a candidate. Mail lists the INBOX newest first, so
+        # the matches since that day come first, and the limit ends the
+        # reading at the last of them.
+        undated, warnings = _search(
+            connector, test_account, "INBOX",
+            text_contains=_CONTENT_TEXT, limit=len(whole),
+        )
+        assert warnings == []
+        _assert_same_rows(undated, whole)
