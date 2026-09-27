@@ -847,3 +847,160 @@ class TestEverySendPathIsConfinedInTestMode:
         assert result is not None, f"{operation} is not a gated send"
         assert "explicit recipients" in result["error"]
         assert result["error_type"] == "safety_violation"
+
+
+class TestTheLoopbackIsAdmittedForSends:
+    """Test mode confines a send to RFC 2606 reserved domains, which no
+    mailbox receives, so an integration run could check what it sent
+    but never what arrived. ``MAIL_TEST_LOOPBACK`` names one real
+    address from which mail comes back to the test account; a send may
+    reach exactly that address as well. A rule's ``forward_to`` may not:
+    a rule forwards every matching message for as long as it exists,
+    and the loopback belongs to a person."""
+
+    LOOPBACK = "loopback@person.com"
+
+    @pytest.fixture(autouse=True)
+    def _test_mode(self, monkeypatch: Any) -> None:
+        operation_logger.operations.clear()
+        monkeypatch.setenv("MAIL_TEST_MODE", "true")
+        monkeypatch.setenv("MAIL_TEST_ACCOUNT", "TestAccount")
+        monkeypatch.delenv("MAIL_TEST_LOOPBACK", raising=False)
+
+    @staticmethod
+    def _violations(result: dict[str, Any]) -> list[str]:
+        """The recipients a safety error names as refused."""
+        return result["error"].split("Violations: ", 1)[1].split(", ")
+
+    @pytest.mark.parametrize(
+        "operation", ["create_draft", "update_draft", "email_send_html"],
+    )
+    def test_a_send_to_exactly_the_loopback_passes(
+        self, operation: str, monkeypatch: Any
+    ) -> None:
+        monkeypatch.setenv("MAIL_TEST_LOOPBACK", self.LOOPBACK)
+        assert (
+            check_test_mode_safety(
+                operation, account="TestAccount", recipients=[self.LOOPBACK],
+            )
+            is None
+        )
+
+    def test_the_loopback_matches_in_any_case(self, monkeypatch: Any) -> None:
+        monkeypatch.setenv("MAIL_TEST_LOOPBACK", "LoopBack@Person.com")
+        assert (
+            check_test_mode_safety(
+                "email_send_html", recipients=["loopback@PERSON.COM"],
+            )
+            is None
+        )
+
+    def test_the_variable_is_read_with_surrounding_space_stripped(
+        self, monkeypatch: Any
+    ) -> None:
+        monkeypatch.setenv("MAIL_TEST_LOOPBACK", f"  {self.LOOPBACK}\n")
+        assert (
+            check_test_mode_safety(
+                "email_send_html", recipients=[self.LOOPBACK],
+            )
+            is None
+        )
+
+    def test_another_real_address_is_still_refused(
+        self, monkeypatch: Any
+    ) -> None:
+        """The match is on the whole address: another mailbox at the
+        loopback's own domain is not admitted."""
+        monkeypatch.setenv("MAIL_TEST_LOOPBACK", self.LOOPBACK)
+        result = check_test_mode_safety(
+            "email_send_html", recipients=["real@person.com"],
+        )
+        assert result is not None
+        assert result["error_type"] == "safety_violation"
+        assert self._violations(result) == ["real@person.com"]
+
+    def test_a_mixed_list_names_only_the_refused_recipient(
+        self, monkeypatch: Any
+    ) -> None:
+        monkeypatch.setenv("MAIL_TEST_LOOPBACK", self.LOOPBACK)
+        result = check_test_mode_safety(
+            "create_draft",
+            recipients=[self.LOOPBACK, "a@example.com", "someone@partner.com"],
+        )
+        assert result is not None
+        assert result["error_type"] == "safety_violation"
+        assert self._violations(result) == ["someone@partner.com"]
+
+    def test_the_refusal_names_the_admitted_loopback(
+        self, monkeypatch: Any
+    ) -> None:
+        monkeypatch.setenv("MAIL_TEST_LOOPBACK", self.LOOPBACK)
+        result = check_test_mode_safety(
+            "email_send_html", recipients=["someone@partner.com"],
+        )
+        assert result is not None
+        assert f"MAIL_TEST_LOOPBACK address {self.LOOPBACK}" in result["error"]
+
+    @pytest.mark.parametrize("unset", [None, "", "   "])
+    def test_without_the_variable_the_loopback_is_refused(
+        self, unset: str | None, monkeypatch: Any
+    ) -> None:
+        if unset is not None:
+            monkeypatch.setenv("MAIL_TEST_LOOPBACK", unset)
+        result = check_test_mode_safety(
+            "email_send_html", recipients=[self.LOOPBACK],
+        )
+        assert result is not None
+        assert result["error_type"] == "safety_violation"
+        assert self._violations(result) == [self.LOOPBACK]
+        assert (
+            "set MAIL_TEST_LOOPBACK to admit one real address"
+            in result["error"]
+        )
+
+    def test_reserved_domains_still_pass_with_the_variable_set(
+        self, monkeypatch: Any
+    ) -> None:
+        monkeypatch.setenv("MAIL_TEST_LOOPBACK", self.LOOPBACK)
+        assert (
+            check_test_mode_safety(
+                "email_send_html",
+                recipients=["a@example.com", "b@foo.test", self.LOOPBACK],
+            )
+            is None
+        )
+
+    def test_explicit_recipients_are_still_required(
+        self, monkeypatch: Any
+    ) -> None:
+        monkeypatch.setenv("MAIL_TEST_LOOPBACK", self.LOOPBACK)
+        result = check_test_mode_safety("email_send_html", recipients=[])
+        assert result is not None
+        assert "explicit recipients" in result["error"]
+
+    @pytest.mark.parametrize("operation", ["create_rule", "update_rule"])
+    def test_a_rule_may_not_forward_to_the_loopback(
+        self, operation: str, monkeypatch: Any
+    ) -> None:
+        monkeypatch.setenv("MAIL_TEST_LOOPBACK", self.LOOPBACK)
+        result = check_test_mode_safety(
+            operation,
+            rule_name="[apple-mail-mcp-test] forward",
+            recipients=["test@example.com", self.LOOPBACK],
+        )
+        assert result is not None
+        assert result["error_type"] == "safety_violation"
+        assert self._violations(result) == [self.LOOPBACK]
+        assert "MAIL_TEST_LOOPBACK does not apply" in result["error"]
+
+    def test_outside_test_mode_the_variable_changes_nothing(
+        self, monkeypatch: Any
+    ) -> None:
+        monkeypatch.delenv("MAIL_TEST_MODE", raising=False)
+        monkeypatch.setenv("MAIL_TEST_LOOPBACK", self.LOOPBACK)
+        assert (
+            check_test_mode_safety(
+                "email_send_html", recipients=["someone@partner.com"],
+            )
+            is None
+        )

@@ -1044,6 +1044,7 @@ class TestEmailSendHtmlIsConfinedInTestMode:
         monkeypatch.setenv("APPLE_MAIL_MCP_COMMS_CONFIG", str(cfg))
         monkeypatch.setenv("MAIL_TEST_MODE", "true")
         monkeypatch.setenv("MAIL_TEST_ACCOUNT", "TestAccount")
+        monkeypatch.delenv("MAIL_TEST_LOOPBACK", raising=False)
 
     @pytest.mark.asyncio
     async def test_an_allowlisted_real_domain_is_refused(
@@ -1095,6 +1096,29 @@ class TestEmailSendHtmlIsConfinedInTestMode:
         }
         result = await email_send_html(
             to=["someone@example.com"], subject="s", body="<p>b</p>",
+        )
+        assert result["success"] is True
+        mock_mail._send_html_email.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_the_loopback_address_sends(
+        self,
+        isolated_drafts: None,
+        mock_mail: MagicMock,
+        allowlisted_real_domain: None,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """MAIL_TEST_LOOPBACK admits one real address, so a read-back
+        test can send to a mailbox that delivers back to the test
+        account. The allowlist still applies on top: this one is on it."""
+        from apple_mail_mcp.server import email_send_html
+
+        monkeypatch.setenv("MAIL_TEST_LOOPBACK", "someone@partner.com")
+        mock_mail._send_html_email.return_value = {
+            "draft_id": "", "sent_message_id": "",
+        }
+        result = await email_send_html(
+            to=["someone@partner.com"], subject="s", body="<p>b</p>",
         )
         assert result["success"] is True
         mock_mail._send_html_email.assert_called_once()

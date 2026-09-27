@@ -307,6 +307,12 @@ def validate_attachment_size(size_bytes: int, max_size: int = 25 * 1024 * 1024) 
 RESERVED_TEST_DOMAINS = {"example.com", "example.net", "example.org"}
 RESERVED_TEST_TLDS = {".example", ".test", ".invalid", ".localhost"}
 
+# The loopback: one real address an integration run may send to, from
+# which the mail arrives back in the test account's INBOX, so a test can
+# read what was delivered instead of trusting the send. Reserved domains
+# receive nothing. Named by MAIL_TEST_LOOPBACK, admitted for sends only.
+TEST_LOOPBACK_ENV = "MAIL_TEST_LOOPBACK"
+
 # Operations that take an account and, in test mode, may only target
 # MAIL_TEST_ACCOUNT. Every account-scoped mutation belongs here: the gate
 # is what keeps an integration run off a real account, and a mutation
@@ -345,7 +351,8 @@ ACCOUNT_REQUIRED_MUTATIONS = {
 }
 
 # Every operation that delivers mail. In test mode each is confined to
-# RFC 2606 reserved domains and must name its recipients explicitly.
+# RFC 2606 reserved domains and the loopback address, and must name its
+# recipients explicitly.
 # create_draft / update_draft are sends only when send_now=True; the
 # server-tool wrappers call check_test_mode_safety with the full
 # recipient list whenever send_now is in play. A tool added later that
@@ -374,6 +381,12 @@ def _is_test_mode_enabled() -> bool:
 
 def _get_test_account() -> str | None:
     return os.environ.get("MAIL_TEST_ACCOUNT")
+
+
+def _get_test_loopback() -> str | None:
+    """The address MAIL_TEST_LOOPBACK names, or None when it is unset or
+    blank. Read at call time, like the other test-mode variables."""
+    return os.environ.get(TEST_LOOPBACK_ENV, "").strip() or None
 
 
 @lru_cache(maxsize=4)
@@ -439,6 +452,15 @@ def _is_reserved_test_domain(email: str) -> bool:
     return False
 
 
+def _is_admitted_send_recipient(email: str, loopback: str | None) -> bool:
+    """True if test mode lets a send reach ``email``: an RFC 2606
+    reserved domain, or exactly the loopback address (whole address,
+    any case)."""
+    if loopback is not None and email.lower() == loopback.lower():
+        return True
+    return _is_reserved_test_domain(email)
+
+
 def _safety_error(operation: str, message: str) -> dict[str, Any]:
     operation_logger.log_operation(
         operation, {"violation": message}, "safety_violation"
@@ -467,7 +489,8 @@ def check_test_mode_safety(
       delete_draft and update_draft likewise: the tools pass the account
       the draft was found in, and a draft with none is refused.
     - Send operations, on a call that sends, must send only to RFC 2606
-      reserved domains and must name every recipient. ``recipients``
+      reserved domains or to the one address MAIL_TEST_LOOPBACK names,
+      and must name every recipient. ``recipients``
       says whether the call sends: None means nothing is sent by this
       call (a draft being saved, checked here for its account only);
       a list, even an empty one, means a send, and an empty one is a
@@ -475,8 +498,9 @@ def check_test_mode_safety(
     - Rule-mutation operations must target rules whose names start with
       RULE_TEST_PREFIX (protects the user's real rules during integration
       testing), and a rule that forwards may forward only to RFC 2606
-      reserved domains: its ``forward_to`` is a send that repeats for
-      every matching message, passed here as ``recipients``.
+      reserved domains, never to the loopback: its ``forward_to`` is a
+      send that repeats for every matching message, passed here as
+      ``recipients``.
     """
     if not _is_test_mode_enabled():
         return None
@@ -520,7 +544,7 @@ def check_test_mode_safety(
                 f"{rule_name!r}.",
             )
 
-    # Send operations: verify every recipient is on a reserved test domain.
+    # Send operations: verify every recipient is one test mode admits.
     if operation in SEND_OPERATIONS and recipients is not None:
         # #175: empty recipients in test mode is unsafe — an implicit-reply
         # send_now path (no explicit to/cc/bcc) lets Mail.app derive
@@ -535,27 +559,60 @@ def check_test_mode_safety(
                 f"send (implicit-reply targets cannot be safety-verified "
                 f"before send).",
             )
-        return _reserved_domain_violation(operation, recipients)
+        return _send_recipient_violation(operation, recipients)
 
     # A rule that forwards sends to its targets on every match. Most rules
     # forward nothing, so an empty list is the ordinary case here, not the
     # derived-recipient hazard it is for a send.
     if operation in RULE_GATED_OPERATIONS and recipients:
-        return _reserved_domain_violation(operation, recipients)
+        return _forward_to_violation(operation, recipients)
 
     return None
 
 
-def _reserved_domain_violation(
+_RESERVED_DOMAINS_TEXT = (
+    "RFC 2606 reserved domains (example.com/.test/.invalid/etc.)"
+)
+
+
+def _send_recipient_violation(
     operation: str, recipients: list[str]
 ) -> dict[str, Any] | None:
-    """The safety error for any recipient off the RFC 2606 reserved
-    domains, or None when every one is on them."""
+    """The safety error for any send recipient test mode does not admit,
+    or None when it admits every one. The error names the refused
+    recipients and says how the loopback stands."""
+    loopback = _get_test_loopback()
+    bad = [r for r in recipients if not _is_admitted_send_recipient(r, loopback)]
+    if not bad:
+        return None
+    if loopback is None:
+        admitted = f"; set {TEST_LOOPBACK_ENV} to admit one real address"
+    else:
+        admitted = f" or the {TEST_LOOPBACK_ENV} address {loopback}"
+    return _safety_error(
+        operation,
+        f"Test mode: recipients must use {_RESERVED_DOMAINS_TEXT}"
+        f"{admitted}. Violations: {', '.join(bad)}",
+    )
+
+
+def _forward_to_violation(
+    operation: str, recipients: list[str]
+) -> dict[str, Any] | None:
+    """The safety error for any rule ``forward_to`` target off the RFC
+    2606 reserved domains, or None when every one is on them.
+
+    The loopback is deliberately not admitted here. A send reaches it
+    once, when a test sends; a rule forwards every message it matches,
+    unattended, for as long as it exists, and a test rule left behind
+    by a failed run would keep forwarding to a person's address.
+    """
     bad = [r for r in recipients if not _is_reserved_test_domain(r)]
     if not bad:
         return None
     return _safety_error(
         operation,
-        f"Test mode: recipients must use RFC 2606 reserved domains "
-        f"(example.com/.test/.invalid/etc.). Violations: {', '.join(bad)}",
+        f"Test mode: a rule's forward_to must use {_RESERVED_DOMAINS_TEXT}; "
+        f"{TEST_LOOPBACK_ENV} does not apply to rules. "
+        f"Violations: {', '.join(bad)}",
     )

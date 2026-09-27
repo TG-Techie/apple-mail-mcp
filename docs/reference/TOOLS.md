@@ -1212,7 +1212,7 @@ Create a new rule. Appended at the end of the rules list.
 
 No confirmation prompt — creation is additive and the rule can be deleted afterward.
 
-**A forwarding rule is a standing send.** Every message the rule matches, from then on, goes to its `forward_to` addresses with nobody reading each one, so those addresses meet the outbound allowlist exactly as a send's recipients do: an off-list address is refused with `error_type: "outbound_disallowed"`, an unreadable allowlist with `allowlist_unavailable`, and in either case nothing is installed. Under `MAIL_TEST_MODE`, `forward_to` may name only RFC 2606 reserved domains (`safety_violation` otherwise), as a send may.
+**A forwarding rule is a standing send.** Every message the rule matches, from then on, goes to its `forward_to` addresses with nobody reading each one, so those addresses meet the outbound allowlist exactly as a send's recipients do: an off-list address is refused with `error_type: "outbound_disallowed"`, an unreadable allowlist with `allowlist_unavailable`, and in either case nothing is installed. Under `MAIL_TEST_MODE`, `forward_to` may name only RFC 2606 reserved domains (`safety_violation` otherwise). A send may also reach the one address `MAIL_TEST_LOOPBACK` names; a rule may not, because it forwards every match for as long as it exists.
 
 **Example:**
 

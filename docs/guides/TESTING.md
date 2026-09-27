@@ -28,6 +28,12 @@ make coverage
 # Integration tests (requires Mail.app)
 MAIL_TEST_ACCOUNT="Gmail" make test-integration
 
+# Also run the loopback read-back tests (tests/integration/test_loopback.py):
+# MAIL_TEST_LOOPBACK names an address whose mail arrives back in the test
+# account's INBOX. Test mode admits exactly that one real recipient; the
+# loopback tests skip when it is unset.
+MAIL_TEST_ACCOUNT="Gmail" MAIL_TEST_LOOPBACK="<address>" make test-integration
+
 # Specific test file
 uv run pytest tests/unit/test_utils.py -v
 ```

@@ -36,6 +36,11 @@ Unit tests mock `_run_applescript()` and test Python logic only. They CANNOT cat
 # Set test account (default: "Gmail")
 export MAIL_TEST_ACCOUNT="Gmail"
 
+# Optional: an address whose mail arrives back in that account's INBOX.
+# Test mode admits it as the one real send recipient; the loopback
+# read-back tests (tests/integration/test_loopback.py) skip without it.
+export MAIL_TEST_LOOPBACK="<address>"
+
 # Run integration tests
 make test-integration
 ```
