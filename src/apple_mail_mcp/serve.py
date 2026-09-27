@@ -20,13 +20,15 @@ Concurrency, as read from the installed fastmcp 3.4.7 on 2026-09-26:
   which is ``anyio.to_thread.run_sync``. One session's 60 s AppleScript
   call in such a tool holds a worker thread, not the event loop. anyio's
   default limiter admits 40 worker threads at once; later calls queue.
-- An ``async def`` tool runs on the event loop, and nothing moves its
-  body to a thread. Seven async tools call the connector synchronously:
-  delete_rule, update_rule, delete_mailbox, draft_create, draft_update,
-  draft_send and email_send_html. While one of them runs osascript, or
-  waits up to the connector's ``lock_timeout`` for the Mail lock, every
-  session's requests wait with it. Waiting for the user's answer to a
-  confirmation is an ``await`` and holds no one up.
+- An ``async def`` tool runs on the event loop, and fastmcp moves none
+  of its body to a thread. So the tools whose work reaches Mail keep it
+  off the loop themselves: delete_rule, update_rule, delete_mailbox and
+  email_send_html are sync tools, and draft_create, draft_update and
+  draft_send await their Mail work through ``server._in_tool_threadpool``.
+  Asking the user to confirm is the one thing those bodies do on the
+  loop (``server._confirm_from_threadpool``), and waiting for the answer
+  is an ``await`` that holds no one up. tests/unit/test_tool_threadpool.py
+  holds each of the seven to it.
 - The Mail lock (``AppleMailConnector._acquire_mail_lock``) opens the lock
   file afresh on every call, and flock(2) refuses a second open of the
   file from another thread of the same process just as it does from

@@ -5,12 +5,15 @@ FastMCP server for Apple Mail integration.
 import argparse
 import atexit
 import datetime as _dt
+import functools
 import logging
 import tempfile
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, ParamSpec, TypeVar, cast
 
+import anyio.from_thread
+import anyio.to_thread
 from fastmcp import Context, FastMCP
 from fastmcp.server.elicitation import AcceptedElicitation
 
@@ -180,6 +183,44 @@ async def _elicit_confirmation(
     return None
 
 
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def _in_tool_threadpool(fn: Callable[_P, _R]) -> Callable[_P, Awaitable[_R]]:
+    """Make a blocking function awaitable by running it in the worker
+    threads fastmcp runs sync tools in (anyio's), keeping its signature.
+
+    One event loop serves every session the daemon has. A body that
+    calls the connector blocks for as long as osascript, the Mail lock
+    or IMAP take, up to the connector's timeout; on the loop that holds
+    up every session, here it holds one worker thread. The one thing
+    such a body needs the loop for, the user's confirmation, it asks
+    through ``_confirm_from_threadpool``.
+
+    Placed above the tool decorator, it leaves fastmcp registering the
+    plain function, which fastmcp dispatches to that same pool as it
+    does every sync tool, and makes the module-level name, which this
+    module's own callers and the tests await, the awaitable.
+    """
+
+    @functools.wraps(fn)
+    async def in_threadpool(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        return await anyio.to_thread.run_sync(functools.partial(fn, *args, **kwargs))
+
+    return in_threadpool
+
+
+def _confirm_from_threadpool(
+    ctx: Context | None, summary: str, operation: str, params: dict[str, Any]
+) -> dict[str, Any] | None:
+    """``_elicit_confirmation`` for a body running under
+    ``_in_tool_threadpool``: the question is asked on the event loop, and
+    this worker thread waits for the answer. Returns what
+    ``_elicit_confirmation`` returns."""
+    return anyio.from_thread.run(_elicit_confirmation, ctx, summary, operation, params)
+
+
 @mcp.tool()
 def list_accounts() -> dict[str, Any]:
     """
@@ -284,8 +325,9 @@ def _resolve_rule_name(rule_index: int) -> str | None:
     return None
 
 
+@_in_tool_threadpool
 @mcp.tool()
-async def delete_rule(
+def delete_rule(
     rule_index: int,
     ctx: Context | None = None,
 ) -> dict[str, Any]:
@@ -330,7 +372,7 @@ async def delete_rule(
             f"Delete Mail.app rule '{rule_name}' (index {rule_index})? "
             f"This cannot be undone."
         )
-        cancel_err = await _elicit_confirmation(
+        cancel_err = _confirm_from_threadpool(
             ctx, summary, "delete_rule", {"rule_index": rule_index}
         )
         if cancel_err:
@@ -492,8 +534,9 @@ def create_rule(
         }
 
 
+@_in_tool_threadpool
 @mcp.tool()
-async def update_rule(
+def update_rule(
     rule_index: int,
     name: str | None = None,
     enabled: bool | None = None,
@@ -561,7 +604,7 @@ async def update_rule(
                 f"Update Mail.app rule '{rule_name}' (index {rule_index})? "
                 f"Previous condition/action state cannot be recovered."
             )
-            cancel_err = await _elicit_confirmation(
+            cancel_err = _confirm_from_threadpool(
                 ctx, summary, "update_rule", {"rule_index": rule_index}
             )
             if cancel_err:
@@ -1808,8 +1851,9 @@ def update_mailbox(
         }
 
 
+@_in_tool_threadpool
 @mcp.tool()
-async def delete_mailbox(
+def delete_mailbox(
     account: str,
     name: str,
     delete_messages: bool = False,
@@ -1868,7 +1912,7 @@ async def delete_mailbox(
             f"Mailbox: {name}\n\n"
             f"This is destructive. The mailbox will be removed from the IMAP server."
         )
-        cancel_err = await _elicit_confirmation(
+        cancel_err = _confirm_from_threadpool(
             ctx, summary, "delete_mailbox",
             {"account": account, "name": name,
              "delete_messages": delete_messages},
@@ -2670,7 +2714,7 @@ def _validate_fresh_seed_fields(
     return None
 
 
-async def _run_send_now_gates(
+def _run_send_now_gates(
     operation: str,
     ctx: Context | None,
     recipients: list[str],
@@ -2690,7 +2734,7 @@ async def _run_send_now_gates(
        given, or the account the draft being sent sits in.
     2. ``check_rate_limit(operation, rate_params)``
     3. If ``validate_recipient_shape``: ``validate_send_operation(*validate_args)``
-    4. ``_elicit_confirmation(ctx, summary, operation, elicit_extra)``
+    4. ``_confirm_from_threadpool(ctx, summary, operation, elicit_extra)``
 
     Returns the first failure response, or ``None`` if all pass.
 
@@ -2728,7 +2772,7 @@ async def _run_send_now_gates(
             "send_allowlisted",
         )
     else:
-        cancel_err = await _elicit_confirmation(
+        cancel_err = _confirm_from_threadpool(
             ctx, summary, operation, elicit_extra,
         )
         if cancel_err:
@@ -2875,7 +2919,7 @@ def _merge_draft_recipients(
     )
 
 
-async def _gate_create_draft_send(
+def _gate_create_draft_send(
     *,
     seed_kind: str,
     to: list[str] | None,
@@ -2906,7 +2950,7 @@ async def _gate_create_draft_send(
         return guard_err
     all_recipients = (to or []) + (cc or []) + (bcc or [])
     summary = _build_draft_send_summary(seed_kind, to, cc, bcc, subject, body)
-    return await _run_send_now_gates(
+    return _run_send_now_gates(
         operation="create_draft",
         ctx=ctx,
         recipients=all_recipients,
@@ -2923,7 +2967,7 @@ async def _gate_create_draft_send(
     )
 
 
-async def _gate_update_draft_send(
+def _gate_update_draft_send(
     *,
     seed_kind: str,
     draft_id: str,
@@ -2944,7 +2988,7 @@ async def _gate_update_draft_send(
     gate's error, or None when every gate passed.
     """
     summary = _build_draft_send_summary(seed_kind, to, cc, bcc, subject, body)
-    return await _run_send_now_gates(
+    return _run_send_now_gates(
         operation="update_draft",
         ctx=ctx,
         recipients=to + cc + bcc,
@@ -2974,7 +3018,8 @@ def _gate_update_draft_accounts(
     return None
 
 
-async def create_draft(
+@_in_tool_threadpool
+def create_draft(
     reply_to: str | None = None,
     forward_of: str | None = None,
     to: list[str] = [],  # noqa: B006 — coerced to None below
@@ -3101,7 +3146,7 @@ async def create_draft(
         # #191: gate chain pulled out to _run_send_now_gates.
         # ----------------------------------------------------------------
         if send_now:
-            gate_err = await _gate_create_draft_send(
+            gate_err = _gate_create_draft_send(
                 seed_kind=seed_kind, to=to, cc=cc, bcc=bcc,
                 subject=subject, body=body, from_account=from_account,
                 attachment_paths=attachment_paths, ctx=ctx,
@@ -3166,7 +3211,8 @@ async def create_draft(
         return {"success": False, "error": str(e), "error_type": "unknown"}
 
 
-async def update_draft(
+@_in_tool_threadpool
+def update_draft(
     draft_id: str,
     to: list[str] | None = None,
     cc: list[str] | None = None,
@@ -3285,7 +3331,7 @@ async def update_draft(
         )
 
         if send_now:
-            gate_err = await _gate_update_draft_send(
+            gate_err = _gate_update_draft_send(
                 seed_kind=seed_kind, draft_id=draft_id, account=draft_account,
                 to=final_to, cc=final_cc, bcc=final_bcc,
                 subject=final_subject, body=final_body or "", ctx=ctx,
@@ -3628,10 +3674,37 @@ async def draft_send(
         >>> draft_send(draft_id="EFGH")
         {"success": True, "sent_message_id": "", "draft_id": ""}
     """
-    # PRE-VALIDATION: read the draft's recipients and check the policy
-    # before Mail is touched at all, so an off-list draft gets the typed
-    # error from the one obvious tool. The connector re-checks on the
-    # send itself; that is the backstop, not the gate.
+    refusal = await _draft_send_refusal(draft_id)
+    if refusal:
+        return refusal
+
+    # Recipients passed pre-validation. Hand off to the existing
+    # delete-recreate-send path with no field overrides.
+    return await update_draft(
+        draft_id=draft_id,
+        to=None,
+        cc=None,
+        bcc=None,
+        subject=None,
+        body=None,
+        attachment_paths=None,
+        template_name=None,
+        template_vars=None,
+        from_account=None,
+        send_now=True,
+        ctx=ctx,
+    )
+
+
+@_in_tool_threadpool
+def _draft_send_refusal(draft_id: str) -> dict[str, Any] | None:
+    """Why ``draft_send`` must not send this draft, or None.
+
+    Reads the draft's recipients and checks the policy before Mail is
+    touched at all, so an off-list draft gets the typed error from the
+    one obvious tool. The connector re-checks on the send itself; that
+    is the backstop, not the gate.
+    """
     try:
         state = mail.get_draft_state(draft_id)
     except MailDraftError as e:
@@ -3689,22 +3762,7 @@ async def draft_send(
             "error_type": "outbound_disallowed",
         }
 
-    # Recipients passed pre-validation. Hand off to the existing
-    # delete-recreate-send path with no field overrides.
-    return await update_draft(
-        draft_id=draft_id,
-        to=None,
-        cc=None,
-        bcc=None,
-        subject=None,
-        body=None,
-        attachment_paths=None,
-        template_name=None,
-        template_vars=None,
-        from_account=None,
-        send_now=True,
-        ctx=ctx,
-    )
+    return None
 
 
 def _validate_html_send_content(
@@ -3831,8 +3889,9 @@ def _validate_html_send_request(
     return None
 
 
+@_in_tool_threadpool
 @mcp.tool()
-async def email_send_html(
+def email_send_html(
     to: list[str] = [],  # noqa: B006 — coerced below
     subject: str = "",
     body: str = "",
@@ -3909,7 +3968,7 @@ async def email_send_html(
         "reply" if reply_to is not None else "new",
         to, cc_list or None, bcc_list or None, subject, body,
     )
-    gate_err = await _run_send_now_gates(
+    gate_err = _run_send_now_gates(
         operation="email_send_html",
         ctx=ctx,
         recipients=all_recipients,
