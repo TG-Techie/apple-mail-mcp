@@ -886,12 +886,12 @@ Create a draft (fresh, reply, or forward). Does not send; send it with
 | `cc` | array[string] | No | [] | CC recipients (same semantics as `to` for reply/forward). |
 | `bcc` | array[string] | No | [] | BCC recipients. |
 | `subject` | string | When fresh | None | Subject. For reply/forward, `None` keeps Mail's `Re:`/`Fwd:` prefix. |
-| `body` | string | No | "" | Body text. For reply/forward, a non-empty body goes **above** what Mail wrote, which stays: the quoted original, or the forwarded message with its header block and every attachment Mail carried. It is pasted as plain text in a visible compose window, so Mail comes to the front for a few seconds. An empty body leaves Mail's quote or forward exactly as Mail made it. |
+| `body` | string | No | "" | Body text, at most 10,000 characters; a longer body is refused (`validation_error`) rather than cut. For reply/forward, a non-empty body goes **above** what Mail wrote, which stays: the quoted original, or the forwarded message with its header block and every attachment Mail carried. It is pasted as plain text in a visible compose window, so Mail comes to the front for a few seconds. An empty body leaves Mail's quote or forward exactly as Mail made it. |
 | `attachment_paths` | array[string] | No | [] | List of file paths to attach. Each must exist, must not carry an executable extension (`.exe`, `.sh`, …), and must be under 25MB — the same checks as `email_send_html`. |
 | `reply_all` | boolean | No | False | For `reply_to` only — use `reply to all`. |
 | `template_name` | string | No | None | Optional template to render for `subject` + `body`. Caller-supplied `subject`/`body` override the rendered output. |
 | `template_vars` | object | No | None | Variables for the template renderer. Requires `template_name`. |
-| `from_account` | string | No | None | Mail.app account name or UUID. None = Mail's default. The saved draft keeps it; see `draft_send` for the one send path that cannot. |
+| `from_account` | string | No | None | Mail.app account name or UUID. None = Mail's default. The saved draft keeps it, and `draft_send` sends from it. |
 
 **Returns:**
 
@@ -937,7 +937,7 @@ draft_create(reply_to="160989", template_name="thanks-for-meeting")
 
 **Error Codes:**
 
-- `validation_error`: Mutually exclusive seeds, missing required fields, or `template_vars` without `template_name`.
+- `validation_error`: Mutually exclusive seeds, missing required fields, `template_vars` without `template_name`, or a body over 10,000 characters.
 - `message_not_found`: `reply_to` / `forward_of` doesn't match any Mail.app message.
 - `account_not_found`: `from_account` doesn't match.
 - `file_not_found` / `validation_error` (attachments): a listed file is
@@ -1073,11 +1073,10 @@ every send (`allowlist_unavailable`). A refused send leaves the draft
 exactly as it was. A send the allowlist does not already cover asks the
 user to confirm.
 
-A fresh draft goes out through Mail's mailto: handler, which composes
-from Mail's default account and carries no attachments: its saved
-sender is not carried over, and a fresh draft with attachments is
-refused (`attachments_unsupported`) before anything is touched. A reply
-or forward keeps the draft's sender.
+Every draft goes out from the sender it was saved with. A fresh draft
+is sent as `email_send_html` sends a fresh message (see its
+composition), as plain text, with the draft's attachments read out of
+the draft first.
 
 **Parameters:**
 
@@ -1105,7 +1104,8 @@ went out; if that removal fails, the response is a success carrying a
 
 - `validation_error`: the draft has no recipients.
 - `outbound_disallowed`, `allowlist_unavailable`: see the security note.
-- `attachments_unsupported`: a fresh draft with attachments.
+- `account_not_found`: the sender the draft was saved with matches no
+  account in Mail; nothing was sent and the draft is unchanged.
 - `safety_violation`: under `MAIL_TEST_MODE`, a draft outside the test
   account or a recipient outside the reserved test domains.
 - `rate_limited`: too many sends in the window.
@@ -1151,10 +1151,10 @@ every send path.
 |-----------|------|----------|---------|-------------|
 | `to` | array | Fresh mode | `[]` | Recipients. In reply mode, explicit values REPLACE Mail's derived set. |
 | `subject` | string | Fresh mode | `""` | Subject. Reply mode derives `Re: …` when omitted. |
-| `body` | string | Yes | - | HTML string for the email body. |
+| `body` | string | Yes | - | HTML string for the email body, at most 10,000 characters. |
 | `cc` | array | No | `[]` | CC recipients (replace derived CC when replying). |
 | `bcc` | array | No | `[]` | BCC recipients. |
-| `from_account` | string | No | null | Mail.app account name or UUID. Null uses Mail's default sender. **Replies only**: the sender is set on the outgoing message. A fresh message composes through mailto:, which cannot set it, and is refused (`from_account_unsupported`) rather than sent from the wrong account. |
+| `from_account` | string | No | null | Mail.app account name or UUID. Null uses Mail's default sender. Set as the sender of the message composed, fresh or reply. |
 | `reply_to` | string | No | null | Message id to reply to; enables reply mode. |
 | `attachment_paths` | array | No | `[]` | File paths to attach. **Fresh mode only** (not supported with `reply_to`). Each file must exist, must not carry an executable extension (`.exe`, `.sh`, …), and must be under 25MB. |
 
@@ -1170,12 +1170,9 @@ every send path.
   nothing was sent; in reply mode the compose window was discarded.
 - `allowlist_unavailable`: the outbound allowlist cannot be read, so
   every send is refused — nothing was sent.
-- `validation_error`: missing `to`/`subject` in fresh mode.
-- `from_account_unsupported`: `from_account` on a fresh message —
-  nothing was sent. Omit it, or save a draft (which keeps the chosen
-  sender) and send from Mail.app.
-- `attachments_unsupported`: `attachment_paths` combined with
-  `reply_to` — nothing was sent.
+- `validation_error`: missing `to`/`subject` in fresh mode, a body over
+  10,000 characters (refused rather than cut), or `attachment_paths`
+  combined with `reply_to` — nothing was sent.
 - `file_not_found` / `validation_error` (attachments): a listed file is
   missing, has a blocked extension, or exceeds 25MB — nothing was sent.
 - `applescript_error`: a mechanical read-back failed
@@ -1186,7 +1183,11 @@ every send path.
   saying "message WAS sent, but the sent copy shows N of M expected
   attachments" means dispatch succeeded and the post-send
   attachment-count check failed — inspect the Sent copy before
-  resending.
+  resending. A compose window a failure leaves is closed with Save, so
+  the message is in Drafts; the error ends with that outcome. When
+  Mail could not send through the account's server, that outcome also
+  carries the text of Mail's send-error sheet ("Cannot send message
+  using the server …").
 
 **Composition (fresh mode):** the message is composed in a visible
 window made by `make new outgoing message`, found by comparing Mail's
@@ -1194,18 +1195,16 @@ window names before and after (a window of the same name already open
 stops the send with `COMPOSE_WINDOW_NOT_UNIQUE`). The HTML is pasted
 over the window's whole body and read back, and any attachments are
 pasted after it as files. Each attachment must be mechanically visible
-in the compose window's AX tree before Send is clicked, and the
-Sent-mailbox copy is checked for the attachment count after dispatch.
+in the compose window's AX tree before Send is clicked (an image shows
+there inline, as an image, anything else as an attachment button), and
+the Sent-mailbox copy is checked for the attachment count after
+dispatch. The sender, when named, is set on the composed message.
 Read back from a delivered copy, the message carries nothing quoted: no
 `blockquote type="cite"`, which iOS Mail draws as a purple bar
-(docs/research/icloud-draft-resync.md, Observation 10). A body over
-10,000 characters is refused (`validation_error`) rather than cut.
+(docs/research/icloud-draft-resync.md, Observation 10).
 
-**Limitations:** attachments not supported in reply mode; an image
-attachment fails the AX check (`ATTACH_MISSING:…`, nothing sent),
-since Mail shows it inline as an image rather than as the attachment
-button the check looks for (measured with a PNG); en-US Mail UI labels;
-sends require Mail.app UI automation permission.
+**Limitations:** attachments not supported in reply mode; en-US Mail
+UI labels; sends require Mail.app UI automation permission.
 
 ---
 

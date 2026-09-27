@@ -4,7 +4,7 @@ Every new feature should be reviewed against the six concerns below before openi
 
 ## Input sanitization
 
-Any string that originates from an MCP tool argument, an environment variable, or any other external source must pass through [`sanitize_input`](../../src/apple_mail_mcp/utils.py#L169) before further processing. It strips null bytes, truncates oversized strings (currently 10000 chars), and coerces non-strings to strings.
+Any string that originates from an MCP tool argument, an environment variable, or any other external source must pass through [`sanitize_input`](../../src/apple_mail_mcp/utils.py#L169) before further processing. It strips null bytes, truncates oversized strings (currently 10000 chars), and coerces non-strings to strings. Cutting is wrong for a message someone will read: a caller's message body longer than that is refused where it enters the connector (`_refuse_overlong_body` in [`mail_connector.py`](../../src/apple_mail_mcp/mail_connector.py)), before anything is composed, saved or sent.
 
 This protects against null-byte injection in shell or AppleScript contexts and bounds memory use for pathological inputs. It does **not** make a string safe for interpolation — see *AppleScript escaping* and *Path-traversal-safe name validation* below.
 

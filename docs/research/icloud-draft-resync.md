@@ -247,6 +247,40 @@ searched afterwards, no mailbox of the account held a delivered copy.
 The two run again together: the HTML reply passed, the other failed
 the same way. That one run alone: passed.
 
+Then the attachment check was made to accept an `AXImage` described by
+the file's name, and the tools stopped refusing a fresh send's sender
+and files. One full run of `test_verified_send.py` and
+`test_loopback.py`: 6 of 6 and 9 of 14.
+
+- `test_fresh_html_carries_an_image_and_a_text_file` passed: an HTML
+  fresh send naming the test account as sender, with a 2x2 PNG and a
+  .txt pasted as files. The check before Send found both, the Sent
+  copy listed both, and the delivered copy carried both, each byte for
+  byte the file sent, with the HTML rendered and nothing quoted.
+- `test_a_fresh_draft_with_files_is_sent_with_them` passed:
+  `draft_create` with two .txt files, then `draft_send`, which saved
+  the files out of the draft and sent them. Both arrived byte for
+  byte, From the sender the draft was saved with, unquoted.
+- The five failures were each a delivered copy that did not appear
+  within the 120 s poll: the plain fresh send
+  (`test_plain_fresh_send_via_draft_path_arrives_intact`), the HTML
+  reply (`test_html_reply_threads_at_the_receiver`, whose seed had
+  arrived), and the seed, a fresh HTML send, of
+  `test_reply_via_draft_path_puts_the_note_above_the_quote`,
+  `test_a_saved_forward_note_sits_above_the_forwarded_message` and
+  `test_forward_without_note_via_tool_lifecycle_carries_original_and_attachments`.
+  Each Sent copy had the loopback as To and a Message-ID. Searched by
+  Message-ID afterwards, every mailbox of the account together held
+  one copy of each, the Sent copy the test had moved to Trash, none
+  marked junk; Mail's Outbox was empty.
+- The five run once more: the lifecycle forward passed, the other four
+  missed the same way, at the plain send, the HTML reply's seed, the
+  draft-path reply itself, and the saved forward's seed. Searched as
+  before: the Sent copy alone each time, To the loopback.
+
+Which messages miss changes from run to run, and a miss can be the
+first send of a test. Why is not established.
+
 ## Derivations, mine
 
 - On an iCloud account, the id `draft_create` returns is transient. In
@@ -343,6 +377,6 @@ the same way. That one run alone: passed.
 - Any account type other than these two.
 - (Observation 10) A live send from an account that is not Mail's
   default: test mode allows only the test account as sender.
-- (Observation 10) Any attachment but .txt on a live send; image files
-  fail the AX check before Send, by either route.
+- (Observation 10) A live send of any attachment but .txt and one
+  small PNG; the PDF was only seen in a compose window.
 - (Observation 10) How iOS Mail draws any of these messages.
