@@ -35,6 +35,41 @@ patches with `account` + `source_mailbox` given). See
 `docs/plans/2026-04-23-imap-connector-design.md` and
 `performance-patterns` for when each path is taken.
 
+## Two ways to run it: a server per client, or one daemon for all
+
+The diagram above is the stdio shape: each MCP client launches its own
+`apple-mail-mcp` process. Where many agent sessions share one Mail, the
+same server runs instead as one resident daemon with a thin proxy per
+session (README, "Running as a fleet daemon"):
+
+```
+session A --stdio--> mail-proxy --+
+session B --stdio--> mail-proxy --+--HTTP 127.0.0.1:41108/mcp--> mail-serve (server.py, one process)
+session C --stdio--> mail-proxy --+                                    |
+                                                                       v
+                                                                  Apple Mail.app
+```
+
+- `serve.py` (`mail-serve`) runs `server.mcp` over streamable HTTP on
+  loopback only. Sync tools run in anyio's worker threads, as fastmcp
+  dispatches them; the tools that reach Mail and also ask for
+  confirmation are decorated with `_in_tool_threadpool` so their bodies
+  run in the same pool and only the confirmation question returns to
+  the event loop (`_confirm_from_threadpool`). Otherwise one session's
+  osascript call would stall every session.
+- `proxy.py` (`mail-proxy`) is what a session launches. It declares
+  nothing of its own: tool listings, calls and elicitation are forwarded
+  to the daemon, and the daemon's `instructions` are fetched when the
+  proxy starts (docs/DISCIPLINE.md, "MCP context exposure"). With the
+  daemon down a session's handshake fails outright rather than
+  reporting an empty tool list (`provider_error_strategy="raise"`).
+- The cross-process Mail lock (`_acquire_mail_lock`) serializes the
+  daemon's own threads and any stdio server or test run beside it.
+
+What one process for all sessions changes, and is not yet decided, is in
+the design queue: the per-process rate-limit budget and the in-memory
+operation log become fleet-wide.
+
 ## Module Responsibilities
 
 | Module | Role | Local dependencies |
@@ -47,6 +82,8 @@ patches with `account` + `source_mailbox` given). See
 | `security.py` | Rate limiting, audit logging (`OperationLogger`), attachment validation, and the `MAIL_TEST_MODE` safety gate (`check_test_mode_safety`) that confines destructive/send/rule operations to a named test account and reserved test domains | `utils` |
 | `drafts.py` | Persists seed metadata (`seed_kind`, `seed_id`, `reply_all`) per draft under `<root>/<draft_id>.json`, since Mail.app forbids mutating a saved draft and `update_draft` is implemented as delete + recreate | `exceptions` |
 | `templates.py` | Email template storage and `str.format`-style rendering (`TemplateStore`, `Template`); one `<name>.md` file per template under `<root>/templates/` | `exceptions` |
+| `serve.py` | The `mail-serve` console entry: the resident daemon, `server.mcp` over HTTP on loopback | `server` (imported at run time only) |
+| `proxy.py` | The `mail-proxy` console entry: a per-session stdio proxy that forwards everything to the daemon and serves its instructions | `serve` (for the port and path); never imports `server` |
 | `cli.py` | The `apple-mail-mcp setup-imap` subcommand; the no-subcommand path starts the MCP server via `server.main()` and is unaffected by this module | `mail_connector`, `imap_connector`, `keychain`, `exceptions` |
 | `utils.py` | Pure functions: AppleScript string escaping/sanitizing, JSON parsing (`parse_applescript_json`), flag/rule field mapping, email/name validation | stdlib only |
 | `exceptions.py` | The typed exception hierarchy every other module raises and `server.py` maps back to `{"error", "error_type"}` | none |
