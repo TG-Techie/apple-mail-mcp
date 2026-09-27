@@ -17,6 +17,7 @@ back that it is gone.
 from __future__ import annotations
 
 import email
+import re
 import time
 from dataclasses import dataclass, field
 from types import TracebackType
@@ -166,6 +167,98 @@ def sent_copy(
         headers=str(record["headers"]),
         attachment_names=tuple(str(n) for n in record["attachment_names"]),
     )
+
+
+# ---------------------------------------------------------------------------
+# A seed to reply to or forward
+# ---------------------------------------------------------------------------
+
+_SEED_MARKER = re.compile(r"seed-marker-[0-9a-f]+")
+
+
+@dataclass(frozen=True)
+class Seed:
+    """A message this suite sent earlier, which a reply or forward test
+    answers instead of sending one of its own. ``marker`` is the
+    ``seed-marker-<hex>`` its body carries, so Mail's quote or forwarded
+    message can be told to hold it; ``rfc_message_id`` is bare."""
+
+    mail_id: str
+    subject: str
+    rfc_message_id: str
+    marker: str
+    attachment_names: tuple[str, ...]
+
+
+def earlier_seed(connector: AppleMailConnector, account: str, prefix: str) -> Seed:
+    """The first message in Sent, then in Trash, that ``account`` sent
+    under a subject starting with ``prefix``, that has files, whose body
+    carries a seed marker, and that is not a draft. Skips the test when
+    there is none; nothing is sent to make one.
+
+    Not a draft, because of 2026-09-27 ~04:56 EDT. The session sweep
+    (conftest.py) had just moved a leftover test draft to Trash, and the
+    saved-draft test's seed fixture, then taking the first match, took
+    that draft as its seed; the script opening Mail's forward of it
+    timed out at 60 s, and Mail answered no AppleEvent for the next 20
+    minutes and more, its main thread inside a scripting command, no
+    dialog or sheet on any of its windows. That the draft was the cause
+    is not established. So a message is refused when it is listed in
+    Mail's drafts mailbox, and when its headers carry
+    ``X-Uniform-Type-Identifier: com.apple.mail-draft``, which Mail
+    writes on the drafts it saves: on 2026-09-27 the four drafts the
+    saved-draft tests saved carried it and the sent message they used as
+    seed did not. That it is on every draft, and on nothing else, was
+    not checked."""
+    body = f"""
+tell application "Mail"
+    set found to missing value
+    repeat with box in {{sent mailbox, trash mailbox}}
+        repeat with m in (messages of box whose subject begins with {_quoted(prefix)})
+            try
+                if (name of account of mailbox of m) is {_quoted(account)} and (count of mail attachments of m) > 0 then
+                    set mId to id of m
+                    set inDrafts to (count of (messages of drafts mailbox whose id is mId)) > 0
+                    if not inDrafts and (all headers of m) does not contain "com.apple.mail-draft" then
+                        if (content of m) contains "seed-marker-" then
+                            set found to contents of m
+                            exit repeat
+                        end if
+                    end if
+                end if
+            end try
+        end repeat
+        if found is not missing value then exit repeat
+    end repeat
+    if found is missing value then
+        set resultData to {{|found|:false}}
+    else
+        set resultData to {{|found|:true, |id|:(id of found as text), |subject|:(subject of found), |message_id|:(message id of found), |content|:(content of found), |attachment_names|:(name of every mail attachment of found)}}
+    end if
+end tell
+"""
+    raw = connector._run_applescript(
+        _wrap_as_json_script(body, timeout=connector.timeout)
+    )
+    data = cast(dict[str, Any], parse_applescript_json(raw))
+    if not data.get("found"):
+        pytest.skip(
+            f"{account!r} holds no message in Sent or Trash whose subject "
+            f"starts with {prefix!r}, that has files and a seed marker, and "
+            "that is not a draft"
+        )
+    marker = _SEED_MARKER.search(str(data["content"]))
+    assert marker is not None, "the seed's body lost its marker between two reads"
+    seed = Seed(
+        mail_id=str(data["id"]),
+        subject=str(data["subject"]),
+        rfc_message_id=bare_message_id(str(data["message_id"])),
+        marker=marker.group(0),
+        attachment_names=tuple(str(n) for n in data["attachment_names"]),
+    )
+    print(f"seed: Mail id {seed.mail_id}, {seed.subject!r}, {seed.marker}, "
+          f"files {seed.attachment_names}")
+    return seed
 
 
 def wait_for_arrival(
