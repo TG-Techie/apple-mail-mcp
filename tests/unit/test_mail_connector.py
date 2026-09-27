@@ -5047,7 +5047,7 @@ class TestAttachmentPropertyGuards:
     ) -> None:
         """Pass 2 must build the destination with ``POSIX file``.
 
-        CLAUDE.md: "Use POSIX file references (POSIX file "/path/to/file")
+        AGENTS.md: "Use POSIX file references (POSIX file "/path/to/file")
         in AppleScript." The bare-string form violated that. Probed live
         2026-08-27 with the same attachment saved both ways: the bare
         string raised -10000 under /private/tmp ("To view or change
