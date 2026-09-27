@@ -11,6 +11,7 @@ import pytest
 from apple_mail_mcp.security import (
     ACCOUNT_GATED_OPERATIONS,
     ACCOUNT_REQUIRED_MUTATIONS,
+    INTERNAL_OPERATIONS,
     OPERATION_TIERS,
     RULE_GATED_OPERATIONS,
     SEND_OPERATIONS,
@@ -287,13 +288,20 @@ class TestCheckRateLimit:
         assert str(int(window)) in result["error"]
 
     async def test_all_operations_have_tier_assigned(self) -> None:
-        """The tiers are keyed by tool name, one per registered tool: a
-        tool added without a tier fails here, and so does a tier left
-        behind under a name no tool has."""
+        """The tiers are keyed by operation name, one per registered tool
+        and per internal operation: a tool added without a tier fails
+        here, and so does a tier left behind under a name nothing has."""
         from apple_mail_mcp import server
 
         tools = {t.name for t in await server.mcp.list_tools()}
-        assert set(OPERATION_TIERS) == tools
+        assert set(OPERATION_TIERS) == tools | INTERNAL_OPERATIONS
+        assert not INTERNAL_OPERATIONS & tools
+
+    def test_tending_is_an_internal_operation_among_the_mutations(self) -> None:
+        from apple_mail_mcp import tender
+
+        assert tender.OPERATION in INTERNAL_OPERATIONS
+        assert OPERATION_TIERS[tender.OPERATION] == "expensive_ops"
 
     def test_tier_limits_config_exists_for_all_tiers(self) -> None:
         expected_tiers = {"cheap_reads", "expensive_ops", "sends"}

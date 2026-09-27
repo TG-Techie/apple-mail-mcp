@@ -72,9 +72,14 @@ def _start_daemon(home: Path) -> Daemon:
         "APPLE_MAIL_MCP_HOME": str(home),
         "FASTMCP_CHECK_FOR_UPDATES": "off",
     }
+    # Tending off: a pass reads Mail's windows, and this daemon's data
+    # home is a temporary one, so its Mail lock is no other process's.
     with log_path.open("wb") as log:
         process = subprocess.Popen(
-            [str(script), "--port", str(port)], env=env, stdout=log, stderr=log
+            [str(script), "--port", str(port), "--tend-interval", "0"],
+            env=env,
+            stdout=log,
+            stderr=log,
         )
     deadline = time.monotonic() + DAEMON_START_SECONDS
     while True:

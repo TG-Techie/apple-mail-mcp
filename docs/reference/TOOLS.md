@@ -973,7 +973,11 @@ draft_create(reply_to="160989", template_name="thanks-for-meeting")
   …`), and the error carries the actual UI state. A window a failed
   paste leaves is closed with Save, so what was composed so far is in
   Drafts, and the error ends with that outcome; a window whose name was
-  not unique is left open. Also lower-level failures.
+  not unique, or whose close failed, is left open (a close addresses a
+  window by name, so none is made while another window has its name).
+  Such a window is recorded, and the daemon closes it with Save once it
+  is the only window of its name (docs/research/compose-window-tending.md).
+  Also lower-level failures.
 - `unknown`: anything else.
 
 ---
@@ -1228,7 +1232,9 @@ every send path.
   the message is in Drafts; the error ends with that outcome. When
   Mail could not send through the account's server, that outcome also
   carries the text of Mail's send-error sheet ("Cannot send message
-  using the server …").
+  using the server …"). While another window has its name no close is
+  made, and a window left open is closed with Save by the daemon later
+  (docs/research/compose-window-tending.md).
 
 **Composition:** every mode is composed in a visible window: a fresh
 message made by `make new outgoing message`, or Mail's own reply or

@@ -61,6 +61,12 @@ unchanged, and a client that runs its own server needs neither.
   `127.0.0.1:41108`, loopback only (`--port` to change it; 41108 is
   provisional). It runs under a process supervisor (pm2 in the fleet that
   runs it), launched from this repo as `uv run --project <this repo> mail-serve`.
+- The daemon tends Mail's compose windows: at start, every 15 minutes, and
+  soon after a composition fails and leaves its window open, it closes the
+  windows this server opened and left (salvaged to Drafts, or discarded when
+  empty), and only those; every other window is left and counted in the
+  audit log. `--tend-interval SECONDS` changes the interval, and 0 turns it
+  off (docs/research/compose-window-tending.md).
 - Restarting the daemon is a deploy. A session already connected through its
   proxy reaches the new daemon on its next call; changed instructions reach a
   session when it next starts.

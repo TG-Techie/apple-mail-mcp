@@ -7779,9 +7779,29 @@ class TestVerifiedSendPrimitives:
         assert "Mail's send-error sheet: " in script
         # The text rides on every outcome after the sheet was read,
         # failures included.
-        assert 'return "SALVAGED" & sheetNote' in script
-        assert 'return "SALVAGE_FAILED:window still open" & sheetNote' in script
-        assert 'return "SALVAGE_FAILED:" & errMsg & sheetNote' in script
+        assert 'set salvageOutcome to "SALVAGED" & sheetNote' in script
+        assert (
+            'set salvageOutcome to "SALVAGE_FAILED:window still open" & sheetNote'
+            in script
+        )
+        assert 'set salvageOutcome to "SALVAGE_FAILED:" & errMsg & sheetNote' in script
+        assert script.rstrip().endswith("return salvageOutcome")
+
+    def test_salvage_closes_a_window_only_when_its_name_is_the_only_one(
+        self, connector: AppleMailConnector
+    ) -> None:
+        """A close addresses the window by name; with two of the name it
+        could close the other, a person's for all it can tell
+        (docs/research/compose-window-tending.md). The count comes before
+        any click."""
+        script = self._salvage_script(connector)
+        count_at = script.index(
+            'set sameNamed to count of (windows whose name is "Probe \\"1\\"")'
+        )
+        assert count_at < script.index('whose subrole is "AXCloseButton"')
+        assert 'if sameNamed is 0 then\n            set salvageOutcome to "NO_WINDOW"' in script
+        assert "else if sameNamed > 1 then" in script
+        assert "none was closed" in script
 
     def test_the_sheet_text_reaches_the_raised_error(
         self, connector: AppleMailConnector

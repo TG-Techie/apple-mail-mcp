@@ -11,7 +11,16 @@ from typing import Any
 
 import pytest
 
-from apple_mail_mcp import serve
+from apple_mail_mcp import serve, tender
+
+
+@pytest.fixture(autouse=True)
+def tenders_started(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """A real tender would run passes against Mail; this records the
+    interval each start asked for instead."""
+    started: list[float] = []
+    monkeypatch.setattr(serve, "start_tender", lambda interval_s: started.append(interval_s))
+    return started
 
 
 def test_default_port_is_the_provisional_allocation() -> None:
@@ -65,3 +74,33 @@ def test_main_defaults_to_the_provisional_port(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(server.mcp, "run", lambda **kw: ports.append(kw["port"]))
     serve.main([])
     assert ports == [41108]
+
+
+class TestTending:
+    """The daemon tends Mail's compose windows (tender.py) unless told not
+    to; the e2e daemon, which must not reach Mail, is told not to."""
+
+    @pytest.fixture(autouse=True)
+    def _no_server(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from apple_mail_mcp import server
+
+        monkeypatch.setattr(server.mcp, "run", lambda **kw: None)
+
+    def test_starts_by_default_at_the_one_interval(
+        self, tenders_started: list[float]
+    ) -> None:
+        serve.main([])
+        assert tenders_started == [tender.TEND_INTERVAL_S]
+
+    def test_takes_its_interval_from_the_flag(self, tenders_started: list[float]) -> None:
+        serve.main(["--tend-interval", "90"])
+        assert tenders_started == [90.0]
+
+    def test_zero_turns_it_off(self, tenders_started: list[float]) -> None:
+        serve.main(["--tend-interval", "0"])
+        assert tenders_started == []
+
+    def test_a_negative_interval_is_refused(self) -> None:
+        with pytest.raises(SystemExit) as exc:
+            serve.build_parser().parse_args(["--tend-interval", "-5"])
+        assert exc.value.code == 2

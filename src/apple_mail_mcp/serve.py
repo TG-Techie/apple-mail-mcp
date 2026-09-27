@@ -38,11 +38,19 @@ Concurrency, as read from the installed fastmcp 3.4.7 on 2026-09-26:
   on that fresh open: a second thread flocking the same handle is let
   straight through (also observed), so a handle kept and reused across
   calls would stop excluding the daemon's threads from each other.
+
+The daemon also tends Mail's compose windows (``tender.py``): a pass at
+start, one every ``--tend-interval`` seconds, and one soon after a
+composition leaves its window open. ``--tend-interval 0`` turns it off,
+for a daemon that must not reach Mail (the e2e tests run one on a
+temporary data home, whose Mail lock no other process holds).
 """
 
 from __future__ import annotations
 
 import argparse
+
+from .tender import TEND_INTERVAL_S, start_tender
 
 DEFAULT_PORT = 41108
 """Provisional until the operator allocates it. imsg-serve holds 41100,
@@ -72,13 +80,33 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_PORT,
         help=f"loopback port (default {DEFAULT_PORT}).",
     )
+    parser.add_argument(
+        "--tend-interval",
+        type=_seconds,
+        default=float(TEND_INTERVAL_S),
+        metavar="SECONDS",
+        help=(
+            "seconds between passes over Mail's compose windows, which close "
+            "the ones this server opened and left (default "
+            f"{TEND_INTERVAL_S}); 0 turns tending off."
+        ),
+    )
     return parser
+
+
+def _seconds(text: str) -> float:
+    value = float(text)
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"must be 0 or more, got {text}")
+    return value
 
 
 def main(argv: list[str] | None = None) -> int:
     ns = build_parser().parse_args(argv)
     from .server import mcp
 
+    if ns.tend_interval > 0:
+        start_tender(interval_s=ns.tend_interval)
     mcp.run(transport="http", host=HOST, port=int(ns.port), path=MCP_PATH)
     return 0
 

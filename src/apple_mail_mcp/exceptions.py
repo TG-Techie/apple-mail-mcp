@@ -114,6 +114,29 @@ class MailAppleScriptError(MailError):
     pass
 
 
+class MailComposeWindowError(MailAppleScriptError):
+    """A composition failed after its compose window opened, and the
+    window was salvaged or discarded, or that was tried.
+
+    ``window_outcome`` is what the salvage or discard reported
+    ("SALVAGED", "NO_WINDOW", "SALVAGE_FAILED:…", …): the composition
+    records from it how its window ended (``compose_ledger``). To a
+    caller it is a ``MailAppleScriptError`` like any other, and its
+    message already carries the outcome."""
+
+    def __init__(self, message: str, *, window_outcome: str) -> None:
+        super().__init__(message)
+        self.window_outcome = window_outcome
+
+
+class MailComposeLedgerError(MailError):
+    """A compose-window record was asked to move to a state its current
+    state does not lead to: a record ends once, and only tending ends a
+    window a composition left open (``compose_ledger``)."""
+
+    pass
+
+
 class MailPermissionError(MailError):
     """Permission denied for operation."""
 

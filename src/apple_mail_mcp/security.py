@@ -131,8 +131,20 @@ TIER_LIMITS: dict[str, tuple[int, float]] = {
     "sends": (3, 60.0),
 }
 
-# The rate-limit tier of each tool, keyed by the tool's name: one entry
-# per registered tool, and no other.
+# What the server does to Mail of its own accord, not on a tool call: each
+# is logged under its name and has a rate-limit tier, like a tool.
+#
+# tend_compose_windows (tender.py): the daemon's pass over Mail's compose
+# windows, which closes those the compose ledger says this connector
+# opened and nothing closed. It changes Mail's state (a window closed, a
+# draft saved), so it is in the tier of the other mutations. Test mode
+# does not confine it: it is no tool a test calls, it names no account,
+# and what it closes loses nothing — a salvage to Drafts, or a discard of
+# a window with nothing in it.
+INTERNAL_OPERATIONS: frozenset[str] = frozenset({"tend_compose_windows"})
+
+# The rate-limit tier of each operation, keyed by its name: one entry per
+# registered tool and per internal operation, and no other.
 OPERATION_TIERS: dict[str, str] = {
     "list_accounts": "cheap_reads",
     "list_rules": "cheap_reads",
@@ -165,6 +177,8 @@ OPERATION_TIERS: dict[str, str] = {
     "save_template": "cheap_reads",
     "delete_template": "cheap_reads",
     "render_template": "cheap_reads",
+    # Internal operations.
+    "tend_compose_windows": "expensive_ops",
 }
 
 
