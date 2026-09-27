@@ -521,9 +521,11 @@ class AppleMailConnector:
                 the v0.5.0 behavior). See issue #75.
             lock_timeout: Seconds to wait for the cross-process Mail
                 automation lock before failing with a clear busy error.
-                Multiple agent sessions run their own server instance;
-                unserialized concurrent AppleScript collides into
-                AppleEvent timeouts (-1712) / invalid connections (-609).
+                Several callers can drive Mail at once (the resident
+                daemon on behalf of many sessions, any stdio server
+                beside it, a test run); unserialized concurrent
+                AppleScript collides into AppleEvent timeouts (-1712) /
+                invalid connections (-609).
         """
         self.timeout = timeout
         self.lock_timeout = lock_timeout

@@ -46,8 +46,9 @@ class OperationLogger:
 
     Every entry is kept in memory for the life of the process and
     appended, as one JSON line, to ``audit_log_path()``. The file is the
-    record that outlives the process: each agent session runs its own
-    server, so without it nothing on disk says what the server did.
+    record that outlives the process: a session may run its own server or
+    share the resident daemon (``mail-serve``) with every other session,
+    and either way nothing else on disk says what the server did.
     """
 
     def __init__(self) -> None:
