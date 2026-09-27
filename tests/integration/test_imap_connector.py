@@ -45,8 +45,12 @@ class TestEndToEnd:
         # keys matching mail_connector.search_messages output shape.
         expected_keys = {
             "id",
+            "rfc_message_id",
             "subject",
             "sender",
+            "to",
+            "cc",
+            "bcc",
             "date_received",
             "read_status",
             "flagged",

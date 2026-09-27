@@ -118,8 +118,8 @@ class TestIMAPDelegation:
         # Any messages returned must have the standard keys. (The server may
         # legitimately return [] — that's a successful IMAP search.)
         expected_keys = {
-            "id", "subject", "sender", "date_received",
-            "read_status", "flagged",
+            "id", "rfc_message_id", "subject", "sender", "to", "cc", "bcc",
+            "date_received", "read_status", "flagged",
         }
         for msg in result:
             assert set(msg.keys()) == expected_keys

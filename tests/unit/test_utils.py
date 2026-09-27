@@ -10,7 +10,9 @@ from apple_mail_mcp.utils import (
     applescript_iso_date_statements,
     distinct_filenames,
     escape_applescript_string,
+    format_address,
     format_applescript_list,
+    format_recipients,
     get_flag_index,
     is_account_uuid,
     is_gmail_system_label,
@@ -557,3 +559,55 @@ class TestSafeAttachmentFilename:
             assert "/" not in out, f"{raw!r} produced {out!r}"
             assert out not in {"..", "."}, f"{raw!r} produced {out!r}"
             assert out.strip() != "", f"{raw!r} produced {out!r}"
+
+
+class TestFormatAddress:
+    """One mailbox as a message row renders it. Both read paths render
+    through this one function, so the AppleScript row and the IMAP row
+    of the same message cannot disagree on the form."""
+
+    def test_name_and_address(self) -> None:
+        assert format_address("Jane Doe", "jane@example.com") == (
+            "Jane Doe <jane@example.com>"
+        )
+
+    def test_no_name_is_the_bare_address(self) -> None:
+        assert format_address("", "jane@example.com") == "jane@example.com"
+
+    def test_surrounding_space_is_not_part_of_either(self) -> None:
+        assert format_address("  Jane Doe ", " jane@example.com ") == (
+            "Jane Doe <jane@example.com>"
+        )
+
+    def test_a_whitespace_name_is_no_name(self) -> None:
+        assert format_address("   ", "jane@example.com") == "jane@example.com"
+
+    def test_no_address_is_the_name_alone(self) -> None:
+        """What a header says with no address is its name; an empty
+        ``<>`` would claim an address that is not there."""
+        assert format_address("Jane Doe", "") == "Jane Doe"
+
+    def test_neither_is_empty(self) -> None:
+        assert format_address("", "") == ""
+
+
+class TestFormatRecipients:
+    def test_renders_each_in_order(self) -> None:
+        assert format_recipients(
+            [("Jane Doe", "jane@example.com"), ("", "ops@example.org")]
+        ) == ["Jane Doe <jane@example.com>", "ops@example.org"]
+
+    def test_none_is_an_empty_list(self) -> None:
+        assert format_recipients([]) == []
+
+    def test_an_entry_with_neither_name_nor_address_is_not_a_recipient(
+        self,
+    ) -> None:
+        """An IMAP group's closing marker is such an entry."""
+        assert format_recipients(
+            [("", ""), ("", "ops@example.org")]
+        ) == ["ops@example.org"]
+
+    def test_takes_any_iterable(self) -> None:
+        pairs = (("", f"u{i}@example.com") for i in range(2))
+        assert format_recipients(pairs) == ["u0@example.com", "u1@example.com"]

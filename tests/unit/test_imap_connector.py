@@ -19,6 +19,9 @@ def _fake_envelope(
     sender_mailbox: bytes = b"alice",
     sender_host: bytes = b"example.com",
     date: datetime | None = None,
+    to: tuple[Address, ...] | None = (),
+    cc: tuple[Address, ...] | None = (),
+    bcc: tuple[Address, ...] | None = (),
 ) -> Envelope:
     """Build an Envelope with reasonable defaults for envelope-shape tests."""
     date = date or datetime(2026, 4, 22, 10, 0, 0)
@@ -29,9 +32,9 @@ def _fake_envelope(
         from_=(from_addr,),
         sender=(from_addr,),
         reply_to=(from_addr,),
-        to=(),
-        cc=(),
-        bcc=(),
+        to=to,
+        cc=cc,
+        bcc=bcc,
         in_reply_to=None,
         message_id=message_id,
     )
@@ -518,6 +521,88 @@ class TestEnvelopeTranslation:
         }
         [msg] = ImapConnector("h", 993, "u@e.com", "pw").search_messages()
         assert msg["subject"] == "héllo ✓"
+
+
+def _mock_client_returning(mock_cls: MagicMock, envelope: Envelope) -> MagicMock:
+    """An IMAPClient whose every SEARCH finds UID 1, fetched as ``envelope``."""
+    mock_client = MagicMock()
+    mock_cls.return_value = mock_client
+    mock_client.list_folders.return_value = [((), b"/", "INBOX")]
+    mock_client.search.return_value = [1]
+    mock_client.fetch.return_value = {1: {b"ENVELOPE": envelope, b"FLAGS": ()}}
+    return mock_client
+
+
+_JANE = Address(b"Jane Doe", None, b"jane", b"example.com")
+_OPS = Address(None, None, b"ops", b"example.org")
+
+
+class TestEnvelopeRecipients:
+    """Every IMAP row carries ``to``, ``cc`` and ``bcc`` from the
+    ENVELOPE, each a list of strings in the form ``sender`` uses."""
+
+    @patch("apple_mail_mcp.imap_connector.IMAPClient")
+    def test_search_rows_carry_to_cc_and_bcc(self, mock_cls):
+        _mock_client_returning(mock_cls, _fake_envelope(
+            to=(_JANE, _OPS),
+            cc=(Address(None, None, b"cc", b"example.net"),),
+            bcc=(Address(b"Hidden", None, b"hidden", b"example.com"),),
+        ))
+        [msg] = ImapConnector("h", 993, "u@e.com", "pw").search_messages()
+        assert msg["to"] == ["Jane Doe <jane@example.com>", "ops@example.org"]
+        assert msg["cc"] == ["cc@example.net"]
+        assert msg["bcc"] == ["Hidden <hidden@example.com>"]
+
+    @patch("apple_mail_mcp.imap_connector.IMAPClient")
+    def test_an_absent_header_is_an_empty_list(self, mock_cls):
+        """The ENVELOPE carries NIL for a header the message does not
+        have; a received message has no Bcc."""
+        _mock_client_returning(
+            mock_cls, _fake_envelope(to=None, cc=None, bcc=None)
+        )
+        [msg] = ImapConnector("h", 993, "u@e.com", "pw").search_messages()
+        assert (msg["to"], msg["cc"], msg["bcc"]) == ([], [], [])
+
+    @patch("apple_mail_mcp.imap_connector.IMAPClient")
+    def test_a_group_lists_its_members_and_not_its_markers(self, mock_cls):
+        """RFC 3501 7.4.2: an address with a NIL host opens a group (its
+        mailbox field holds the group's name) and one with NIL mailbox
+        and host closes it. Neither is a mailbox anyone was sent to, so
+        ``undisclosed-recipients:;`` is no recipient at all."""
+        opens = Address(None, None, b"team", None)
+        closes = Address(None, None, None, None)
+        undisclosed = Address(None, None, b"undisclosed-recipients", None)
+        _mock_client_returning(mock_cls, _fake_envelope(
+            to=(opens, _JANE, _OPS, closes),
+            cc=(undisclosed, closes),
+        ))
+        [msg] = ImapConnector("h", 993, "u@e.com", "pw").search_messages()
+        assert msg["to"] == ["Jane Doe <jane@example.com>", "ops@example.org"]
+        assert msg["cc"] == []
+
+    @patch("apple_mail_mcp.imap_connector.IMAPClient")
+    def test_get_message_row_carries_them(self, mock_cls):
+        _mock_client_returning(
+            mock_cls, _fake_envelope(to=(_JANE,), cc=(_OPS,))
+        )
+        msg = ImapConnector("h", 993, "u@e.com", "pw").get_message(
+            "msg-1@example.com", include_content=False
+        )
+        assert msg["to"] == ["Jane Doe <jane@example.com>"]
+        assert msg["cc"] == ["ops@example.org"]
+        assert msg["bcc"] == []
+
+    @patch("apple_mail_mcp.imap_connector.IMAPClient")
+    def test_thread_rows_carry_them(self, mock_cls):
+        _mock_client_returning(mock_cls, _fake_envelope(
+            message_id=b"<anchor@x>", to=(_JANE,), bcc=(_OPS,)
+        ))
+        [msg] = ImapConnector("h", 993, "u@e.com", "pw").find_thread_members(
+            anchor_rfc_message_id="anchor@x", anchor_references=[],
+        )
+        assert msg["to"] == ["Jane Doe <jane@example.com>"]
+        assert msg["cc"] == []
+        assert msg["bcc"] == ["ops@example.org"]
 
 
 class TestFindThreadMembers:

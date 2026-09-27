@@ -36,13 +36,14 @@ from typing import Any, cast
 
 from imapclient import IMAPClient
 from imapclient.exceptions import IMAPClientError, LoginError
-from imapclient.response_types import Envelope
+from imapclient.response_types import Address, Envelope
 
 from .exceptions import (
     MailImapMoveUnsupportedError,
     MailImapTrashNotFoundError,
     MailMessageNotFoundError,
 )
+from .utils import format_address, format_recipients
 
 logger = logging.getLogger(__name__)
 
@@ -327,16 +328,36 @@ def _flatten_one(node: Any, out: set[int]) -> None:
             pass
 
 
+def _address_parts(address: Address) -> tuple[str, str]:
+    """``(display name, address)`` of one ENVELOPE address, for
+    ``format_address``."""
+    mailbox = _decode(address.mailbox)
+    host = _decode(address.host)
+    email = f"{mailbox}@{host}" if mailbox and host else mailbox or ""
+    return _decode(address.name), email
+
+
 def _format_sender(envelope: Envelope) -> str:
     from_ = envelope.from_ or ()
     if not from_:
         return ""
-    first = from_[0]
-    name = _decode(first.name)
-    mailbox = _decode(first.mailbox)
-    host = _decode(first.host)
-    email = f"{mailbox}@{host}" if mailbox and host else mailbox or ""
-    return f"{name} <{email}>" if name else email
+    return format_address(*_address_parts(from_[0]))
+
+
+def _format_recipient_list(addresses: tuple[Address, ...] | None) -> list[str]:
+    """One ENVELOPE address list (``to``, ``cc`` or ``bcc``) as a row's
+    list of strings. NIL, for a header the message does not have, is
+    the empty list.
+
+    An address with a NIL host is a group marker, not a mailbox (RFC
+    3501 7.4.2): it opens a group, its mailbox field holding the
+    group's name, or with a NIL mailbox too it closes one. A group's
+    members are listed and its markers are not, so
+    ``undisclosed-recipients:;`` lists no one.
+    """
+    return format_recipients(
+        _address_parts(address) for address in addresses or () if address.host
+    )
 
 
 def _bodystructure_extract_attachments(
@@ -499,6 +520,9 @@ def _envelope_to_dict(
         "rfc_message_id": rfc_id,
         "subject": _decode(envelope.subject),
         "sender": _format_sender(envelope),
+        "to": _format_recipient_list(envelope.to),
+        "cc": _format_recipient_list(envelope.cc),
+        "bcc": _format_recipient_list(envelope.bcc),
         "date_received": date_str,
         "read_status": _FLAG_SEEN in flags,
         "flagged": _FLAG_FLAGGED in flags,
@@ -657,8 +681,9 @@ class ImapConnector:
 
         Returns:
             Dict with the same keys as the AppleScript ``get_message``
-            output: ``id``, ``subject``, ``sender``, ``date_received``,
-            ``read_status``, ``flagged``, ``content``.
+            output: ``id``, ``rfc_message_id``, ``subject``, ``sender``,
+            ``to``, ``cc``, ``bcc``, ``date_received``, ``read_status``,
+            ``flagged``, ``content``.
 
         Raises:
             MailMessageNotFoundError: No message in ``mailbox`` matches
@@ -824,9 +849,10 @@ class ImapConnector:
 
         Returns:
             List of message dicts in the same shape as search_messages
-            (``id``, ``subject``, ``sender``, ``date_received``,
-            ``read_status``, ``flagged``), deduped by Message-ID, sorted
-            chronologically ascending.
+            (``id``, ``rfc_message_id``, ``subject``, ``sender``, ``to``,
+            ``cc``, ``bcc``, ``date_received``, ``read_status``,
+            ``flagged``), deduped by Message-ID, sorted chronologically
+            ascending.
         """
         with self._session() as client:
             # Tier 1: Gmail X-GM-THRID via [Gmail]/All Mail

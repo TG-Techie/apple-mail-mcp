@@ -4,6 +4,7 @@ Utility functions for Apple Mail MCP.
 
 import json
 import re
+from collections.abc import Iterable
 from typing import Any
 
 _UUID_RE = re.compile(
@@ -442,6 +443,35 @@ def parse_rfc822_ids(raw: str) -> list[str]:
         if cleaned and cleaned not in out:
             out.append(cleaned)
     return out
+
+
+def format_address(name: str, address: str) -> str:
+    """One mailbox as every message row renders it: ``Name <address>``
+    when there is a display name, else the bare address.
+
+    The one renderer for a row's ``sender`` on the IMAP path and for
+    ``to`` / ``cc`` / ``bcc`` on both paths, so the AppleScript row and
+    the IMAP row of the same message cannot disagree on the form. Each
+    path supplies the two parts as it reads them: Mail's ``name`` and
+    ``address`` of a recipient, or an IMAP ENVELOPE address.
+
+    A name with no address renders as the name alone, and neither as
+    ``""``: an empty ``<>`` would claim an address that is not there.
+    """
+    name = name.strip()
+    address = address.strip()
+    if name and address:
+        return f"{name} <{address}>"
+    return address or name
+
+
+def format_recipients(pairs: Iterable[tuple[str, str]]) -> list[str]:
+    """``(name, address)`` pairs as a row's recipient list, in order.
+
+    An entry with neither a name nor an address is not a recipient (an
+    IMAP group's closing marker is one) and is left out.
+    """
+    return [text for text in (format_address(n, a) for n, a in pairs) if text]
 
 
 def walk_thread_graph(
