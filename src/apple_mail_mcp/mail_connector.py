@@ -240,15 +240,6 @@ class _SentCopy:
     rfc_message_id: str
     attachment_names: tuple[str, ...]
 
-    def result(self) -> dict[str, Any]:
-        """The send's result: the copy's Mail id, which ``get_messages``
-        takes, and its RFC Message-ID."""
-        return {
-            "draft_id": "",
-            "sent_message_id": self.mail_id,
-            "sent_rfc_message_id": self.rfc_message_id,
-        }
-
 
 @dataclass(frozen=True)
 class _SentCopyUnidentified:
@@ -258,25 +249,33 @@ class _SentCopyUnidentified:
 
     why: str
 
-    def result(self, *, files_pasted: bool) -> dict[str, Any]:
-        """The send's result: success with no id, and one warning saying
-        why, and that the files, when there were any, are unverified
-        rather than missing."""
-        unverified = (
-            ", and the files it was sent with are unverified"
-            if files_pasted
-            else ""
-        )
+
+def _sent_result(
+    copy: _SentCopy | _SentCopyUnidentified, *, files_pasted: bool
+) -> dict[str, Any]:
+    """What a send that went out returns: the copy's Mail id, which
+    ``get_messages`` takes, and its RFC Message-ID; or, for a copy not
+    identified, no id and one warning saying why, and that the files,
+    when there were any, are unverified rather than missing."""
+    if isinstance(copy, _SentCopy):
         return {
             "draft_id": "",
-            "sent_message_id": "",
-            "sent_rfc_message_id": "",
-            "warnings": [
-                f"The message was sent, but its copy in Sent could not be "
-                f"identified: {self.why}. No id is returned{unverified}; "
-                "look in Sent before sending it again."
-            ],
+            "sent_message_id": copy.mail_id,
+            "sent_rfc_message_id": copy.rfc_message_id,
         }
+    unverified = (
+        ", and the files it was sent with are unverified" if files_pasted else ""
+    )
+    return {
+        "draft_id": "",
+        "sent_message_id": "",
+        "sent_rfc_message_id": "",
+        "warnings": [
+            f"The message was sent, but its copy in Sent could not be "
+            f"identified: {copy.why}. No id is returned{unverified}; "
+            "look in Sent before sending it again."
+        ],
+    }
 
 
 def _closing_of(raw: str, *, by: Closer, at: float) -> Closed | None:
@@ -5474,13 +5473,14 @@ end tell
         """What a send that went out returns, by the copy it filed in
         Sent (``_find_sent_copy``): found, it must carry every file the
         composition pasted, by name, and its ids are returned; not
-        identified, no id is returned, with a warning saying why."""
+        identified, no id is returned, with a warning saying why
+        (``_sent_result``)."""
         copy = self._find_sent_copy(window.subject, window.before_ids)
-        if isinstance(copy, _SentCopyUnidentified):
+        if isinstance(copy, _SentCopy):
+            self._check_sent_attachments(copy, [f.name for f in files])
+        else:
             logger.warning("a send's copy in Sent was not identified: %s", copy.why)
-            return copy.result(files_pasted=bool(files))
-        self._check_sent_attachments(copy, [f.name for f in files])
-        return copy.result()
+        return _sent_result(copy, files_pasted=bool(files))
 
     @staticmethod
     def _check_sent_attachments(copy: _SentCopy, names: list[str]) -> None:
