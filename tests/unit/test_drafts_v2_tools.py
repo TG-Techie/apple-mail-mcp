@@ -1630,3 +1630,135 @@ class TestADraftIdReachesEveryAccountInTestMode:
         assert result["error_type"] == "safety_violation"
         mock_mail.create_draft.assert_not_called()
         mock_mail.delete_draft.assert_not_called()
+
+
+class TestEachDraftToolAnswersToItsOwnName:
+    """Each draft tool reaches the test-mode gate, the rate limiter and
+    the audit log under its own name, so an audit entry's ``operation``
+    is the tool that was called. What security.py's tables say about
+    each name is pinned in test_security.py."""
+
+    _STATE = {
+        "draft_id": "OLD",
+        "to": ["alice@example.com"], "cc": [], "bcc": [],
+        "subject": "hi", "body": "x",
+        "in_reply_to": "", "references": "", "attachment_names": [],
+        "sender": "", "account": "TestAccount",
+    }
+
+    @pytest.fixture(autouse=True)
+    def _fresh_log(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from apple_mail_mcp.security import operation_logger
+
+        operation_logger.operations.clear()
+        monkeypatch.delenv(
+            "APPLE_MAIL_MCP_SEND_ELICITATION_ALLOWLIST", raising=False
+        )
+
+    @pytest.fixture
+    def test_mode(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("MAIL_TEST_MODE", "true")
+        monkeypatch.setenv("MAIL_TEST_ACCOUNT", "TestAccount")
+        # The test account's identifiers are its name alone: no osascript.
+        monkeypatch.setattr(
+            "apple_mail_mcp.security._get_test_account_identifiers",
+            lambda name: frozenset({name}),
+        )
+
+    @staticmethod
+    def _logged() -> list[tuple[str, str]]:
+        from apple_mail_mcp.security import operation_logger
+
+        return [(op["operation"], op["result"]) for op in operation_logger.operations]
+
+    def _state(self, account: str) -> dict[str, Any]:
+        return {**self._STATE, "account": account}
+
+    def test_draft_create(self, isolated_drafts: None, mock_mail: MagicMock) -> None:
+        from apple_mail_mcp.tools.drafts import draft_create
+
+        mock_mail.create_draft.return_value = {"draft_id": "NEW", "sent_message_id": ""}
+        assert draft_create(to=["alice@example.com"], subject="s", body="b")["success"]
+        assert self._logged() == [("draft_create", "success")]
+
+    def test_draft_update(self, isolated_drafts: None, mock_mail: MagicMock) -> None:
+        from apple_mail_mcp.tools.drafts import draft_update
+
+        mock_mail.get_draft_state.return_value = self._state("TestAccount")
+        mock_mail.create_draft.return_value = {"draft_id": "NEW", "sent_message_id": ""}
+        assert draft_update(draft_id="OLD", body="revised")["success"]
+        assert self._logged() == [("draft_update", "success")]
+
+    def test_draft_delete(self, isolated_drafts: None, mock_mail: MagicMock) -> None:
+        from apple_mail_mcp.tools.drafts import draft_delete
+
+        mock_mail.get_draft_state.return_value = self._state("TestAccount")
+        assert draft_delete(draft_id="OLD")["success"]
+        assert self._logged() == [("draft_delete", "success")]
+
+    async def test_draft_send(self, isolated_drafts: None, mock_mail: MagicMock) -> None:
+        """The allowlisted send is recorded, then the send itself."""
+        from apple_mail_mcp.tools.drafts import draft_send
+
+        mock_mail.get_draft_state.return_value = self._state("TestAccount")
+        mock_mail.create_draft.return_value = {"draft_id": "", "sent_message_id": ""}
+        assert (await draft_send(draft_id="OLD"))["success"]
+        assert self._logged() == [
+            ("draft_send", "send_allowlisted"), ("draft_send", "success"),
+        ]
+
+    def test_draft_create_refused_in_test_mode(
+        self, isolated_drafts: None, mock_mail: MagicMock, test_mode: None,
+    ) -> None:
+        from apple_mail_mcp.tools.drafts import draft_create
+
+        result = draft_create(
+            to=["alice@example.com"], subject="s", body="b", from_account="Other",
+        )
+        assert result["error_type"] == "safety_violation"
+        assert self._logged() == [("draft_create", "safety_violation")]
+
+    def test_draft_update_refused_in_test_mode(
+        self, isolated_drafts: None, mock_mail: MagicMock, test_mode: None,
+    ) -> None:
+        from apple_mail_mcp.tools.drafts import draft_update
+
+        mock_mail.get_draft_state.return_value = self._state("")
+        result = draft_update(draft_id="OLD", body="revised")
+        assert "draft_update" in result["error"]
+        assert self._logged() == [("draft_update", "safety_violation")]
+
+    def test_draft_delete_refused_in_test_mode(
+        self, isolated_drafts: None, mock_mail: MagicMock, test_mode: None,
+    ) -> None:
+        from apple_mail_mcp.tools.drafts import draft_delete
+
+        mock_mail.get_draft_state.return_value = self._state("")
+        result = draft_delete(draft_id="OLD")
+        assert "draft_delete" in result["error"]
+        assert self._logged() == [("draft_delete", "safety_violation")]
+
+    async def test_draft_send_refused_in_test_mode(
+        self, isolated_drafts: None, mock_mail: MagicMock, test_mode: None,
+    ) -> None:
+        from apple_mail_mcp.tools.drafts import draft_send
+
+        mock_mail.get_draft_state.return_value = self._state("")
+        result = await draft_send(draft_id="OLD")
+        assert "draft_send" in result["error"]
+        assert self._logged() == [("draft_send", "safety_violation")]
+
+    async def test_draft_send_is_rate_limited_as_a_send(
+        self, isolated_drafts: None, mock_mail: MagicMock,
+    ) -> None:
+        from apple_mail_mcp.security import TIER_LIMITS, rate_limiter
+        from apple_mail_mcp.tools.drafts import draft_send
+
+        for _ in range(TIER_LIMITS["sends"][0]):
+            assert rate_limiter.check("sends")
+        mock_mail.get_draft_state.return_value = self._state("TestAccount")
+        result = await draft_send(draft_id="OLD")
+        assert result["error_type"] == "rate_limited"
+        assert "sends" in result["error"]
+        assert self._logged() == [("draft_send", "rate_limited")]
+        mock_mail.create_draft.assert_not_called()

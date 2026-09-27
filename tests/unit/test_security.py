@@ -9,7 +9,11 @@ from unittest.mock import patch
 import pytest
 
 from apple_mail_mcp.security import (
+    ACCOUNT_GATED_OPERATIONS,
+    ACCOUNT_REQUIRED_MUTATIONS,
     OPERATION_TIERS,
+    RULE_GATED_OPERATIONS,
+    SEND_OPERATIONS,
     TIER_LIMITS,
     OperationLogger,
     RateLimiter,
@@ -284,9 +288,9 @@ class TestCheckRateLimit:
     def test_returns_error_dict_when_over_limit(self) -> None:
         max_calls = TIER_LIMITS["sends"][0]
         for _ in range(max_calls):
-            check_rate_limit("create_draft", {"subject": "x"})
+            check_rate_limit("draft_send", {"subject": "x"})
 
-        result = check_rate_limit("create_draft", {"subject": "x"})
+        result = check_rate_limit("draft_send", {"subject": "x"})
         assert result is not None
         assert result["success"] is False
         assert result["error_type"] == "rate_limited"
@@ -295,41 +299,36 @@ class TestCheckRateLimit:
     def test_logs_rate_limited_to_operation_logger(self) -> None:
         max_calls = TIER_LIMITS["sends"][0]
         for _ in range(max_calls):
-            check_rate_limit("create_draft", {"subject": "x"})
+            check_rate_limit("draft_send", {"subject": "x"})
 
-        check_rate_limit("create_draft", {"subject": "blocked"})
+        check_rate_limit("draft_send", {"subject": "blocked"})
 
         recent = operation_logger.get_recent_operations(limit=10)
         rate_limited_entries = [
             op for op in recent if op["result"] == "rate_limited"
         ]
         assert len(rate_limited_entries) == 1
-        assert rate_limited_entries[0]["operation"] == "create_draft"
+        assert rate_limited_entries[0]["operation"] == "draft_send"
         assert rate_limited_entries[0]["parameters"] == {"subject": "blocked"}
 
     def test_error_message_includes_limit_and_window(self) -> None:
         max_calls, window = TIER_LIMITS["sends"]
         for _ in range(max_calls):
-            check_rate_limit("create_draft", {"subject": "x"})
+            check_rate_limit("draft_send", {"subject": "x"})
 
-        result = check_rate_limit("create_draft", {"subject": "x"})
+        result = check_rate_limit("draft_send", {"subject": "x"})
         assert result is not None
         assert str(max_calls) in result["error"]
         assert str(int(window)) in result["error"]
 
-    def test_all_operations_have_tier_assigned(self) -> None:
-        expected_ops = {
-            "list_accounts", "list_rules", "list_mailboxes", "get_messages",
-            "get_thread", "save_attachments", "search_messages",
-            "update_message", "create_mailbox", "update_mailbox",
-            "delete_mailbox", "delete_messages",
-            "create_draft", "update_draft", "delete_draft",
-            "email_send_html",
-            "delete_rule", "create_rule", "update_rule",
-            "list_templates", "get_template", "save_template",
-            "delete_template", "render_template",
-        }
-        assert set(OPERATION_TIERS.keys()) == expected_ops
+    async def test_all_operations_have_tier_assigned(self) -> None:
+        """The tiers are keyed by tool name, one per registered tool: a
+        tool added without a tier fails here, and so does a tier left
+        behind under a name no tool has."""
+        from apple_mail_mcp import server
+
+        tools = {t.name for t in await server.mcp.list_tools()}
+        assert set(OPERATION_TIERS) == tools
 
     def test_tier_limits_config_exists_for_all_tiers(self) -> None:
         expected_tiers = {"cheap_reads", "expensive_ops", "sends"}
@@ -392,7 +391,7 @@ class TestCheckTestModeSafety:
         monkeypatch.delenv("MAIL_TEST_MODE", raising=False)
         assert check_test_mode_safety("search_messages", account="Gmail") is None
         assert (
-            check_test_mode_safety("create_draft", recipients=["real@person.com"])
+            check_test_mode_safety("draft_send", recipients=["real@person.com"])
             is None
         )
 
@@ -420,7 +419,7 @@ class TestCheckTestModeSafety:
             # A draft id likewise names a draft in any account; the tools
             # read the draft's account back and pass it here, and one Mail
             # cannot name (a local draft) is not the test account.
-            "delete_draft", "update_draft",
+            "draft_update", "draft_delete", "draft_send",
         ],
     )
     def test_a_mutation_without_an_account_is_refused_in_test_mode(
@@ -571,11 +570,12 @@ class TestCheckTestModeSafety:
         monkeypatch.setenv("MAIL_TEST_MODE", "true")
 
         assert (
-            check_test_mode_safety("create_draft", recipients=["a@example.com"]) is None
+            check_test_mode_safety("email_send_html", recipients=["a@example.com"])
+            is None
         )
         assert (
             check_test_mode_safety(
-                "create_draft", recipients=["a@example.com", "b@foo.test"]
+                "email_send_html", recipients=["a@example.com", "b@foo.test"]
             )
             is None
         )
@@ -584,46 +584,22 @@ class TestCheckTestModeSafety:
         monkeypatch.setenv("MAIL_TEST_MODE", "true")
 
         result = check_test_mode_safety(
-            "create_draft", recipients=["a@example.com", "real@person.com"]
+            "email_send_html", recipients=["a@example.com", "real@person.com"]
         )
         assert result is not None
         assert result["error_type"] == "safety_violation"
         assert "real@person.com" in result["error"]
 
-    def test_recipients_none_means_this_call_sends_nothing(
-        self, monkeypatch: Any
-    ) -> None:
-        """A draft being saved reaches the gate for its account only,
-        with recipients=None; nothing leaves, so there is nothing to
-        confine. The send path always passes a list — an empty one is a
-        send whose recipients Mail would derive, refused below (#175).
-        Until 2026-09-11 None was refused too, which made the gate
-        unusable for the save path."""
-        monkeypatch.setenv("MAIL_TEST_MODE", "true")
-
-        assert check_test_mode_safety("create_draft", recipients=None) is None
-
     def test_send_blocked_when_recipients_empty_in_test_mode(
         self, monkeypatch: Any
     ) -> None:
-        """#175: same as above but with explicit empty list."""
+        """#175: a send that names no recipients has Mail derive them."""
         monkeypatch.setenv("MAIL_TEST_MODE", "true")
 
-        result = check_test_mode_safety("create_draft", recipients=[])
+        result = check_test_mode_safety("email_send_html", recipients=[])
         assert result is not None
         assert result["error_type"] == "safety_violation"
         assert "explicit recipients" in result["error"]
-
-    def test_send_blocked_for_update_draft_empty_recipients(
-        self, monkeypatch: Any
-    ) -> None:
-        """#175: same gap applies to update_draft's send path."""
-        monkeypatch.setenv("MAIL_TEST_MODE", "true")
-
-        result = check_test_mode_safety("update_draft", recipients=[])
-        assert result is not None
-        assert result["error_type"] == "safety_violation"
-        assert "update_draft" in result["error"]
 
     def test_send_empty_recipients_passes_outside_test_mode(
         self, monkeypatch: Any
@@ -633,8 +609,8 @@ class TestCheckTestModeSafety:
         None and the new branch is never reached."""
         monkeypatch.delenv("MAIL_TEST_MODE", raising=False)
 
-        assert check_test_mode_safety("create_draft", recipients=None) is None
-        assert check_test_mode_safety("create_draft", recipients=[]) is None
+        assert check_test_mode_safety("draft_send", recipients=None) is None
+        assert check_test_mode_safety("draft_send", recipients=[]) is None
 
     def test_non_send_operation_with_empty_recipients_unchanged(
         self, monkeypatch: Any
@@ -701,11 +677,12 @@ class TestAccountGateCoversEveryAccountScopedMutation:
             "delete_messages",
             # The sender the caller names: a draft saved into, or mail
             # sent from, that account.
-            "create_draft",
-            "update_draft",
+            "draft_create",
             "email_send_html",
             # The account a draft named by id sits in.
-            "delete_draft",
+            "draft_update",
+            "draft_delete",
+            "draft_send",
         ],
     )
     def test_mutation_on_another_account_is_refused(
@@ -722,8 +699,8 @@ class TestAccountGateCoversEveryAccountScopedMutation:
         "operation",
         [
             "update_mailbox", "delete_mailbox", "delete_messages",
-            "create_draft", "update_draft", "email_send_html",
-            "delete_draft",
+            "draft_create", "draft_update", "draft_delete", "draft_send",
+            "email_send_html",
         ],
     )
     def test_mutation_on_the_test_account_is_allowed(
@@ -731,8 +708,15 @@ class TestAccountGateCoversEveryAccountScopedMutation:
     ) -> None:
         monkeypatch.setenv("MAIL_TEST_MODE", "true")
         monkeypatch.setenv("MAIL_TEST_ACCOUNT", "TestAccount")
+        # A send is checked for its recipients as well; these are admitted.
+        recipients = ["a@example.com"] if operation in SEND_OPERATIONS else None
 
-        assert check_test_mode_safety(operation, account="TestAccount") is None
+        assert (
+            check_test_mode_safety(
+                operation, account="TestAccount", recipients=recipients,
+            )
+            is None
+        )
 
 
 class TestAForwardingRuleIsConfinedLikeASend:
@@ -814,9 +798,7 @@ class TestEverySendPathIsConfinedInTestMode:
     mail anyone on the allowlist. The parametrize below is the list; a
     tool added later that sends belongs in it."""
 
-    @pytest.mark.parametrize(
-        "operation", ["create_draft", "update_draft", "email_send_html"],
-    )
+    @pytest.mark.parametrize("operation", ["draft_send", "email_send_html"])
     def test_a_send_to_a_real_domain_is_refused(
         self, operation: str, monkeypatch: Any
     ) -> None:
@@ -831,22 +813,98 @@ class TestEverySendPathIsConfinedInTestMode:
         assert result["error_type"] == "safety_violation"
         assert "real@person.com" in result["error"]
 
-    @pytest.mark.parametrize(
-        "operation", ["create_draft", "update_draft", "email_send_html"],
-    )
+    @pytest.mark.parametrize("recipients", [[], None], ids=["empty", "none"])
+    @pytest.mark.parametrize("operation", ["draft_send", "email_send_html"])
     def test_a_send_with_no_explicit_recipients_is_refused(
-        self, operation: str, monkeypatch: Any
+        self, operation: str, recipients: list[str] | None, monkeypatch: Any
     ) -> None:
         """A reply with nothing explicit lets Mail derive the recipients
-        at send time, past this gate."""
+        at send time, past this gate, and a call that passes none gives
+        it nothing to check. Every call to a send operation sends, so
+        either is refused."""
         monkeypatch.setenv("MAIL_TEST_MODE", "true")
         monkeypatch.setenv("MAIL_TEST_ACCOUNT", "TestAccount")
         result = check_test_mode_safety(
-            operation, account="TestAccount", recipients=[],
+            operation, account="TestAccount", recipients=recipients,
         )
         assert result is not None, f"{operation} is not a gated send"
         assert "explicit recipients" in result["error"]
+        assert operation in result["error"]
         assert result["error_type"] == "safety_violation"
+
+
+class TestEachToolIsClassifiedUnderItsOwnName:
+    """A tool passes its own name to check_rate_limit,
+    check_test_mode_safety and the audit log, and the tables in
+    security.py say what that tool does. A name missing from the
+    test-mode tables is not an error there: the gate passes it as a
+    no-op. So every registered tool is accounted for below, and a tool
+    added later fails here until it is placed."""
+
+    # What each draft tool does, as the tables must say it:
+    # (rate-limit tier, account-gated, account required, sends).
+    DRAFT_TOOLS: dict[str, tuple[str, bool, bool, bool]] = {
+        # Writes a draft into the account its named sender belongs to.
+        "draft_create": ("expensive_ops", True, False, False),
+        # Rebuilds a draft named by id, in its own account or under the
+        # sender the caller names.
+        "draft_update": ("expensive_ops", True, True, False),
+        # Removes a draft named by id from its account.
+        "draft_delete": ("expensive_ops", True, True, False),
+        # Sends a draft named by id: the one send from a draft.
+        "draft_send": ("sends", True, True, True),
+    }
+
+    # Tools test mode does not confine, and why. Placing a tool here
+    # decides that an integration run may call it on any account.
+    NOT_CONFINED: dict[str, str] = {
+        "list_accounts": "reads the account list",
+        "list_rules": "reads the rule list",
+        "get_messages": "reads messages by id",
+        "get_thread": "reads a thread by message id",
+        "save_attachments": "reads a message; writes files to a local directory",
+        "list_templates": "local template files",
+        "get_template": "local template files",
+        "save_template": "local template files",
+        "delete_template": "local template files",
+        "render_template": "a local template, and a read of the message it fills from",
+    }
+
+    @staticmethod
+    async def _registered_tools() -> set[str]:
+        from apple_mail_mcp import server
+
+        return {t.name for t in await server.mcp.list_tools()}
+
+    async def test_every_draft_tool_has_a_row(self) -> None:
+        tools = await self._registered_tools()
+        assert {t for t in tools if t.startswith("draft_")} == set(self.DRAFT_TOOLS)
+
+    @pytest.mark.parametrize("tool", sorted(DRAFT_TOOLS))
+    def test_the_tables_say_what_the_draft_tool_does(self, tool: str) -> None:
+        tier, account_gated, account_required, sends = self.DRAFT_TOOLS[tool]
+        assert OPERATION_TIERS[tool] == tier
+        assert (tool in ACCOUNT_GATED_OPERATIONS) is account_gated
+        assert (tool in ACCOUNT_REQUIRED_MUTATIONS) is account_required
+        assert (tool in SEND_OPERATIONS) is sends
+
+    async def test_every_tool_is_confined_by_test_mode_or_says_why_not(
+        self,
+    ) -> None:
+        tools = await self._registered_tools()
+        confined = (
+            ACCOUNT_GATED_OPERATIONS | SEND_OPERATIONS | RULE_GATED_OPERATIONS
+        )
+        assert tools - confined == set(self.NOT_CONFINED)
+
+    async def test_the_test_mode_tables_name_only_tools(self) -> None:
+        """A name in these tables that no tool passes confines nothing."""
+        tools = await self._registered_tools()
+        for table in (
+            ACCOUNT_GATED_OPERATIONS, ACCOUNT_REQUIRED_MUTATIONS,
+            SEND_OPERATIONS, RULE_GATED_OPERATIONS,
+        ):
+            assert table <= tools, table - tools
 
 
 class TestTheLoopbackIsAdmittedForSends:
@@ -872,9 +930,7 @@ class TestTheLoopbackIsAdmittedForSends:
         """The recipients a safety error names as refused."""
         return result["error"].split("Violations: ", 1)[1].split(", ")
 
-    @pytest.mark.parametrize(
-        "operation", ["create_draft", "update_draft", "email_send_html"],
-    )
+    @pytest.mark.parametrize("operation", ["draft_send", "email_send_html"])
     def test_a_send_to_exactly_the_loopback_passes(
         self, operation: str, monkeypatch: Any
     ) -> None:
@@ -924,7 +980,7 @@ class TestTheLoopbackIsAdmittedForSends:
     ) -> None:
         monkeypatch.setenv("MAIL_TEST_LOOPBACK", self.LOOPBACK)
         result = check_test_mode_safety(
-            "create_draft",
+            "email_send_html",
             recipients=[self.LOOPBACK, "a@example.com", "someone@partner.com"],
         )
         assert result is not None

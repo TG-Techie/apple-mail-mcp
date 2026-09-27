@@ -31,11 +31,6 @@ step in the lifecycle. Treat the id you held before draft_update as
 stale. The old draft is removed only after the new one exists (or the
 send went out), so a failed draft_update or draft_send leaves it in
 Drafts under the id you already hold.
-
-The operation names these tools give the rate limiter, the test-mode
-gate and the audit log are create_draft, update_draft and delete_draft,
-the names security.py's tables know them by; a send from a draft is
-update_draft there, a send that must name the draft's account.
 """
 
 import dataclasses
@@ -446,7 +441,7 @@ def _gate_draft_update_accounts(
     if from_account is not None:
         touched.append(from_account)
     for account in touched:
-        safety_err = check_test_mode_safety("update_draft", account=account)
+        safety_err = check_test_mode_safety("draft_update", account=account)
         if safety_err:
             return safety_err
     return None
@@ -521,7 +516,7 @@ def draft_create(
         raise ValueError("template_vars requires template_name")
     # A named sender is an account this call writes into: the draft lands
     # in its Drafts, so in test mode it must be the test account.
-    if refused := check_test_mode_safety("create_draft", account=from_account):
+    if refused := check_test_mode_safety("draft_create", account=from_account):
         return refused
 
     seed_kind, seed_id = _resolve_draft_create_seed(reply_to, forward_of)
@@ -554,7 +549,7 @@ def draft_create(
         ),
     )
     operation_logger.log_operation(
-        "create_draft",
+        "draft_create",
         {
             "seed_kind": seed_kind,
             "seed_id": seed_id,
@@ -678,7 +673,7 @@ def draft_update(
         draft_id, store, new_draft_id=new_draft_id, sent=False,
     )
     operation_logger.log_operation(
-        "update_draft",
+        "draft_update",
         {
             "old_draft_id": draft_id,
             "new_draft_id": new_draft_id,
@@ -720,12 +715,12 @@ def draft_delete(draft_id: str) -> dict[str, Any]:
     # A draft id names a draft in any account; read which before
     # acting, so test mode can keep the delete in the test account.
     state = server.mail.get_draft_state(draft_id)
-    if refused := check_test_mode_safety("delete_draft", account=_draft_account(state)):
+    if refused := check_test_mode_safety("draft_delete", account=_draft_account(state)):
         return refused
     server.mail.delete_draft(draft_id)
     _get_draft_state_store().delete(draft_id)
     operation_logger.log_operation(
-        "delete_draft", {"draft_id": draft_id, "account": state.get("account")},
+        "draft_delete", {"draft_id": draft_id, "account": state.get("account")},
         "success",
     )
     return {"success": True, "draft_id": draft_id}
@@ -780,11 +775,11 @@ def draft_send(
         )
     subject: str | None = state.get("subject")
     if refused := check_test_mode_safety(
-        "update_draft", account=_draft_account(state), recipients=recipients,
+        "draft_send", account=_draft_account(state), recipients=recipients,
     ):
         return refused
     if refused := check_rate_limit(
-        "update_draft", {"draft_id": draft_id, "subject": subject}
+        "draft_send", {"draft_id": draft_id, "subject": subject}
     ):
         return refused
     if refused := send.outbound_refusal("draft_send", recipients):
@@ -795,9 +790,9 @@ def draft_send(
     if refused := _fresh_send_guard(source.seed_kind, source.attachment_names):
         return refused
     if refused := send.confirm_send(
-        ctx, "update_draft", recipients,
+        ctx, "draft_send", recipients,
         send.build_send_summary(source.seed_kind, to, cc, bcc, subject, source.body),
-        {"draft_id": draft_id, "send_now": True},
+        {"draft_id": draft_id},
     ):
         return refused
 
@@ -818,11 +813,10 @@ def draft_send(
     )
     warning = _retire_old_draft(draft_id, store, new_draft_id="", sent=True)
     operation_logger.log_operation(
-        "update_draft",
+        "draft_send",
         {
             "old_draft_id": draft_id,
             "old_draft_removed": warning is None,
-            "send_now": True,
             "to": to,
             "cc": cc,
             "bcc": bcc,

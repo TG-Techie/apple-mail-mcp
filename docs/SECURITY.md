@@ -154,23 +154,14 @@ def validate_email(email: str) -> bool:
 
 ### Send Operation Security
 
-```python
-# Validation checks
-is_valid, error = validate_send_operation(to, cc, bcc)
-if not is_valid:
-    return {"success": False, "error": error}
+Mail leaves through two tools: `email_send_html`, and `draft_send` for a saved draft (`draft_create` and `draft_update` only save). Before anything is sent, each passes these gates, and any one of them refuses the send:
 
-# Confirmation requirement (logged)
-require_confirmation("create_draft", {
-    "subject": subject,
-    "to": to,
-    "recipient_count": len(to) + len(cc or []) + len(bcc or []),
-    "send_now": send_now,
-})
+- **Outbound allowlist** (`outbound_allowlist.py`): every recipient must be on it. The connector checks the final recipients again at dispatch.
+- **Rate limit** (`check_rate_limit`): the `sends` tier, 3 per 60 seconds.
+- **Confirmation** (`confirm_send`): the user is asked, unless every recipient is on the allowlist.
+- **Test mode** (`check_test_mode_safety`, only with `MAIL_TEST_MODE=true`): the test account only, and recipients on RFC 2606 reserved domains or the `MAIL_TEST_LOOPBACK` address.
 
-# Operation logging
-operation_logger.log_operation("create_draft", params, "success")
-```
+A send that goes out is recorded in the audit log under the tool's name, with its recipients and subject and never its body.
 
 ### Bulk Operation Limits
 
@@ -279,10 +270,11 @@ script = f"tell application 'Mail' to {user_command}"  # NEVER DO THIS
 
 #### 3. Implement Rate Limiting
 
+Give the tool a tier under its own name in `OPERATION_TIERS`, and check it before acting:
+
 ```python
-# Prevent abuse
-if not rate_limit_check("create_draft", window_seconds=60, max_operations=10):
-    return {"success": False, "error": "Rate limit exceeded"}
+if refused := check_rate_limit("draft_send", {"draft_id": draft_id}):
+    return refused  # error_type "rate_limited"
 ```
 
 #### 4. Log Everything

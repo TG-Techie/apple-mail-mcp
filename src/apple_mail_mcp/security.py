@@ -167,6 +167,8 @@ TIER_LIMITS: dict[str, tuple[int, float]] = {
     "sends": (3, 60.0),
 }
 
+# The rate-limit tier of each tool, keyed by the tool's name: one entry
+# per registered tool, and no other.
 OPERATION_TIERS: dict[str, str] = {
     "list_accounts": "cheap_reads",
     "list_rules": "cheap_reads",
@@ -183,15 +185,17 @@ OPERATION_TIERS: dict[str, str] = {
     "delete_rule": "expensive_ops",
     "create_rule": "expensive_ops",
     "update_rule": "expensive_ops",
-    # Drafts lifecycle (#134) — create_draft / update_draft tier under
-    # "sends" because their gate chain only fires on send_now=True
-    # (which is the actual send action). delete_draft tiers under
-    # expensive_ops for parity with the other CRUD-style mutations.
-    "create_draft": "sends",
-    "update_draft": "sends",
-    "delete_draft": "expensive_ops",
+    # Drafts. draft_create and draft_update write a draft into an account
+    # through Mail, a compose window and its attachments; draft_delete
+    # removes one. They change Mail's state like the mutations above.
+    # draft_send is the one send from a draft.
+    "draft_create": "expensive_ops",
+    "draft_update": "expensive_ops",
+    "draft_delete": "expensive_ops",
+    "draft_send": "sends",
     "email_send_html": "sends",
-    # Email templates (#30) — local file I/O only, never touches Mail.app.
+    # Email templates (#30): local files under the data home, except that
+    # render_template also reads the message it fills variables from.
     "list_templates": "cheap_reads",
     "get_template": "cheap_reads",
     "save_template": "cheap_reads",
@@ -327,14 +331,17 @@ ACCOUNT_GATED_OPERATIONS = {
     "create_mailbox",
     "update_mailbox",
     "delete_mailbox",
-    # The sender the caller names (from_account): a draft saved into that
-    # account's Drafts, or mail sent under it. A sender left to Mail's
-    # default is not confined here — the fresh send path cannot name one.
-    "create_draft",
-    "update_draft",
+    # The sender the caller names (from_account): the account a draft is
+    # saved into, or mail is sent under. A sender left to Mail's default
+    # is not confined here — the fresh send path cannot name one.
+    "draft_create",
     "email_send_html",
-    # The account the draft named by id sits in.
-    "delete_draft",
+    # The account the draft named by id sits in, which each of these
+    # reads back from Mail before acting. draft_update also passes the
+    # sender it is asked to move the draft to.
+    "draft_update",
+    "draft_delete",
+    "draft_send",
 }
 
 # Of those, the ones that change mail and can be called without naming an
@@ -347,20 +354,19 @@ ACCOUNT_REQUIRED_MUTATIONS = {
     # A draft id likewise names a draft in any account. The tools read the
     # draft's account back from Mail and pass it; one Mail cannot name (a
     # local draft) is not the test account.
-    "update_draft",
-    "delete_draft",
+    "draft_update",
+    "draft_delete",
+    "draft_send",
 }
 
-# Every operation that delivers mail. In test mode each is confined to
-# RFC 2606 reserved domains and the loopback address, and must name its
-# recipients explicitly.
-# create_draft / update_draft are sends only when send_now=True; the
-# server-tool wrappers call check_test_mode_safety with the full
-# recipient list whenever send_now is in play. A tool added later that
-# sends belongs here, or test mode never sees where its mail goes.
+# Every operation that delivers mail; every call to one sends. In test
+# mode each is confined to RFC 2606 reserved domains and the loopback
+# address, and must pass every recipient explicitly: draft_send those it
+# reads back from the draft, email_send_html those it was given. A tool
+# added later that sends belongs here, or test mode never sees where its
+# mail goes.
 SEND_OPERATIONS = {
-    "create_draft",
-    "update_draft",
+    "draft_send",
     "email_send_html",
 }
 
@@ -487,15 +493,15 @@ def check_test_mode_safety(
     - Account-gated operations must target MAIL_TEST_ACCOUNT.
     - delete_messages and update_message must name the test account;
       with no account they would act on message ids from any account.
-      delete_draft and update_draft likewise: the tools pass the account
-      the draft was found in, and a draft with none is refused.
-    - Send operations, on a call that sends, must send only to RFC 2606
-      reserved domains or to the one address MAIL_TEST_LOOPBACK names,
-      and must name every recipient. ``recipients``
-      says whether the call sends: None means nothing is sent by this
-      call (a draft being saved, checked here for its account only);
-      a list, even an empty one, means a send, and an empty one is a
-      send whose recipients Mail would derive, which is refused.
+      draft_update, draft_delete and draft_send likewise: the tools pass
+      the account the draft was found in, and a draft with none is
+      refused.
+    - Send operations must send only to RFC 2606 reserved domains or to
+      the one address MAIL_TEST_LOOPBACK names, and must name every
+      recipient in ``recipients``. Every call to one sends, so a call
+      with no recipients is refused, whether it passes an empty list (a
+      send whose recipients Mail would derive) or None (which leaves
+      this gate nothing to check).
     - Rule-mutation operations must target rules whose names start with
       RULE_TEST_PREFIX (protects the user's real rules during integration
       testing), and a rule that forwards may forward only to RFC 2606
@@ -546,13 +552,11 @@ def check_test_mode_safety(
             )
 
     # Send operations: verify every recipient is one test mode admits.
-    if operation in SEND_OPERATIONS and recipients is not None:
-        # #175: empty recipients in test mode is unsafe — an implicit-reply
-        # send_now path (no explicit to/cc/bcc) lets Mail.app derive
-        # recipients at send time, bypassing the reserved-domain gate.
-        # Force explicit recipients so the safety check has something to
-        # validate. Catches the v0.7.0 analog of the v0.6 reply_to_message
-        # block that was dropped in #134's drafts-lifecycle consolidation.
+    if operation in SEND_OPERATIONS:
+        # #175: a send with no explicit recipients (a reply left to Mail)
+        # has them derived at send time, past this gate, so test mode
+        # requires them explicit; with none passed at all there is nothing
+        # here to check.
         if not recipients:
             return _safety_error(
                 operation,
