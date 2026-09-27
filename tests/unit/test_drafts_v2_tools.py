@@ -1762,3 +1762,72 @@ class TestEachDraftToolAnswersToItsOwnName:
         assert "sends" in result["error"]
         assert self._logged() == [("draft_send", "rate_limited")]
         mock_mail.create_draft.assert_not_called()
+
+    @staticmethod
+    def _fill_expensive_ops(leave: int = 0) -> None:
+        from apple_mail_mcp.security import TIER_LIMITS, rate_limiter
+
+        for _ in range(TIER_LIMITS["expensive_ops"][0] - leave):
+            assert rate_limiter.check("expensive_ops")
+
+    def test_draft_create_is_rate_limited_before_the_test_mode_gate(
+        self, isolated_drafts: None, mock_mail: MagicMock, test_mode: None,
+    ) -> None:
+        """The rate limit is the first gate: with the tier full, a call
+        test mode would also refuse is refused as rate-limited."""
+        from apple_mail_mcp.tools.drafts import draft_create
+
+        self._fill_expensive_ops()
+        result = draft_create(
+            to=["alice@example.com"], subject="s", body="b", from_account="Other",
+        )
+        assert result["error_type"] == "rate_limited"
+        assert "expensive_ops" in result["error"]
+        assert self._logged() == [("draft_create", "rate_limited")]
+        mock_mail.create_draft.assert_not_called()
+
+    def test_draft_update_is_rate_limited_before_the_draft_is_read(
+        self, isolated_drafts: None, mock_mail: MagicMock,
+    ) -> None:
+        from apple_mail_mcp.tools.drafts import draft_update
+
+        self._fill_expensive_ops()
+        result = draft_update(draft_id="OLD", body="revised")
+        assert result["error_type"] == "rate_limited"
+        assert "expensive_ops" in result["error"]
+        assert self._logged() == [("draft_update", "rate_limited")]
+        mock_mail.get_draft_state.assert_not_called()
+        mock_mail.create_draft.assert_not_called()
+
+    def test_draft_delete_is_rate_limited_before_the_draft_is_read(
+        self, isolated_drafts: None, mock_mail: MagicMock,
+    ) -> None:
+        from apple_mail_mcp.tools.drafts import draft_delete
+
+        self._fill_expensive_ops()
+        result = draft_delete(draft_id="OLD")
+        assert result["error_type"] == "rate_limited"
+        assert "expensive_ops" in result["error"]
+        assert self._logged() == [("draft_delete", "rate_limited")]
+        mock_mail.get_draft_state.assert_not_called()
+        mock_mail.delete_draft.assert_not_called()
+
+    @pytest.mark.parametrize("tool", ["draft_create", "draft_update", "draft_delete"])
+    def test_a_call_takes_one_expensive_ops_slot(
+        self, tool: str, isolated_drafts: None, mock_mail: MagicMock,
+    ) -> None:
+        from apple_mail_mcp.security import rate_limiter
+        from apple_mail_mcp.tools import drafts
+
+        mock_mail.get_draft_state.return_value = self._state("TestAccount")
+        mock_mail.create_draft.return_value = {"draft_id": "NEW", "sent_message_id": ""}
+        calls = {
+            "draft_create": lambda: drafts.draft_create(
+                to=["alice@example.com"], subject="s", body="b",
+            ),
+            "draft_update": lambda: drafts.draft_update(draft_id="OLD", body="v2"),
+            "draft_delete": lambda: drafts.draft_delete(draft_id="OLD"),
+        }
+        self._fill_expensive_ops(leave=1)
+        assert calls[tool]()["success"] is True
+        assert rate_limiter.check("expensive_ops") is False

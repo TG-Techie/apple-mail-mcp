@@ -945,6 +945,9 @@ draft_create(reply_to="160989", template_name="thanks-for-meeting")
 - `draft_not_settled`: Mail accepted the save but the new draft had not
   appeared in Drafts within 10 s, so there is no id to return. Look for
   the draft in Mail.app before saving again.
+- `rate_limited`: more than 20 calls in 60 s to the `expensive_ops`
+  tier, which draft saves, updates and deletes share with searches and
+  the other mutations.
 - `applescript_error`, `unknown`: Lower-level failures.
 
 ---
@@ -1053,6 +1056,7 @@ do the same.
 
 - `draft_not_found`: `draft_id` doesn't match any existing draft.
 - `invalid_draft_id`: `draft_id` failed validation.
+- `rate_limited`: the `expensive_ops` tier is full, as for `draft_create`.
 
 ---
 

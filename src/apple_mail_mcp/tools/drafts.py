@@ -510,6 +510,8 @@ def draft_create(
         >>> draft_send(draft_id="ABCD")
         {"success": True, "sent_message_id": ""}
     """
+    if refused := check_rate_limit("draft_create", {"subject": subject, "to": to}):
+        return refused
     if reply_to and forward_of:
         raise ValueError("reply_to and forward_of are mutually exclusive")
     if template_vars and not template_name:
@@ -622,6 +624,8 @@ def draft_update(
         >>> r["draft_id"]   # different from "ABCD"!
         'EFGH'
     """
+    if refused := check_rate_limit("draft_update", {"draft_id": draft_id}):
+        return refused
     if template_vars and not template_name:
         raise ValueError("template_vars requires template_name")
     state = server.mail.get_draft_state(draft_id)
@@ -702,8 +706,8 @@ def draft_update(
 def draft_delete(draft_id: str) -> dict[str, Any]:
     """Delete (move to Trash) an existing draft. No send, no recovery
     expected — Mail.app moves the draft to Deleted Messages and no longer
-    treats it as editable. No confirmation (recoverable from Trash) and
-    no rate limit (local operation).
+    treats it as editable. No confirmation (recoverable from Trash). It
+    drives Mail, so it is rate-limited with the other mutations.
 
     Args:
         draft_id: Existing draft to delete.
@@ -712,6 +716,8 @@ def draft_delete(draft_id: str) -> dict[str, Any]:
         ``{"success": True, "draft_id": "<id>"}`` on a clean delete; an
         error response if the draft does not exist.
     """
+    if refused := check_rate_limit("draft_delete", {"draft_id": draft_id}):
+        return refused
     # A draft id names a draft in any account; read which before
     # acting, so test mode can keep the delete in the test account.
     state = server.mail.get_draft_state(draft_id)
