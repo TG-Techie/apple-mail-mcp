@@ -277,6 +277,7 @@ class TestAFreshSendNamesItsSenderAndCarriesFiles:
         kwargs = mock_mail._send_html_email.call_args.kwargs
         assert kwargs["from_account"] == "Work"
         assert kwargs["reply_to"] is None
+        assert kwargs["forward_of"] is None
 
     @pytest.mark.asyncio
     async def test_email_send_html_reply_still_honours_it(
@@ -1259,28 +1260,35 @@ class TestDraftSendHtml:
         mock_mail._send_html_email.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_attachments_with_reply_to_unsupported(
+    async def test_attachments_on_a_reply_reach_the_connector(
         self,
         isolated_drafts: None,
         mock_mail: MagicMock,
         tmp_path: Any,
     ) -> None:
-        """reply_to + attachments is explicitly unsupported for now —
-        clear validation error, no connector call, nothing sent."""
+        """A reply carries files as a fresh message does. It was refused
+        while the reply's files would have gone in through the
+        dictionary, which cost a reply its quote (measured 2026-09-27,
+        docs/research/icloud-draft-resync.md, Observation 11); every
+        seed's files are pasted after Mail's part now."""
         from apple_mail_mcp.tools.send import email_send_html
 
         f = tmp_path / "a.txt"
         f.write_text("x")
+        mock_mail._send_html_email.return_value = {
+            "draft_id": "", "sent_message_id": ""
+        }
         result = await email_send_html(
             to=["alice@example.com"],
             body="<p>b</p>",
             reply_to="12345",
             attachment_paths=[str(f)],
         )
-        assert result["success"] is False
-        assert result["error_type"] == "validation_error"
-        assert "replies" in result["error"]
-        mock_mail._send_html_email.assert_not_called()
+        assert result["success"] is True, result
+        kwargs = mock_mail._send_html_email.call_args.kwargs
+        assert kwargs["reply_to"] == "12345"
+        assert kwargs["forward_of"] is None
+        assert kwargs["attachment_paths"] == [Path(str(f))]
 
     @pytest.mark.asyncio
     async def test_email_send_html_calls_connector(
@@ -1329,6 +1337,125 @@ class TestDraftSendHtml:
         assert result["success"] is False
         assert result["error_type"] == "outbound_disallowed"
         mock_mail._send_html_email.assert_not_called()
+
+
+class TestEmailSendHtmlForwards:
+    """``email_send_html(forward_of=...)`` forwards: Mail's own forward
+    of the message, with the HTML above it. Until it did, a "forward"
+    through this tool was a fresh message with the original pasted into
+    its body (2026-09-26), which is not a forward: no forwarded-message
+    block from Mail, none of the original's files."""
+
+    @pytest.fixture
+    def sent(self, mock_mail: MagicMock) -> MagicMock:
+        mock_mail._send_html_email.return_value = {
+            "draft_id": "", "sent_message_id": ""
+        }
+        return mock_mail
+
+    @pytest.mark.asyncio
+    async def test_a_forward_reaches_the_connector_as_one(
+        self, isolated_drafts: None, sent: MagicMock, tmp_path: Path
+    ) -> None:
+        """No subject is needed: Mail derives "Fwd: …". Files go with it."""
+        from apple_mail_mcp.tools.send import email_send_html
+
+        f = tmp_path / "mine.txt"
+        f.write_text("x")
+        result = await email_send_html(
+            forward_of="msg-1", to=["alice@example.com"], body="<p>fyi</p>",
+            attachment_paths=[str(f)], from_account="Work",
+        )
+        assert result == {"success": True, "draft_id": "", "sent_message_id": ""}
+        kwargs = sent._send_html_email.call_args.kwargs
+        assert kwargs["forward_of"] == "msg-1"
+        assert kwargs["reply_to"] is None
+        assert kwargs["to"] == ["alice@example.com"]
+        assert kwargs["subject"] == ""
+        assert kwargs["from_account"] == "Work"
+        assert kwargs["attachment_paths"] == [f]
+
+    @pytest.mark.asyncio
+    async def test_a_forward_names_its_recipients(
+        self, isolated_drafts: None, sent: MagicMock
+    ) -> None:
+        """Mail derives no recipient for a forward, so there is no one to
+        send it to unless the caller says."""
+        from apple_mail_mcp.tools.send import email_send_html
+
+        result = await email_send_html(forward_of="msg-1", body="<p>fyi</p>")
+        assert result["success"] is False
+        assert result["error_type"] == "validation_error"
+        assert "'to' is required" in result["error"]
+        sent._send_html_email.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_reply_and_a_forward_at_once_are_refused(
+        self, isolated_drafts: None, sent: MagicMock
+    ) -> None:
+        from apple_mail_mcp.tools.send import email_send_html
+
+        result = await email_send_html(
+            reply_to="msg-1", forward_of="msg-2", to=["alice@example.com"],
+            body="<p>b</p>",
+        )
+        assert result["success"] is False
+        assert result["error_type"] == "validation_error"
+        assert "mutually exclusive" in result["error"]
+        sent._send_html_email.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_forwards_files_meet_the_send_checks(
+        self, isolated_drafts: None, sent: MagicMock, tmp_path: Path
+    ) -> None:
+        from apple_mail_mcp.tools.send import email_send_html
+
+        f = tmp_path / "installer.exe"
+        f.write_bytes(b"MZ")
+        result = await email_send_html(
+            forward_of="msg-1", to=["alice@example.com"], body="<p>b</p>",
+            attachment_paths=[str(f)],
+        )
+        assert result["success"] is False
+        assert result["error_type"] == "validation_error"
+        assert "installer.exe" in result["error"]
+        sent._send_html_email.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_an_off_list_forward_recipient_is_refused(
+        self, isolated_drafts: None, sent: MagicMock
+    ) -> None:
+        from apple_mail_mcp.tools.send import email_send_html
+
+        result = await email_send_html(
+            forward_of="msg-1", to=["random@other.com"], body="<p>b</p>",
+        )
+        assert result["success"] is False
+        assert result["error_type"] == "outbound_disallowed"
+        sent._send_html_email.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_forward_is_put_to_the_user_as_a_forward(
+        self,
+        isolated_drafts: None,
+        sent: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """What the user is asked to confirm says what is being sent."""
+        from apple_mail_mcp.tools import send
+
+        asked: list[str] = []
+
+        def confirm(ctx: Any, op: str, rcpts: list[str], summary: str,
+                    extra: dict[str, Any]) -> None:
+            asked.append(summary)
+
+        monkeypatch.setattr(send, "confirm_send", confirm)
+        result = await send.email_send_html(
+            forward_of="msg-1", to=["alice@example.com"], body="<p>b</p>",
+        )
+        assert result["success"] is True, result
+        assert asked and asked[0].startswith("Forward this message?")
 
 
 class TestEmailSendHtmlIsConfinedInTestMode:

@@ -4015,15 +4015,16 @@ class AppleMailConnector:
         return resolved
 
     @staticmethod
-    def _validate_create_draft_args(
+    def _validate_compose_args(
         seed: str,
         seed_id: str | None,
         to: list[str] | None,
         subject: str | None,
     ) -> None:
-        """Validate the per-seed argument requirements of create_draft.
-        Raises ValueError with a specific message on the first violation.
-        (#193)
+        """Validate the per-seed argument requirements of a composition,
+        where a caller's arguments enter the connector (``create_draft``,
+        ``_send_html_email``). Raises ValueError with a specific message
+        on the first violation. (#193)
         """
         if seed not in ("new", "reply", "forward"):
             raise ValueError(
@@ -4597,138 +4598,16 @@ tell application "System Events"
 end tell
 """
 
-    def _send_html_reply(
-        self,
-        *,
-        to: list[str],
-        cc: list[str] | None,
-        bcc: list[str] | None,
-        subject: str,
-        body: str,  # HTML string
-        from_account: str | None,
-        reply_to: str,
-    ) -> dict[str, str]:
-        """Send an HTML reply into an existing thread.
-
-        Two scripts with the outbound-allowlist gate BETWEEN them:
-
-        A. Open the reply compose window (``reply origMsg opening window
-           true`` — Mail carries the threading headers), identify it by
-           window-set diff (never by guessed subject), apply recipient /
-           subject / sender overrides at the scripting-DICTIONARY level
-           (header-only — the ``content`` setter that causes the iOS
-           purple bar is never touched), then read the FINAL recipient
-           set and derived subject back from the outgoing-message model
-           (UI To-field values are display pills, not addresses).
-
-        B. Only if every recipient passes the allowlist: inject the HTML
-           via clipboard paste ABOVE Mail's auto-quoted original
-           (cmd+up first), then the Phase-0 verified send.
-
-        Off-list recipients (including any the caller supplied): hard
-        fail — the compose window is discarded (verified), nothing is
-        pasted or sent, and ``MailOutboundDisallowedError`` names them.
-        There are no allowlist exceptions; ``reply_all`` does not exist —
-        callers wanting it pass the full participant list via ``to``/``cc``
-        explicitly.
-        """
-        seed_id = self._maybe_resolve_rfc_seed_id("reply", reply_to)
-        seed_id_safe = escape_applescript_string(sanitize_input(seed_id or ""))
-
-        def _override_block(kind: str, addrs: list[str] | None) -> str:
-            if not addrs:
-                return ""
-            list_str = ", ".join(
-                f'"{escape_applescript_string(a)}"' for a in addrs
-            )
-            return f"""
-                delete (every {kind} recipient of replyMsg)
-                repeat with addr in {{{list_str}}}
-                    make new {kind} recipient at end of {kind} recipients of replyMsg with properties {{address:addr}}
-                end repeat
-            """
-
-        to_over = _override_block("to", to)
-        cc_over = _override_block("cc", cc)
-        bcc_over = _override_block("bcc", bcc)
-        subject_override = (
-            f'set subject of replyMsg to "{escape_applescript_string(sanitize_input(subject))}"'
-            if subject
-            else ""
-        )
-        sender_clause = ""
-        if from_account is not None:
-            sender_email = self._resolve_account_to_sender(from_account)
-            sender_clause = (
-                f'set sender of replyMsg to '
-                f'"{escape_applescript_string(sanitize_input(sender_email))}"'
-            )
-
-        script_a_body = f"""
-tell application "System Events"
-    tell application process "Mail"
-        set beforeNames to name of windows
-    end tell
-end tell
-tell application "Mail"
-    activate
-    set origMsg to missing value
-    repeat with acc in accounts
-        try
-            repeat with mb in mailboxes of acc
-                try
-                    set origMsg to first message of mb whose id is "{seed_id_safe}"
-                    exit repeat
-                end try
-            end repeat
-        end try
-        if origMsg is not missing value then exit repeat
-    end repeat
-    if origMsg is missing value then error "SEED_NOT_FOUND"
-    set replyMsg to reply origMsg opening window true
-end tell
-{self._as_new_compose_window_block()}
-tell application "Mail"
-    {to_over}
-    {cc_over}
-    {bcc_over}
-    {subject_override}
-    {sender_clause}
-    set toAddrs to address of to recipients of replyMsg
-    if toAddrs is missing value then set toAddrs to {{}}
-    set ccAddrs to address of cc recipients of replyMsg
-    if ccAddrs is missing value then set ccAddrs to {{}}
-    set bccAddrs to address of bcc recipients of replyMsg
-    if bccAddrs is missing value then set bccAddrs to {{}}
-    set resultData to {{|window|:newName, |subject|:(subject of replyMsg as text), |to|:toAddrs, |cc|:ccAddrs, |bcc|:bccAddrs}}
-end tell
-"""
-        raw = self._run_applescript(
-            _wrap_as_json_script(script_a_body, timeout=self.timeout)
-        )
-        meta = cast(dict[str, Any], parse_applescript_json(raw))
-        win_name = str(meta.get("window") or "")
-        derived_subject = str(meta.get("subject") or "")
-        resolved_to = [str(a) for a in (meta.get("to") or [])]
-        resolved_cc = [str(a) for a in (meta.get("cc") or [])]
-        resolved_bcc = [str(a) for a in (meta.get("bcc") or [])]
-
-        self._gate_compose_recipients(
-            win_name, resolved_to, resolved_cc, resolved_bcc
-        )
-        self._paste_verified(window_name=win_name, body=body, placement="above")
-        return self._send_compose_window(win_name, derived_subject)
-
     def _paste_verified(
         self,
         *,
         window_name: str,
         body: str,
         placement: _PastePlacement,
-        plain: bool = False,
+        plain: bool,
     ) -> None:
         """Paste ``body`` into the named compose window at ``placement``
-        and read it back: HTML by default, plain text when ``plain``.
+        and read it back: plain text when ``plain``, HTML otherwise.
 
         The read-back is its own osascript process, since a fresh process
         is the only reliable way to read the post-paste AX tree (within
@@ -4813,6 +4692,28 @@ end tell
                 f"(compose window: {salvage})"
             )
 
+    @staticmethod
+    def _gate_named_recipients(
+        seed: str,
+        to: list[str] | None,
+        cc: list[str] | None,
+        bcc: list[str] | None,
+    ) -> None:
+        """The outbound allowlist on a send's recipients as the caller
+        named them, before Mail is touched; ``MailOutboundDisallowedError``
+        on failure. A reply's group left None is Mail's to fill from the
+        message replied to, which nothing here can see: it is judged with
+        every other recipient once the window holds it
+        (``_gate_compose_recipients``). No other seed derives a recipient,
+        so what it names is everyone it sends to, and it must name
+        someone."""
+        if seed != "reply":
+            assert_recipients_allowed_for_send(to, cc, bcc, seed=seed)
+            return
+        named = [addr for group in (to, cc, bcc) for addr in group or []]
+        if named:
+            assert_recipients_allowed_for_send(named, None, None)
+
     def _gate_compose_recipients(
         self,
         window_name: str,
@@ -4822,9 +4723,10 @@ end tell
     ) -> None:
         """HARD POLICY GATE on the recipients an open compose window will
         send to, as read back from the outgoing-message model after every
-        override. No exceptions. On failure the window is discarded
-        (verified) and ``MailOutboundDisallowedError`` raised, before
-        anything is pasted or sent."""
+        override: those the caller named and those Mail derived. No
+        exceptions. On failure the window is discarded (verified) and
+        ``MailOutboundDisallowedError`` raised, before anything is pasted
+        or sent."""
         try:
             assert_recipients_allowed_for_send(
                 to or None, cc or None, bcc or None, seed="new"
@@ -4869,67 +4771,71 @@ end tell
         from_account: str | None,
         attachment_paths: list[Path] | None = None,
         reply_to: str | None = None,
+        forward_of: str | None = None,
     ) -> dict[str, str]:
         """Send an HTML email at once; no draft is saved first. A fresh
-        message goes through the one composition (``_compose``), a reply
-        into a thread through ``_send_html_reply``. Either way the HTML
-        reaches the compose window by clipboard paste, never through
-        ``content``.
+        message, a reply (``reply_to``) or a forward (``forward_of``),
+        each through the one composition (``_compose``), the HTML pasted
+        into the compose window, never set through ``content``. On a
+        reply or forward it goes above what Mail wrote, which stays as
+        Mail made it: the quoted original, or the forwarded message with
+        its header block and the original's files.
 
         Args:
-            to: List of recipient email addresses.
-            cc: Optional CC recipient list.
-            bcc: Optional BCC recipient list.
-            subject: Email subject line.
-            body: HTML string for the email body.
+            to: Recipient addresses. Required on a fresh message and a
+                forward. On a reply, an empty list keeps the recipients
+                Mail derives from the message replied to; a list replaces
+                them.
+            cc: CC recipients; on a reply, ``None`` keeps Mail's.
+            bcc: BCC recipients.
+            subject: Required on a fresh message. On a reply or forward,
+                ``""`` keeps Mail's "Re: …" or "Fwd: …".
+            body: HTML string for the email body; on a reply or forward
+                an empty one leaves Mail's part as it is.
             from_account: Account name, UUID or one of its addresses to
                 send from; set as the message's sender. ``None`` leaves
                 Mail's default.
-            attachment_paths: Fresh messages only.
-            reply_to: Message id to reply to; enables reply mode.
+            attachment_paths: Files pasted after everything else, on
+                every seed.
+            reply_to: Id of the message to reply to, Mail's own or an RFC
+                5322 Message-ID.
+            forward_of: Id of the message to forward, in the same forms.
+                At most one of ``reply_to`` and ``forward_of``.
 
         Returns:
             ``{"draft_id": "", "sent_message_id": ""}`` on success.
 
         Raises:
-            NotImplementedError: attachments on a reply.
+            ValueError: both ``reply_to`` and ``forward_of``; a fresh
+                message without ``to`` or ``subject``; a body longer than
+                a message body carries.
+            MailMessageNotFoundError: no message has that id.
             MailAccountNotFoundError: ``from_account`` matches no account.
             FileNotFoundError: a listed attachment does not exist.
-            ValueError: the body is longer than a message body carries.
             MailOutboundDisallowedError: a recipient is not on the
-                outbound allowlist.
+                outbound allowlist, or a fresh message or forward names
+                none.
             MailAppleScriptError: a mechanical read-back failed. Nothing
                 was sent, except when the error says the message WAS sent
                 and its Sent copy lacks a file it was sent with.
         """
+        if reply_to is not None and forward_of is not None:
+            raise ValueError("reply_to and forward_of are mutually exclusive")
+        seed, seed_id = (
+            ("reply", reply_to) if reply_to is not None
+            else ("forward", forward_of) if forward_of is not None
+            else ("new", None)
+        )
+        self._validate_compose_args(seed, seed_id, to, subject)
         _refuse_overlong_body(body)
-        if attachment_paths and reply_to is not None:
-            raise NotImplementedError(
-                "HTML replies with attachments are not supported yet — "
-                "the reply compose window comes from Mail's `reply` verb "
-                "and its attachment behavior is unverified. Send the "
-                "attachment in a fresh email_send_html message, or save "
-                "a reply draft via draft_create and send manually from "
-                "Mail.app."
-            )
-        if reply_to is not None:
-            return self._send_html_reply(
-                to=to,
-                cc=cc,
-                bcc=bcc,
-                subject=subject,
-                body=body,
-                from_account=from_account,
-                reply_to=reply_to,
-            )
         return self._compose(
-            seed="new",
-            seed_id=None,
+            seed=seed,
+            seed_id=self._maybe_resolve_rfc_seed_id(seed, seed_id),
             reply_all=False,
-            to=to,
+            to=to or None,
             cc=cc,
             bcc=bcc,
-            subject=subject,
+            subject=subject if seed == "new" else subject or None,
             body=body,
             plain=False,
             attachment_paths=attachment_paths,
@@ -5118,7 +5024,7 @@ end if
             MailAppleScriptError: AppleScript failure, or a mechanical
                 read-back of the compose window failed.
         """
-        self._validate_create_draft_args(seed, seed_id, to, subject)
+        self._validate_compose_args(seed, seed_id, to, subject)
         _refuse_overlong_body(body)
 
         # HARD POLICY GATE — the actual-send enforcement perimeter for the
@@ -5170,9 +5076,9 @@ end if
         send_now: bool,
     ) -> dict[str, str]:
         """The one composition behind every draft the connector saves
-        and every message it sends but the HTML reply
-        (``_send_html_reply``): ``create_draft`` for every seed and both
-        outcomes (``plain``), and a fresh ``_send_html_email`` (HTML).
+        and every message it sends: ``create_draft`` for every seed and
+        both outcomes (``plain``), and ``_send_html_email`` for every
+        seed (HTML).
 
           1. Open a visible compose window (``_open_compose``): a fresh
              message, or Mail's own reply or forward of the seed. Its
@@ -5182,7 +5088,9 @@ end if
              before and after, never guessed from the subject, and the
              subject and recipients it holds are read back.
           2. On a send, those recipients pass the outbound allowlist, or
-             the window is discarded and nothing is pasted.
+             the window is discarded and nothing is pasted. They include
+             any Mail derived for a reply, which this is the first point
+             that can see.
           3. Paste the body and read it back (``_fill_compose``), then the
              files, each seen in the window's AX tree.
           4. Send: the verified send, then the Sent copy must carry every
@@ -5205,8 +5113,9 @@ end if
         left none (docs/research/draft-resave-spike.md).
 
         Checked before anything is composed: on a send, every recipient
-        the caller named passes the outbound allowlist
-        (``MailOutboundDisallowedError``), here as well as at every
+        the caller named passes the outbound allowlist, and a seed that
+        derives none names someone (``_gate_named_recipients``,
+        ``MailOutboundDisallowedError``), here as well as at every
         caller, since the connector is the hard block on a path by which
         mail leaves; every attachment exists (``FileNotFoundError``); and
         ``from_account`` names an account (``MailAccountNotFoundError``).
@@ -5216,9 +5125,7 @@ end if
         the message was in fact sent.
         """
         if send_now:
-            assert_recipients_allowed_for_send(
-                to, cc, bcc, seed=seed, reply_all=reply_all
-            )
+            self._gate_named_recipients(seed, to, cc, bcc)
         files = _existing_files(attachment_paths)
         sender = (
             self._resolve_account_to_sender(from_account)

@@ -435,6 +435,45 @@ class TestAFreshSendNamesItsSenderAndCarriesFiles:
         assert kwargs["from_account"] == "Work <w@example.com>"
 
 
+class TestAnHtmlForwardThroughTheProtocol:
+    """``forward_of`` is a parameter of the tool as a client sees it, and
+    a forward with a file reaches the connector as one. The recipient is
+    allowlisted by a policy of this class's own, so nothing is put to the
+    user to confirm."""
+
+    @pytest.fixture(autouse=True)
+    def _example_com_allowed(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        policy = tmp_path / "comms.yaml"
+        policy.write_text("email:\n  allowed_outbound:\n    - '*@example.com'\n")
+        monkeypatch.setenv("APPLE_MAIL_MCP_COMMS_CONFIG", str(policy))
+
+    async def test_forward_of_is_in_the_tool_schema(self) -> None:
+        schema = (await server.mcp.get_tool("email_send_html")).parameters
+        assert "forward_of" in schema["properties"]
+        assert "forward_of" not in schema.get("required", [])
+
+    async def test_a_forward_with_a_file_reaches_the_connector(
+        self, mock_mail: MagicMock, tmp_path: Path
+    ) -> None:
+        mine = tmp_path / "mine.txt"
+        mine.write_text("mine")
+        mock_mail._send_html_email.return_value = {"draft_id": "", "sent_message_id": ""}
+        result = await server.mcp.call_tool(
+            "email_send_html",
+            {"forward_of": "msg-1", "to": ["a@example.com"],
+             "body": "<p>fyi</p>", "attachment_paths": [str(mine)]},
+        )
+        body = result.structured_content
+        assert body is not None
+        assert body["success"] is True, body
+        kwargs = mock_mail._send_html_email.call_args.kwargs
+        assert kwargs["forward_of"] == "msg-1"
+        assert kwargs["reply_to"] is None
+        assert kwargs["attachment_paths"] == [mine]
+
+
 class TestDraftUpdateInvocation:
     """draft_update is delete-and-recreate, so it needs three connector
     calls stubbed and does not fit the single-method table above."""

@@ -144,35 +144,42 @@ def confirm_send(
     return _confirm_from_threadpool(ctx, summary, operation, elicit_extra)
 
 
-def _validate_html_send_content(
+def _html_send_seed(
     *,
     to: list[str],
     subject: str,
     reply_to: str | None,
+    forward_of: str | None,
     attachment_paths: list[str],
-) -> None:
-    """What may go on an email_send_html message, given which compose path
-    it takes, checked before anything is composed. A fresh message needs
-    its recipients and subject; a reply has Mail derive them. Both set
-    the sender on the message they compose. A fresh message takes
-    attachments; a reply cannot yet, since what Mail's reply verb does
-    with them is unverified. Files that are allowed get the send-path
-    file checks. Anything else raises ValueError.
+) -> str:
+    """Which message an email_send_html call composes: ``"new"``,
+    ``"reply"`` or ``"forward"``, checked, before anything is composed,
+    for what that message needs. A fresh message needs its recipients and
+    subject. A reply has Mail derive both. A forward has Mail derive its
+    subject but no recipient, so it names them. Every one takes files,
+    which get the send-path file checks. Anything else raises ValueError.
     """
-    if reply_to is None and not to:
-        raise ValueError("email_send_html: 'to' is required unless reply_to is given")
-    if reply_to is None and not subject:
+    if reply_to is not None and forward_of is not None:
         raise ValueError(
-            "email_send_html: 'subject' is required unless reply_to is given"
+            "email_send_html: reply_to and forward_of are mutually exclusive"
         )
-    if attachment_paths and reply_to is not None:
+    seed = (
+        "reply" if reply_to is not None
+        else "forward" if forward_of is not None
+        else "new"
+    )
+    if seed != "reply" and not to:
         raise ValueError(
-            "email_send_html: attachments are not supported on replies "
-            "yet. Nothing was sent. Send them in a fresh message, or save "
-            "a reply draft with draft_create and send it from Mail.app."
+            "email_send_html: 'to' is required unless reply_to is given"
+        )
+    if seed == "new" and not subject:
+        raise ValueError(
+            "email_send_html: 'subject' is required unless reply_to or "
+            "forward_of is given"
         )
     if attachment_paths:
         validate_attachment_files(attachment_paths)
+    return seed
 
 
 @_in_tool_threadpool
@@ -186,14 +193,15 @@ def email_send_html(
     bcc: list[str] = [],  # noqa: B006 — coerced below
     from_account: str | None = None,
     reply_to: str | None = None,
+    forward_of: str | None = None,
     attachment_paths: list[str] = [],  # noqa: B006 — coerced below
     ctx: Context | None = None,
 ) -> dict:
     """Send an HTML email directly. Does not save a draft first.
 
-    This is the PREFERRED send tool — use it for fresh mail and replies
-    unless a human wants to review the draft in Mail.app first (then use
-    ``draft_create`` + ``draft_send``).
+    This is the PREFERRED send tool — use it for fresh mail, replies and
+    forwards unless a human wants to review the draft in Mail.app first
+    (then use ``draft_create`` + ``draft_send``).
 
     Body must be an HTML string. The email is composed via clipboard injection
     into Mail.app's rich-text compose window and sent immediately, with
@@ -208,6 +216,13 @@ def email_send_html(
     to the derived "Re: …" and ``to`` defaults to Mail's derived reply
     recipients. The pasted HTML lands ABOVE the auto-quoted original.
 
+    **Forward**: pass ``forward_of=<message_id>`` (same id forms) and ``to``,
+    which is required: Mail derives no recipient for a forward. ``subject``
+    defaults to Mail's "Fwd: …". The HTML lands ABOVE Mail's forwarded
+    message, which keeps its header block and the original's attachments.
+    Never forward by pasting a message into a fresh one: that is not a
+    forward.
+
     **Reply-all**: there is no reply_all flag. Fetch the thread participants
     (``get_thread`` / ``get_messages``) and pass them explicitly via
     ``to``/``cc`` — every recipient is validated against the outbound
@@ -217,20 +232,23 @@ def email_send_html(
     Args:
         to: Recipient email addresses. Optional when ``reply_to`` is given
             (Mail derives them; explicit values REPLACE the derived set).
-        subject: Email subject line. Optional when ``reply_to`` is given.
+        subject: Email subject line. Optional with ``reply_to`` or
+            ``forward_of``.
         body: HTML string for the email body.
         cc: Optional CC recipients (replace derived CC when replying).
         bcc: Optional BCC recipients.
-        attachment_paths: Optional file paths to attach (fresh mail only —
-            not supported with ``reply_to`` yet). Files must exist, must
-            not carry executable extensions, and must be under 25MB each.
-            The send is verified end-to-end: each attachment must be
-            visible in the compose window before Send is clicked, and the
-            Sent-mailbox copy is checked for the attachment count.
+        attachment_paths: Optional file paths to attach, in every mode;
+            on a reply or forward they go after Mail's quote or forwarded
+            message. Files must exist, must not carry executable
+            extensions, and must be under 25MB each. Each must be visible
+            in the compose window before Send is clicked, and the
+            Sent-mailbox copy is checked for every file by name.
         from_account: Mail.app account name or UUID. None uses Mail's
-            default. Set as the sender of the message composed, fresh
-            or reply.
+            default. Set as the sender of the message composed, in every
+            mode.
         reply_to: Message id to reply to. Enables reply mode.
+        forward_of: Message id to forward. Enables forward mode; mutually
+            exclusive with ``reply_to``.
 
     Returns:
         ``{"success": True, "draft_id": "", "sent_message_id": ""}`` on success.
@@ -240,8 +258,8 @@ def email_send_html(
     attachment_paths = attachment_paths or []
     all_recipients = list(to) + list(cc_list) + list(bcc_list)
 
-    _validate_html_send_content(
-        to=to, subject=subject, reply_to=reply_to,
+    seed = _html_send_seed(
+        to=to, subject=subject, reply_to=reply_to, forward_of=forward_of,
         attachment_paths=attachment_paths,
     )
     # A reply that names no recipients leaves the list empty here: Mail
@@ -256,8 +274,7 @@ def email_send_html(
     if refused := check_rate_limit("email_send_html", {"subject": subject, "to": to}):
         return refused
     summary = build_send_summary(
-        "reply" if reply_to is not None else "new",
-        to, cc_list or None, bcc_list or None, subject, body,
+        seed, to, cc_list or None, bcc_list or None, subject, body,
     )
     if refused := confirm_send(
         ctx, "email_send_html", all_recipients, summary,
@@ -273,6 +290,7 @@ def email_send_html(
         body=body,
         from_account=from_account,
         reply_to=reply_to,
+        forward_of=forward_of,
         attachment_paths=[Path(a) for a in attachment_paths] or None,
     )
     operation_logger.log_operation(
@@ -284,6 +302,7 @@ def email_send_html(
             "subject": subject,
             "from_account": from_account,
             "reply_to": reply_to,
+            "forward_of": forward_of,
         },
         "success",
     )

@@ -4895,9 +4895,9 @@ class TestAttachmentPropertyGuards:
 
 class TestComposition:
     """The one composition behind every draft the connector saves and
-    every message it sends but the HTML reply (``_compose``): the window
-    it opens (``_build_open_compose_script``), and the paste placements
-    it and the HTML reply use. Each pin is a measurement: the loopback
+    every message it sends (``_compose``): the window it opens
+    (``_build_open_compose_script``), and the paste placements it
+    uses. Each pin is a measurement: the loopback
     read-back of 2026-09-27 (docs/research/icloud-draft-resync.md,
     Observation 10), the re-save spike of the same day
     (docs/research/draft-resave-spike.md), or the paste-focus failure of
@@ -7120,26 +7120,23 @@ class TestSendHtmlEmail:
                 from_account=None,
             )
 
-    def test_html_reply_with_attachments_raises(
+    def test_a_reply_and_a_forward_at_once_are_refused(
         self, connector: AppleMailConnector
     ) -> None:
-        """reply_to + attachment_paths raises NotImplementedError
-        immediately, before any AppleScript is called. (Fresh sends with
-        attachments are supported — TestSendHtmlWithAttachments.)"""
-        called: list[bool] = []
-        connector._run_applescript = lambda _: (called.append(True), "SENT")[1]  # type: ignore[method-assign]
-        with pytest.raises(NotImplementedError):
+        """One message is one seed: refused before any AppleScript."""
+        captured = _scripted(connector, ["unused"])
+        with pytest.raises(ValueError, match="mutually exclusive"):
             connector._send_html_email(
                 to=["test@example.com"],
                 cc=None,
                 bcc=None,
-                subject="Hi",
+                subject="",
                 body="<p>x</p>",
                 from_account=None,
                 reply_to="12345",
-                attachment_paths=[Path("/tmp/file.pdf")],
+                forward_of="67890",
             )
-        assert not called, "_run_applescript must not be called for reply+attachments"
+        assert captured == []
 
     def test_html_fresh_names_its_sender(
         self, connector: AppleMailConnector
@@ -7412,6 +7409,14 @@ def _overlong_html_reply(c: AppleMailConnector) -> None:
     )
 
 
+def _overlong_html_forward(c: AppleMailConnector) -> None:
+    """By RFC Message-ID, which is looked up in Mail unless refused first."""
+    c._send_html_email(
+        to=["a@example.com"], cc=None, bcc=None, subject="",
+        body="x" * _OVERLONG, from_account=None, forward_of="abc@example.com",
+    )
+
+
 def _overlong_fresh_plain_send(c: AppleMailConnector) -> None:
     c.create_draft(
         seed="new", to=["a@example.com"], subject="s",
@@ -7442,9 +7447,9 @@ def _overlong_forward_note_sent(c: AppleMailConnector) -> None:
 class TestAnOverlongBodyIsRefusedNotCut:
     """``sanitize_input`` cuts at SANITIZE_MAX_LENGTH without a word, and
     every body a caller hands the connector passes through it on its way
-    to a paste (a fresh draft or send, an HTML reply, a note above a reply
-    or forward). A longer body is refused, on every path, with one
-    message, before anything is composed or looked up."""
+    to a paste (a fresh draft or send, an HTML reply or forward, a note
+    above a reply or forward). A longer body is refused, on every path,
+    with one message, before anything is composed or looked up."""
 
     @pytest.fixture
     def connector(self) -> AppleMailConnector:
@@ -7455,6 +7460,7 @@ class TestAnOverlongBodyIsRefusedNotCut:
         [
             _overlong_fresh_html,
             _overlong_html_reply,
+            _overlong_html_forward,
             _overlong_fresh_plain_send,
             _overlong_fresh_saved_draft,
             _overlong_reply_note,
@@ -7836,172 +7842,276 @@ class TestMailAutomationLock:
             holder.wait()
 
 
-class TestSendHtmlReply:
-    """Phases 1–3 of PLAN-html-reply-send: HTML replies via
-    ``_send_html_email(reply_to=...)``.
+class TestHtmlReplyAndForward:
+    """``_send_html_email(reply_to=...)`` and ``(forward_of=...)``: the one
+    composition (``_compose``) on Mail's own reply or forward window, the
+    HTML pasted above what Mail wrote and the files after it. Until
+    2026-09-27 the HTML reply had a composition of its own, which took no
+    files, and there was no HTML forward: the "forward" of 2026-09-26 was
+    a fresh message with the original pasted into it.
 
-    Flow contract (two scripts + Python policy gate between them):
-      A. open the reply compose window (`reply origMsg opening window true`),
-         identify it by window-set diff, apply recipient overrides at the
-         scripting-dictionary level, return {window, subject, to, cc} JSON.
-      B. inject HTML above Mail's auto-quote (cmd+up before paste) and run
-         the verified-send block.
-    The outbound allowlist gate runs in Python on the recipients script A
-    read back from the outgoing-message MODEL (not UI pills). Off-list →
-    hard fail, discard the compose window, send nothing. No exceptions.
+    The outbound allowlist is met twice: on the recipients the caller
+    names, before any AppleScript; and on the recipients the window
+    holds, read back from the outgoing-message model after every
+    override, which include those Mail derived for a reply. Off-list at
+    the second, the window is discarded, and nothing is pasted or sent.
     """
 
     @pytest.fixture
     def connector(self) -> AppleMailConnector:
         return AppleMailConnector(timeout=30)
 
-    _REPLY_META = (
-        '{"window": "Re: Probe", "subject": "Re: Probe", '
-        '"to": ["alice@example.com"], "cc": []}'
-    )
+    _BODY = "<p>html above <b>what Mail wrote</b></p>"
+    _WINDOW = {"reply": "Re: Probe", "forward": "Fwd: Probe"}
 
-    def _run_reply(
+    def _send(
         self,
         connector: AppleMailConnector,
+        seed: str,
         *,
-        meta: str | None = None,
         to: list[str] | None = None,
         subject: str = "",
+        body: str = _BODY,
+        files: list[Path] | None = None,
+        from_account: str | None = None,
+        seed_id: str = "12345",
+        outcomes: list[str] | None = None,
     ) -> list[str]:
-        scripts: list[str] = []
-        outcomes = [
-            meta or self._REPLY_META,
-            "PASTED_UNVERIFIED",
-            "padding reply body padding",  # read-back sees the pasted text
-            "SENT",
-        ]
-
-        def fake_run(script: str) -> str:
-            scripts.append(script)
-            return outcomes[min(len(scripts) - 1, len(outcomes) - 1)]
-
-        connector._run_applescript = fake_run  # type: ignore[method-assign]
-        connector._send_html_email(
-            to=to or [],
+        """Send an HTML reply or forward against a well-behaved Mail and
+        return the scripts it ran: open, paste, read-back, then (with
+        files) the file paste and its check, the verified send and (with
+        files) the Sent copy's file names."""
+        if outcomes is None:
+            outcomes = _compose_outcomes(
+                body, window=self._WINDOW[seed], seed=seed,
+                file_names=[f.name for f in files or []],
+            )
+        captured = _scripted(connector, outcomes)
+        mode = {"reply_to": seed_id} if seed == "reply" else {"forward_of": seed_id}
+        result = connector._send_html_email(
+            to=["a@example.com"] if to is None else to,
             cc=None,
             bcc=None,
             subject=subject,
-            body="<p>reply body</p>",
-            from_account=None,
-            reply_to="12345",
+            body=body,
+            from_account=from_account,
+            attachment_paths=files,
+            **mode,
         )
-        return scripts
+        assert result == {"draft_id": "", "sent_message_id": ""}
+        return captured
 
-    def test_reply_flow_opens_reply_window_and_reads_model(
+    def test_a_reply_opens_mails_reply_window_and_keeps_what_mail_derived(
         self, connector: AppleMailConnector
     ) -> None:
-        scripts = self._run_reply(connector)
-        # meta, paste, read-back (fresh process), verified send.
-        assert len(scripts) == 4
-        script_a = scripts[0]
-        # Cross-account id lookup + reply verb with a VISIBLE window.
-        assert 'whose id is "12345"' in script_a
-        assert "reply origMsg opening window true" in script_a
-        # Window identified by set-diff, not by guessed subject.
-        assert "beforeNames" in script_a
-        # Names are counted, and a new window whose name is already open
-        # is refused: every later step addresses it by name.
-        assert "afterCount > beforeCount" in script_a
-        assert "COMPOSE_WINDOW_NOT_UNIQUE" in script_a
-        # Recipients read from the outgoing-message model, not UI pills.
-        assert "address of to recipients" in script_a
+        """No recipients and no subject given: Mail's own stay, and the
+        window's recipients are read from the model, not the UI."""
+        scripts = self._send(connector, "reply", to=[])
+        assert len(scripts) == 4  # open, paste, read-back, verified send
+        open_s = scripts[0]
+        assert 'whose id is "12345"' in open_s
+        assert "reply origMsg opening window true" in open_s
+        assert "beforeNames" in open_s
+        assert "afterCount > beforeCount" in open_s
+        assert "COMPOSE_WINDOW_NOT_UNIQUE" in open_s
+        assert "address of to recipients of theMessage" in open_s
+        assert "delete (every to recipient of theMessage)" not in open_s
+        assert "set subject of theMessage" not in open_s
+        # A send takes no Drafts snapshot; only a save looks for its draft.
+        assert "set beforeIds to {}" in open_s
 
-    def test_reply_flow_pastes_above_quote_and_verifies_send(
+    def test_a_forward_opens_mails_forward_window_with_its_recipients(
         self, connector: AppleMailConnector
     ) -> None:
-        scripts = self._run_reply(connector)
-        paste_s, send_s = scripts[1], scripts[3]
-        # cmd+up puts the caret above Mail's auto-quoted original.
+        scripts = self._send(connector, "forward", to=["alice@example.com"])
+        open_s = scripts[0]
+        assert 'whose id is "12345"' in open_s
+        assert "forward origMsg opening window true" in open_s
+        assert "make new outgoing message" not in open_s
+        assert "delete (every to recipient of theMessage)" in open_s
+        assert 'repeat with addr in {"alice@example.com"}' in open_s
+
+    @pytest.mark.parametrize("seed", ["reply", "forward"])
+    def test_the_html_goes_above_what_mail_wrote_and_is_sent_verified(
+        self, connector: AppleMailConnector, seed: str
+    ) -> None:
+        """cmd+up, then the paste: never a select-all or a delete, which
+        would take Mail's quote or forwarded message with it. The content
+        is never set, and the window's Send button sends."""
+        scripts = self._send(connector, seed)
+        _, paste_s, readback_s, send_s = scripts
         assert "key code 126 using command down" in paste_s
-        assert 'keystroke "v" using command down' in paste_s
-        # Verified-send landmarks (Phase 0 primitives).
+        assert "public.html" in paste_s
+        assert 'keystroke "a" using command down' not in paste_s
+        assert "key code 51" not in paste_s
+        assert "AXWebArea" in readback_s
         assert "enabled of sendBtn" in send_s
-        assert "sent mailbox" in send_s
+        assert f'set composeSubject to "{self._WINDOW[seed]}"' in send_s
+        assert all("set content" not in s for s in scripts)
 
-    def test_reply_off_list_recipient_hard_fails_and_discards(
+    @pytest.mark.parametrize("seed", ["reply", "forward"])
+    def test_files_go_after_what_mail_wrote_and_are_checked_in_the_sent_copy(
+        self, connector: AppleMailConnector, tmp_path: Path, seed: str
+    ) -> None:
+        """Pasted at the end, never attached through the dictionary: on a
+        reply or forward whose body was untouched, ``make new attachment``
+        sent the original unquoted and dropped a forward's own files
+        (docs/research/icloud-draft-resync.md, Observation 11). The Sent
+        copy must carry the caller's file; a forward's carries the
+        original's as well."""
+        mine = tmp_path / "mine.txt"
+        mine.write_text("mine")
+        outcomes = _compose_outcomes(
+            self._BODY, window=self._WINDOW[seed], seed=seed,
+            file_names=["mine.txt"],
+        )
+        outcomes[-1] = json.dumps(["theirs.pdf", "mine.txt"])
+        scripts = self._send(connector, seed, files=[mine], outcomes=outcomes)
+        assert len(scripts) == 7
+        _, paste_s, _, files_s, verify_s, send_s, names_s = scripts
+        assert "key code 126 using command down" in paste_s
+        assert "writeObjects:fileURLs" in files_s
+        assert mine.resolve().as_posix() in files_s
+        assert "key code 125 using command down" in files_s
+        assert '"mine.txt"' in verify_s
+        assert "click sendBtn" in send_s
+        assert "name of every mail attachment" in names_s
+        assert f'whose subject is "{self._WINDOW[seed]}"' in names_s
+        assert all("make new attachment" not in s for s in scripts)
+
+    @pytest.mark.parametrize("seed", ["reply", "forward"])
+    def test_a_file_missing_from_the_sent_copy_says_it_was_sent(
+        self, connector: AppleMailConnector, tmp_path: Path, seed: str
+    ) -> None:
+        mine = tmp_path / "mine.txt"
+        mine.write_text("mine")
+        outcomes = _compose_outcomes(
+            self._BODY, window=self._WINDOW[seed], seed=seed,
+            file_names=["mine.txt"],
+        )
+        outcomes[-1] = json.dumps(["theirs.pdf"])
+        with pytest.raises(MailAppleScriptError, match="WAS sent"):
+            self._send(connector, seed, files=[mine], outcomes=outcomes)
+
+    def test_derived_recipients_off_the_list_discard_the_window(
         self, connector: AppleMailConnector
     ) -> None:
-        """Derived recipients off the allowlist → MailOutboundDisallowedError,
-        compose window discarded, HTML never pasted, nothing sent."""
-        from apple_mail_mcp.exceptions import MailOutboundDisallowedError
-
-        scripts: list[str] = []
-        meta = (
-            '{"window": "Re: Probe", "subject": "Re: Probe", '
-            '"to": ["evil@other.com"], "cc": []}'
-        )
-
-        def fake_run(script: str) -> str:
-            scripts.append(script)
-            return meta if len(scripts) == 1 else "DISCARDED"
-
-        connector._run_applescript = fake_run  # type: ignore[method-assign]
+        """Mail derived an off-list recipient for the reply: the window is
+        discarded, the HTML never pasted, nothing sent."""
+        meta = _compose_meta("Re: Probe", to=["evil@other.com"])
+        captured = _scripted(connector, [meta, "DISCARDED"])
         with pytest.raises(MailOutboundDisallowedError, match="evil@other.com"):
             connector._send_html_email(
-                to=[],
-                cc=None,
-                bcc=None,
-                subject="",
-                body="<p>x</p>",
-                from_account=None,
-                reply_to="12345",
+                to=[], cc=None, bcc=None, subject="", body="<p>x</p>",
+                from_account=None, reply_to="12345",
             )
-        # Script 2 must be the discard, and no paste/send script ever ran.
-        assert len(scripts) == 2
-        assert "AXCloseButton" in scripts[1]
-        assert all('keystroke "v"' not in s for s in scripts)
+        assert len(captured) == 2
+        assert "AXCloseButton" in captured[1]
+        assert all('keystroke "v"' not in s for s in captured)
 
-    def test_reply_recipient_override_applied_in_model(
-        self, connector: AppleMailConnector
+    @pytest.mark.parametrize("seed", ["reply", "forward"])
+    def test_an_off_list_recipient_the_caller_names_never_reaches_mail(
+        self, connector: AppleMailConnector, seed: str
     ) -> None:
-        """Explicit to= replaces Mail's derived recipients at the
-        scripting-dictionary level (reply-all = caller passes the full
-        participant list explicitly; there is no reply_all parameter)."""
-        meta = (
-            '{"window": "Re: Probe", "subject": "Re: Probe", '
-            '"to": ["alice@example.com", "bob@example.com"], "cc": []}'
-        )
-        scripts = self._run_reply(
-            connector, meta=meta,
-            to=["alice@example.com", "bob@example.com"],
-        )
-        script_a = scripts[0]
-        assert "delete (every to recipient of replyMsg)" in script_a
-        assert "bob@example.com" in script_a
-
-    def test_reply_gate_uses_post_override_recipients(
-        self, connector: AppleMailConnector
-    ) -> None:
-        """The gate judges what script A read back AFTER overrides — an
-        off-list override is caught even though the caller supplied it."""
-        from apple_mail_mcp.exceptions import MailOutboundDisallowedError
-
-        meta = (
-            '{"window": "Re: Probe", "subject": "Re: Probe", '
-            '"to": ["evil@other.com"], "cc": []}'
-        )
-        scripts: list[str] = []
-
-        def fake_run(script: str) -> str:
-            scripts.append(script)
-            return meta if len(scripts) == 1 else "DISCARDED"
-
-        connector._run_applescript = fake_run  # type: ignore[method-assign]
-        with pytest.raises(MailOutboundDisallowedError):
+        mode = {"reply_to": "12345"} if seed == "reply" else {"forward_of": "12345"}
+        captured = _scripted(connector, ["unused"])
+        with pytest.raises(MailOutboundDisallowedError, match="evil@other.com"):
             connector._send_html_email(
-                to=["evil@other.com"],
-                cc=None,
-                bcc=None,
-                subject="",
-                body="<p>x</p>",
-                from_account=None,
-                reply_to="12345",
+                to=["a@example.com"], cc=["evil@other.com"], bcc=None,
+                subject="", body="<p>x</p>", from_account=None, **mode,
             )
+        assert captured == []
+
+    def test_a_forward_to_no_one_never_reaches_mail(
+        self, connector: AppleMailConnector
+    ) -> None:
+        """Mail derives no recipient for a forward: the connector refuses
+        one that names nobody, whatever its caller checked."""
+        captured = _scripted(connector, ["unused"])
+        with pytest.raises(MailOutboundDisallowedError, match="no recipients"):
+            connector._send_html_email(
+                to=[], cc=None, bcc=None, subject="", body="<p>x</p>",
+                from_account=None, forward_of="12345",
+            )
+        assert captured == []
+
+    def test_explicit_recipients_replace_mails_in_the_model(
+        self, connector: AppleMailConnector
+    ) -> None:
+        """There is no reply-all: a caller wanting it names everyone."""
+        outcomes = _compose_outcomes(self._BODY, window="Re: Probe", seed="reply")
+        outcomes[0] = _compose_meta(
+            "Re: Probe", to=["alice@example.com", "bob@example.com"]
+        )
+        scripts = self._send(
+            connector, "reply", to=["alice@example.com", "bob@example.com"],
+            outcomes=outcomes,
+        )
+        open_s = scripts[0]
+        assert "delete (every to recipient of theMessage)" in open_s
+        assert 'repeat with addr in {"alice@example.com", "bob@example.com"}' in open_s
+        assert "reply to all" not in open_s
+
+    @pytest.mark.parametrize("seed", ["reply", "forward"])
+    def test_a_subject_given_replaces_mails(
+        self, connector: AppleMailConnector, seed: str
+    ) -> None:
+        scripts = self._send(connector, seed, subject='Say "hi"')
+        assert 'set subject of theMessage to "Say \\"hi\\""' in scripts[0]
+
+    @pytest.mark.parametrize("seed", ["reply", "forward"])
+    def test_a_named_sender_is_set_last(
+        self, connector: AppleMailConnector, seed: str
+    ) -> None:
+        with patch.object(
+            connector, "_resolve_account_to_sender",
+            return_value="Alice Smith <me@example.com>",
+        ) as resolve:
+            scripts = self._send(connector, seed, from_account="Work")
+        resolve.assert_called_once_with("Work")
+        open_s = scripts[0]
+        sender_at = open_s.index(
+            'set sender of theMessage to "Alice Smith <me@example.com>"'
+        )
+        assert sender_at > open_s.index("opening window true")
+        assert sender_at > open_s.rindex("make new to recipient")
+
+    @pytest.mark.parametrize("seed", ["reply", "forward"])
+    def test_an_rfc_message_id_is_resolved_to_mails_id_first(
+        self, connector: AppleMailConnector, seed: str
+    ) -> None:
+        """Read tools on the IMAP path hand out RFC 5322 Message-IDs as
+        ids (#148); the seed lookup matches Mail's own id (#205)."""
+        with patch.object(
+            connector, "find_message_by_message_id", return_value="4242",
+        ) as find:
+            scripts = self._send(connector, seed, seed_id="<abc@example.com>")
+        find.assert_called_once_with("<abc@example.com>")
+        assert 'whose id is "4242"' in scripts[0]
+
+    def test_an_rfc_message_id_that_matches_nothing_never_reaches_mail(
+        self, connector: AppleMailConnector
+    ) -> None:
+        captured = _scripted(connector, ["unused"])
+        with patch.object(
+            connector, "find_message_by_message_id", return_value=None,
+        ), pytest.raises(MailMessageNotFoundError):
+            connector._send_html_email(
+                to=["a@example.com"], cc=None, bcc=None, subject="",
+                body="<p>x</p>", from_account=None,
+                forward_of="abc@example.com",
+            )
+        assert captured == []
+
+    @pytest.mark.parametrize("seed", ["reply", "forward"])
+    def test_an_empty_body_leaves_mails_part_as_mail_made_it(
+        self, connector: AppleMailConnector, seed: str
+    ) -> None:
+        """Nothing is pasted: the window is opened, gated and sent."""
+        scripts = self._send(connector, seed, body="")
+        assert len(scripts) == 2
+        assert "click sendBtn" in scripts[1]
+        assert all('keystroke "v"' not in s for s in scripts)
 
 
 class TestBulkCrossScanCountsEachIdOnce:
