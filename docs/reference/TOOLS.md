@@ -33,7 +33,7 @@ Search for messages matching specified criteria.
 | `text_contains` | string | No | None | Substring match against headers + body (RFC 3501 `TEXT`). IMAP: server-side `TEXT` predicate. AppleScript: matches `content + subject + sender` (recipients omitted). Same perf characteristics as `body_contains`. |
 
 **Notes:**
-- Returns metadata-only rows (id, subject, sender, date_received, read_status, flagged). For full bodies, pipe the result ids into `get_messages([ids])`.
+- Returns metadata-only rows (id, rfc_message_id, subject, sender, to, cc, bcc, date_received, read_status, flagged; see "Row fields" below). For full bodies, pipe the result ids into `get_messages([ids])`.
 - Malformed `date_from` / `date_to` raise `error_type: validation_error`. Only ISO 8601 YYYY-MM-DD is accepted; relative dates like "7 days ago" are not supported.
 - `has_attachment` is filtered after the initial server-side match because Mail.app rejects attachment predicates inside its `whose` clause.
 - `source=[ids]` (folded-in `get_selected_messages` and the `thread_of` use case) scopes the search to a specific id list. Filter parameters (`sender_contains`, `read_status`, etc.) compose with `source` — the resolved messages are post-filtered. The literal token `"SELECTED"` may appear in the list and is server-resolved to Mail.app's current UI selection (zero-or-more ids); mixed lists like `["SELECTED", "12345"]` are valid. Returns `account: null` and `mailbox: null` in the response. Missing ids drop out silently (partial-results convention).
@@ -49,7 +49,7 @@ When the call commits to the AppleScript path **and** a body/text filter is set,
 
 **Warnings field:**
 
-`search_messages` responses may include an optional `warnings: list[str]` field that surfaces proactive cost concerns before slow paths run. The field is **omitted** when there are no warnings (don't pollute the cheap-call default case). Currently only fires for AppleScript-path body/text search; future detection conditions may extend the mechanism. Example:
+`search_messages` responses may include an optional `warnings: list[str]` field. The field is **omitted** when there are no warnings (don't pollute the cheap-call default case). It fires for AppleScript-path body/text search, surfacing the cost before the slow path runs, and on the AppleScript path for each row whose `to`, `cc` or `bcc` Mail could not read (see "Row fields"). Example:
 
 ```json
 {
@@ -75,6 +75,9 @@ When the call commits to the AppleScript path **and** a body/text filter is set,
       "rfc_message_id": "CABc123@example.com",
       "subject": "Meeting Tomorrow",
       "sender": "john@example.com",
+      "to": ["Jane Doe <jane@example.com>", "team@example.com"],
+      "cc": [],
+      "bcc": [],
       "date_received": "Mon Jan 15 2024 10:30:00",
       "read_status": false,
       "flagged": false
@@ -93,6 +96,10 @@ before treating it as the whole set.
 **Row fields:**
 - `id` — path-native: Mail.app internal numeric id when the AppleScript path runs, RFC 5322 Message-ID when the IMAP path runs. Fast for downstream same-path operations.
 - `rfc_message_id` — RFC 5322 Message-ID (bracketless), or `null` when the message lacks a Message-ID header. Always present, regardless of which path produced the row. Accepted by the IMAP fast paths in `update_message` / `delete_messages` (#149 / #150 / #151 / #152) — the dual-emit means cross-path consumers don't need to know which path generated their input.
+- `to`, `cc`, `bcc` — who the message went to, each a list of strings in the form `sender` uses: `Name <address>` when the header gives a display name, else the bare address. `[]` when the message has none of that kind. Both paths render them with one function, so the same message gives the same lists whichever path built the row, on `search_messages`, `get_messages` and `get_thread` alike.
+  - `bcc` is only ever non-empty on a message the account itself sent: a received message carries no Bcc. Whether a sent copy kept its Bcc is up to the client that saved it.
+  - On the AppleScript path each list is read on its own; one Mail cannot read comes back `[]` with a `warnings` entry naming the list and the message (`cc recipients unreadable for message 12345: ...`). An empty list is "none" only when no such warning names it.
+  - On the IMAP path a group (`team: a@example.com, b@example.com;`) lists its members and not its name, so `undisclosed-recipients:;` lists no one. Display names written as RFC 2047 encoded-words are decoded, as Mail decodes them.
 
 **Examples:**
 
@@ -127,6 +134,12 @@ search_messages(
     read_status=False,
     limit=20
 )
+
+# Check who a sent message went to, from its copy in Sent
+sent = search_messages(account="iCloud", mailbox="Sent Messages",
+                       subject_contains="Q3 report", limit=1)
+row = sent["messages"][0]
+row["to"], row["cc"], row["bcc"]   # read with sent.get("warnings")
 ```
 
 **Error Codes:**
@@ -173,6 +186,9 @@ For accounts configured with IMAP (via `apple-mail-mcp setup-imap --account <nam
       "rfc_message_id": "CABc123@example.com",
       "subject": "Meeting Tomorrow",
       "sender": "john@example.com",
+      "to": ["Jane Doe <jane@example.com>"],
+      "cc": ["ops@example.com"],
+      "bcc": [],
       "date_received": "Mon Jan 15 2024 10:30:00",
       "read_status": false,
       "flagged": true,
@@ -183,7 +199,7 @@ For accounts configured with IMAP (via `apple-mail-mcp setup-imap --account <nam
 }
 ```
 
-Row fields include both `id` (path-native — see `search_messages` for details) and `rfc_message_id` (always RFC 5322 bracketless, or `null` when the message lacks a Message-ID header). The dual-emit (#148) lets cross-path consumers hand the right id to the right tool without needing to know which path produced the row.
+Row fields include both `id` (path-native — see `search_messages` for details) and `rfc_message_id` (always RFC 5322 bracketless, or `null` when the message lacks a Message-ID header). The dual-emit (#148) lets cross-path consumers hand the right id to the right tool without needing to know which path produced the row. `to`, `cc` and `bcc` are as `search_messages` describes them; a list Mail could not read on the AppleScript path is named in the response's `warnings`.
 
 **Examples:**
 
@@ -225,18 +241,20 @@ Return all messages in the thread containing the given anchor message, sorted by
   "thread": [
     {"id": "100", "rfc_message_id": "anchor@x.com",
      "subject": "Q3 Report", "sender": "alice@x.com",
+     "to": ["Bob <bob@x.com>"], "cc": [], "bcc": [],
      "date_received": "Mon Jan 1 2024 10:00:00", "read_status": true, "flagged": false},
     {"id": "101", "rfc_message_id": "reply1@x.com",
      "subject": "Re: Q3 Report", "sender": "bob@x.com",
+     "to": ["alice@x.com"], "cc": [], "bcc": [],
      "date_received": "Mon Jan 1 2024 14:30:00", "read_status": true, "flagged": false}
   ],
   "count": 2
 }
 ```
 
-Row fields include both `id` (path-native — see `search_messages` for details) and `rfc_message_id` (always RFC 5322 bracketless, or `null` when the message lacks a Message-ID header). See `search_messages` for the dual-emit (#148) rationale.
+Row fields include both `id` (path-native — see `search_messages` for details) and `rfc_message_id` (always RFC 5322 bracketless, or `null` when the message lacks a Message-ID header). See `search_messages` for the dual-emit (#148) rationale, and for `to`, `cc` and `bcc`.
 
-Uses the connector's tiered IMAP threading dispatch (Tier 1 X-GM-THRID for Gmail per #122, Tier 3 header-search BFS fallback) when IMAP is configured; falls back to AppleScript otherwise. The AppleScript path prefilters on subject and misses members whose subject was rewritten mid-thread; whenever it is the path that built the result, the response carries a `warnings` list saying so and why IMAP was not used (not configured, failed, or cooling down after a failure). A response without `warnings` came from IMAP.
+Uses the connector's tiered IMAP threading dispatch (Tier 1 X-GM-THRID for Gmail per #122, Tier 3 header-search BFS fallback) when IMAP is configured; falls back to AppleScript otherwise. The AppleScript path prefilters on subject and misses members whose subject was rewritten mid-thread; whenever it is the path that built the result, the response carries a `warnings` list saying so and why IMAP was not used (not configured, failed, or cooling down after a failure), and naming any row whose recipients Mail could not read. A response without `warnings` came from IMAP.
 
 **Examples:**
 

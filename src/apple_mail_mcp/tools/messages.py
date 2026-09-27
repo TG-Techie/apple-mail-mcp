@@ -255,8 +255,11 @@ def search_messages(
 
     Returns:
         Dictionary containing matching messages. Each message row includes
-        id, subject, sender, date_received, read_status, flagged. Rows
-        are metadata-only — call ``get_messages([ids])`` for bodies.
+        id, subject, sender, to, cc, bcc, date_received, read_status,
+        flagged. ``to``/``cc``/``bcc`` are lists of ``Name <address>`` or
+        bare addresses; ``bcc`` is only ever non-empty on mail the account
+        sent. Rows are metadata-only — call ``get_messages([ids])`` for
+        bodies.
 
     Example:
         >>> search_messages("Gmail", sender_contains="john@example.com", read_status=False, limit=10)
@@ -391,7 +394,9 @@ def get_messages(
             for typical id counts.
 
     Returns:
-        Dictionary containing the list of messages and count.
+        Dictionary containing the list of messages and count. Rows carry
+        the ``search_messages`` fields (recipients included) plus
+        ``content`` and, when requested, ``attachments``.
 
     Example:
         >>> get_messages(["12345"], account="iCloud", mailbox="INBOX")
@@ -579,7 +584,8 @@ def get_thread(message_id: str) -> dict[str, Any]:
 
     Returns:
         Dictionary with the thread list. Rows are metadata-only —
-        id, subject, sender, date_received, read_status, flagged.
+        id, subject, sender, to, cc, bcc, date_received, read_status,
+        flagged, as ``search_messages`` returns them.
 
     Example:
         >>> get_thread("12345")

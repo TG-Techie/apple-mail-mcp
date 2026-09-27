@@ -2049,8 +2049,10 @@ class AppleMailConnector:
             mailbox: Folder to look in for the IMAP path. Optional.
 
         Returns:
-            Message dictionary with keys: id, subject, sender,
-            date_received, read_status, flagged, content.
+            Message dictionary with keys: id, rfc_message_id, subject,
+            sender, to, cc, bcc, date_received, read_status, flagged,
+            content; ``warnings`` when there are any, and always with
+            ``attachments``.
 
         Raises:
             MailMessageNotFoundError: Message not found via either path.
@@ -2434,13 +2436,16 @@ class AppleMailConnector:
                 (the anchor). Typically obtained from search_messages or
                 get_message results.
             on_warning: Receives one human-readable string when the
-                result came from the AppleScript path.
+                result came from the AppleScript path, and on that path
+                one for each recipient list of a thread row that could
+                not be read.
 
         Returns:
             List of message dicts sorted by date_received ascending. Each
-            dict has the search_messages shape: id, subject, sender,
-            date_received, read_status, flagged. A thread of 1 is valid
-            (anchor with no threading headers).
+            dict has the search_messages shape: id, rfc_message_id,
+            subject, sender, to, cc, bcc, date_received, read_status,
+            flagged. A thread of 1 is valid (anchor with no threading
+            headers).
 
         Raises:
             MailMessageNotFoundError: If no message with the given id exists.
