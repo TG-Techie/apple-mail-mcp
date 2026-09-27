@@ -6,14 +6,29 @@ fixture in conftest.py handles setup (move BULK_SIZE messages into
 The benchmarks themselves operate on the bench mailbox so test data
 is isolated from real mail.
 
-Three benchmarks here:
-- `mark_as_read_50_msgs` — bulk read-state toggle (single AppleScript
-  call covering all N messages; the key scaling-pattern signal)
-- `move_messages_50_msgs` — bulk move via the legacy connector method
-  (AppleScript-only baseline: round-trip bench → source → bench)
+Benchmarks here:
+- `mark_as_read_50_msgs` — bulk read-state toggle via `update_message`
+  (single AppleScript call covering all N messages, unless IMAP is
+  configured for the test account and the read-only fast path
+  (#151) takes it instead; the key scaling-pattern signal either way)
+- `move_messages_50_msgs` — bulk move via `update_message`'s narrow
+  `account` + `source_mailbox` path (round-trip bench → source →
+  bench); AppleScript unless the move-only IMAP fast path (#149)
+  applies for the test account
 - `update_message_move_50_msgs_imap` — bulk move via update_message's
-  IMAP fast path (#149); side-by-side companion to the AppleScript
-  baseline above.
+  IMAP fast path (#149), forced by using RFC 5322 Message-IDs from an
+  IMAP search; side-by-side companion to the baseline above.
+- `move_messages_50_msgs_gmail` — bulk move with `gmail_mode=True`
+  against the Gmail bench fixtures, via `update_message`
+
+`move_messages` and `mark_as_read` were removed from the connector as
+dead code (no caller once `update_message` (#135) absorbed their
+behavior); these benchmarks were ported to call `update_message`
+directly. `move_messages` had no IMAP dispatch of its own, so the old
+docstrings called two of these "AppleScript-only" baselines; that
+guarantee no longer holds now that `update_message` itself chooses an
+IMAP fast path when one applies and credentials are configured for the
+account under test.
 """
 
 from __future__ import annotations
@@ -38,7 +53,10 @@ def test_mark_as_read_50_msgs(
     capture_mode: bool,
 ) -> None:
     """Baseline: bulk-mark-read against BULK_SIZE messages in the bench
-    mailbox, using the narrow-path source_mailbox parameter from #103.
+    mailbox, via update_message's narrow-path source_mailbox parameter
+    (#103). update_message may take the read-only IMAP fast path (#151)
+    instead of AppleScript when credentials are configured for
+    test_account — see the module docstring.
 
     Each iteration toggles read→unread→read on the same message set.
     Final state of each iteration matches the message's starting state.
@@ -46,15 +64,15 @@ def test_mark_as_read_50_msgs(
     name = "mark_as_read_50_msgs"
 
     def run() -> None:
-        connector.mark_as_read(
+        connector.update_message(
             bench_messages,
-            read=False,
+            read_status=False,
             account=test_account,
             source_mailbox=bench_mailbox,
         )
-        connector.mark_as_read(
+        connector.update_message(
             bench_messages,
-            read=True,
+            read_status=True,
             account=test_account,
             source_mailbox=bench_mailbox,
         )
@@ -72,8 +90,11 @@ def test_move_messages_50_msgs(
     baselines: dict[str, float],
     capture_mode: bool,
 ) -> None:
-    """Baseline: bulk-move BULK_SIZE messages, using narrow-path
-    source_mailbox in both directions.
+    """Baseline: bulk-move BULK_SIZE messages via update_message, using
+    the narrow-path source_mailbox in both directions. update_message
+    may take the move-only IMAP fast path (#149) instead of AppleScript
+    when credentials are configured for test_account — see the module
+    docstring.
 
     Each iteration moves bench → source → bench. Two move calls per
     iteration; we measure the round-trip and report it as
@@ -91,7 +112,7 @@ def test_move_messages_50_msgs(
 
     def run() -> None:
         # Move bench → source (narrow source-scan)
-        connector.move_messages(
+        connector.update_message(
             current_ids,
             destination_mailbox=bench_source,
             account=test_account,
@@ -105,7 +126,7 @@ def test_move_messages_50_msgs(
         moved_ids = [m["id"] for m in in_source[: len(current_ids)]]
 
         # Move source → bench (narrow source-scan)
-        connector.move_messages(
+        connector.update_message(
             moved_ids,
             destination_mailbox=bench_mailbox,
             account=test_account,
@@ -211,10 +232,14 @@ def test_move_messages_50_msgs_gmail(
     baselines: dict[str, float],
     capture_mode: bool,
 ) -> None:
-    """Gmail variant (#101): bulk-move 50 synthetic messages with
-    ``gmail_mode=True`` (Gmail's IMAP doesn't natively support MOVE for
-    label-backed folders, so the connector falls back to copy+delete in
-    two AppleScript steps — that path is what this baseline measures).
+    """Gmail variant (#101): bulk-move 50 synthetic messages via
+    update_message with ``gmail_mode=True`` (Gmail's IMAP doesn't
+    natively support MOVE for label-backed folders, so the AppleScript
+    pass falls back to copy+delete in two steps). update_message's
+    move-only IMAP fast path (#149) does not consult ``gmail_mode`` —
+    if IMAP is configured for test_account_gmail this benchmark measures
+    that path's UID MOVE instead of the copy+delete AppleScript pass;
+    see the module docstring.
 
     Same shape as ``test_move_messages_50_msgs`` but the source and
     destination mailboxes are dedicated synthetic-data fixtures, never
@@ -224,7 +249,7 @@ def test_move_messages_50_msgs_gmail(
     current_ids = list(gmail_bench_messages)
 
     def run() -> None:
-        connector.move_messages(
+        connector.update_message(
             current_ids,
             destination_mailbox=gmail_bench_source,
             account=test_account_gmail,
@@ -238,7 +263,7 @@ def test_move_messages_50_msgs_gmail(
         )
         moved_ids = [m["id"] for m in in_source[: len(current_ids)]]
 
-        connector.move_messages(
+        connector.update_message(
             moved_ids,
             destination_mailbox=gmail_bench_mailbox,
             account=test_account_gmail,

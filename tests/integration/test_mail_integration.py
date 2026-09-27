@@ -1377,8 +1377,11 @@ class TestRuleCRUDIntegration:
             assert test_rule["index"] == new_index
             assert test_rule["enabled"] is True
 
-            # 3. SET_RULE_ENABLED: toggle off.
-            connector.set_rule_enabled(new_index, enabled=False)
+            # 3. ENABLE-TOGGLE: toggle off via update_rule's patch-style
+            # `enabled` field (set_rule_enabled was removed as dead code —
+            # its server tool was already replaced by update_rule's
+            # enable/disable path before this).
+            connector.update_rule(rule_index=new_index, enabled=False)
             rules = connector.list_rules()
             test_rule = next(
                 r for r in rules if r["name"] == self.TEST_RULE_NAME

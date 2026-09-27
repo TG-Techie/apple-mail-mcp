@@ -210,10 +210,10 @@ def connector() -> AppleMailConnector:
     """Single connector reused across the entire benchmark session.
 
     Generous timeout (10 min) because some setup operations on full
-    accounts can be slow — `move_messages` in particular scans every
-    account×mailbox pair to find each message ID (see #32). The benchmarks
-    themselves are much faster than this; the long timeout is for fixture
-    setup and teardown."""
+    accounts can be slow — a cross-scan bulk move in particular scans
+    every account×mailbox pair to find each message ID (see #32). The
+    benchmarks themselves are much faster than this; the long timeout is
+    for fixture setup and teardown."""
     return AppleMailConnector(timeout=600)
 
 
@@ -293,7 +293,7 @@ def bench_messages(
             if not leftover:
                 break
             try:
-                connector.move_messages(
+                connector.update_message(
                     [m["id"] for m in leftover],
                     destination_mailbox=bench_source,
                     account=test_account,
@@ -317,15 +317,15 @@ def bench_messages(
             f"messages; need {BULK_SIZE}."
         )
     try:
-        connector.move_messages(
+        connector.update_message(
             [m["id"] for m in source_msgs],
             destination_mailbox=bench_mailbox,
             account=test_account,
             source_mailbox=bench_source,
         )
     except MailAppleScriptError as e:
-        # The bulk-operation cubic-loop bug (#103) makes move_messages
-        # impractically slow on accounts with many mailboxes (e.g.,
+        # The bulk-operation cubic-loop bug (#103) makes a cross-scan bulk
+        # move impractically slow on accounts with many mailboxes (e.g.,
         # Gmail with 90+ labels in the configuration). Once #103 is
         # fixed, this fixture (and the bulk benchmarks that depend on
         # it) will succeed automatically.
@@ -465,7 +465,7 @@ def gmail_bench_messages(
             if not leftover:
                 break
             try:
-                connector.move_messages(
+                connector.update_message(
                     [m["id"] for m in leftover],
                     destination_mailbox=gmail_bench_source,
                     account=test_account_gmail,
@@ -488,7 +488,7 @@ def gmail_bench_messages(
             f"{BULK_SIZE}. The synthetic-data setup may have failed mid-way."
         )
     try:
-        connector.move_messages(
+        connector.update_message(
             [m["id"] for m in source_msgs],
             destination_mailbox=gmail_bench_mailbox,
             account=test_account_gmail,
