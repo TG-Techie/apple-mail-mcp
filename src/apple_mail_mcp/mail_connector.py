@@ -5295,7 +5295,14 @@ end if
         apply the headers (``_draft_headers_block``), and set
         ``resultData`` to what the window holds: its name, subject and
         recipients, and — when ``snapshot_drafts`` — the Drafts ids that
-        existed before it opened, so the save can find its own."""
+        existed before it opened, so the save can find its own.
+
+        Mail retitles a compose window the moment its subject is set
+        (measured 2026-09-27, docs/research/icloud-draft-resync.md,
+        Observation 12), and every later step addresses the window by
+        name. So a reply or forward whose subject is overridden is named
+        again, by the same diff, once the headers are on it; named only
+        before, it was addressed by a name no window had any more."""
         seed_id_safe = (
             escape_applescript_string(sanitize_input(seed_id))
             if seed_id is not None
@@ -5317,6 +5324,11 @@ end if
             if snapshot_drafts
             else "set beforeIds to {}"
         )
+        renamed = (
+            self._as_new_compose_window_block()
+            if seed != "new" and subject is not None
+            else ""
+        )
         return f"""
 tell application "System Events"
     tell application process "Mail"
@@ -5331,6 +5343,9 @@ end tell
 {self._as_new_compose_window_block()}
 tell application "Mail"
     {headers_block}
+end tell
+{renamed}
+tell application "Mail"
     set toAddrs to address of to recipients of theMessage
     if toAddrs is missing value then set toAddrs to {{}}
     set ccAddrs to address of cc recipients of theMessage

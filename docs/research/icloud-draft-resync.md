@@ -320,6 +320,68 @@ delivered copy.
 account's INBOX and System Events' windows of Mail held nothing whose
 subject carried the run's prefix.
 
+## Observation 12 — a reply or forward retitled by its own subject (2026-09-27, about 07:43–07:51 EDT)
+
+The seed for every run here was one message in the test account's
+Trash: a fresh HTML send from Observation 11's loopback work, with two
+.txt files, not listed in any drafts mailbox, and whose headers carry
+no `X-Uniform-Type-Identifier: com.apple.mail-draft`. The times before
+07:45:51 were not logged to the second; the scratch scripts were last
+written at 07:43 and 07:44.
+
+1. `create_draft(seed="reply", subject="ZZZ-AMM-INTEG-retitle-<hex>",
+   send_now=False)` through `_compose`, one run. It raised, from the
+   paste: `NO_BODY_AREA:webarea never appeared in Re: <the seed's
+   subject>` (compose window: `NO_WINDOW`). One compose window was
+   left open, named `ZZZ-AMM-INTEG-retitle-<hex>`: System Events
+   counted 27 windows against the baseline 26, and `count of outgoing
+   messages` was 1 against 0. That window was closed by name without
+   saving; afterwards 26 and 0.
+2. A direct AppleScript probe: Mail's `forward … opening window true`
+   of the same seed, System Events' `name of window 1` read, the
+   subject set through the dictionary, the name read again.
+
+   | when | front window's name |
+   |---|---|
+   | before `set subject` | `Fwd: <the seed's subject>` |
+   | right after | `ZZZ-AMM-INTEG-retitle-direct` |
+   | 0.5 s after | `ZZZ-AMM-INTEG-retitle-direct` |
+   | 2 s after | `ZZZ-AMM-INTEG-retitle-direct` |
+
+   That window too was closed by name without saving; afterwards 26
+   windows and 0 outgoing messages.
+
+The window had been named by the counted-names diff right after it
+opened, before the headers were set, and every later step (the paste,
+the file paste, the close with Save) addresses it by that name. The
+connector now runs the same diff a second time after the headers
+whenever a reply or forward has its subject overridden
+(`_build_open_compose_script`). A fresh message is not affected: its
+subject is set in the creation properties, before the first diff.
+
+3. The same two calls after that change, 07:45:51–07:46:12, one run
+   each, `to=["test1@example.com"]`, sender the test account:
+
+   | seed | window name the script reported | a window by that name after the script | saved draft read back | draft marker header | windows by that name after the save |
+   |---|---|---|---|---|---|
+   | reply | the override subject | yes | subject the override, To test1@example.com, no files, `In-Reply-To` the seed's Message-ID; the note at offset 0 of the content, "wrote:" at 79 | present | 0 |
+   | forward | the override subject | yes | subject the override, To test1@example.com, files `second.txt`, `first.txt` (the seed's); the note at 0, "Begin forwarded message" at 28 | present | 0 |
+
+   The window count went 26 → 27 when each window opened.
+
+4. The reply's draft was gone at 07:46:12, 11 s after `create_draft`
+   returned its id: a delete by that id answered "no draft with id".
+   Through 07:51:33 nothing with its subject was found in the drafts,
+   trash or sent mailboxes of any account, in the test account's
+   Drafts, Deleted Messages, Sent Messages or INBOX, or among outgoing
+   messages; nothing under `Re: <the seed's subject>` either (checked
+   to 07:47:47). The test account's Drafts count was 45 throughout.
+   Where it went was not established. The forward's draft was moved to
+   Trash by its id without incident.
+
+`count of outgoing messages` was 0 and System Events counted 26 Mail
+windows at 07:46:13, the baseline. Nothing was sent.
+
 ## Derivations, mine
 
 - On an iCloud account, the id `draft_create` returns is transient. In
@@ -391,6 +453,16 @@ subject carried the run's prefix.
   tests passed on a re-run, and the keys and pasteboard content of the
   reply path's paste are unchanged by this work. How often it happens
   was not measured.
+- (Observation 12) Until the second naming, every reply or forward
+  through `_compose` with its subject overridden addressed its window
+  by a name the window no longer had: the saved draft and the HTML
+  reply or forward sent at once alike. Derived from the code; only the
+  reply save was run that way.
+- (Observation 12) The draft marker header was on both drafts read
+  back here and not on the sent seed. That it is on every draft Mail
+  saves, and on nothing else, was not checked; the integration seed
+  fixture uses it only beside a check that the seed is not listed in a
+  drafts mailbox.
 
 ## What this bears on
 
@@ -422,6 +494,10 @@ subject carried the run's prefix.
   compose window closed with Save, and on every seed the caller's files
   are pasted at the end, never attached through the dictionary. The
   re-save it ends is `draft-resave-spike.md`'s.
+- A reply or forward whose subject is overridden is named again after
+  its headers are set (`_build_open_compose_script`, with the commit
+  that added Observation 12), so the paste, the file paste and the
+  close with Save reach the retitled window.
 
 ## Not tried
 

@@ -5011,6 +5011,37 @@ class TestComposition:
         assert "COMPOSE_WINDOW_NOT_UNIQUE" in script
         assert "|window|:newName" in script
 
+    @pytest.mark.parametrize("seed", ["reply", "forward"])
+    def test_a_window_whose_subject_is_set_is_named_again_after(
+        self, connector: AppleMailConnector, seed: str
+    ) -> None:
+        """Mail retitles a compose window the moment its subject is set
+        (measured 2026-09-27, docs/research/icloud-draft-resync.md,
+        Observation 12): named only before the override, a reply or
+        forward with its own subject was addressed by a name no window
+        had, and the paste failed NO_BODY_AREA."""
+        script = self._compose(connector, seed=seed)
+        subject_at = script.index("set subject of theMessage")
+        assert script.index("afterCount > beforeCount") < subject_at
+        assert script.rindex("afterCount > beforeCount") > subject_at
+        assert script.rindex("afterCount > beforeCount") < script.index(
+            "|window|:newName"
+        )
+
+    @pytest.mark.parametrize("seed", ["new", "reply", "forward"])
+    def test_a_window_whose_subject_is_not_set_is_named_once(
+        self, connector: AppleMailConnector, seed: str
+    ) -> None:
+        """A fresh message's subject is set as it is made, and a reply or
+        forward without an override keeps Mail's: nothing retitles it."""
+        script = connector._build_open_compose_script(
+            seed=seed, seed_id=None if seed == "new" else "160989",
+            reply_all=False, to=["a@example.com"], cc=None, bcc=None,
+            subject="Fresh" if seed == "new" else None, sender=None,
+            snapshot_drafts=False,
+        )
+        assert script.count("afterCount > beforeCount") == 1
+
     def test_what_mail_will_send_is_read_back_from_the_model(
         self, connector: AppleMailConnector
     ) -> None:
