@@ -18,6 +18,12 @@ import pytest
 
 from apple_mail_mcp.mail_connector import AppleMailConnector
 
+from .mail_readback import (
+    assert_html_rendered,
+    sent_count_for_subject,
+    sent_source_for_subject,
+)
+
 pytestmark = pytest.mark.skipif(
     "not config.getoption('--run-integration')",
     reason="Integration tests disabled by default. Use --run-integration to run."
@@ -27,31 +33,6 @@ pytestmark = pytest.mark.skipif(
 @pytest.fixture
 def connector() -> AppleMailConnector:
     return AppleMailConnector(timeout=90)
-
-
-def _sent_source_for_subject(connector: AppleMailConnector, subject: str) -> str:
-    return connector._run_applescript(
-        f'tell application "Mail" to return source of first message of '
-        f'sent mailbox whose subject is "{subject}"'
-    )
-
-
-def _assert_html_rendered(source: str, tag_fragment: str) -> None:
-    """The sent message's html part must contain the REAL tag, not an
-    escaped one — on 2026-07-21 mail shipped with &lt;p&gt; because the
-    integration suite asserted dispatch but never rendering."""
-    html_part = source[source.find("text/html"):]
-    assert tag_fragment in html_part, "HTML did not render as HTML"
-    escaped = tag_fragment.replace("<", "&lt;").replace(">", "&gt;")
-    assert escaped not in html_part, "HTML was pasted as literal text"
-
-
-def _sent_count_for_subject(connector: AppleMailConnector, subject: str) -> int:
-    out = connector._run_applescript(
-        f'tell application "Mail" to return (count of (messages of sent mailbox '
-        f'whose subject is "{subject}")) as text'
-    ).strip()
-    return int(out)
 
 
 class TestVerifiedMailtoSend:
@@ -71,7 +52,7 @@ class TestVerifiedMailtoSend:
         assert result == {"draft_id": "", "sent_message_id": ""}
         # The verified-send block already polled for the Sent copy before
         # returning SENT; re-read it here independently.
-        assert _sent_count_for_subject(connector, subject) >= 1
+        assert sent_count_for_subject(connector, subject) >= 1
 
 
 class TestVerifiedHtmlSend:
@@ -92,9 +73,9 @@ class TestVerifiedHtmlSend:
             from_account=None,
         )
         assert result == {"draft_id": "", "sent_message_id": ""}
-        assert _sent_count_for_subject(connector, subject) >= 1
-        _assert_html_rendered(
-            _sent_source_for_subject(connector, subject), "<b>phase-0</b>"
+        assert sent_count_for_subject(connector, subject) >= 1
+        assert_html_rendered(
+            sent_source_for_subject(connector, subject), "<b>phase-0</b>"
         )
         restored = connector._run_applescript(
             "return (the clipboard as text)"
@@ -129,7 +110,7 @@ class TestVerifiedHtmlReply:
             reply_to=target,
         )
         assert result == {"draft_id": "", "sent_message_id": ""}
-        assert _sent_count_for_subject(connector, f"Re: {orig_subject}") >= 1
+        assert sent_count_for_subject(connector, f"Re: {orig_subject}") >= 1
         # The whole point of reply mode: threading headers on the wire.
         headers = connector._run_applescript(
             f'tell application "Mail" to return all headers of first message '
@@ -137,8 +118,8 @@ class TestVerifiedHtmlReply:
         )
         assert "In-Reply-To:" in headers
         assert "References:" in headers
-        _assert_html_rendered(
-            _sent_source_for_subject(connector, f"Re: {orig_subject}"),
+        assert_html_rendered(
+            sent_source_for_subject(connector, f"Re: {orig_subject}"),
             "<i>phase-1-3</i>",
         )
 
@@ -193,11 +174,11 @@ class TestHtmlSendWithAttachments:
                 attachment_paths=[f1, f2],
             )
             assert result == {"draft_id": "", "sent_message_id": ""}
-            assert _sent_count_for_subject(connector, subject) == 1
-            src = _sent_source_for_subject(connector, subject)
+            assert sent_count_for_subject(connector, subject) == 1
+            src = sent_source_for_subject(connector, subject)
             assert "first.txt" in src
             assert "second.txt" in src
-            _assert_html_rendered(src, "<b>marker-ai</b>")
+            assert_html_rendered(src, "<b>marker-ai</b>")
             # cc must be on the wire (it used to be silently dropped).
             assert "ccprobe@example.com" in src
             count = connector._run_applescript(

@@ -1,12 +1,14 @@
 """Fixtures shared by the integration tests.
 
-Nothing in this directory names an account, a login or a host. Every
-test that touches a real account gets it from ``MAIL_TEST_ACCOUNT`` —
-the same variable the server's safety gate checks — and everything
-about that account (IMAP host, port, login) is read from Mail.app at
-run time. A literal in a fixture is a second configuration path that
-nobody maintains, and a default is a literal that only applies when
-you forgot to set the real one.
+Nothing in this directory names an account, an address, a login or a
+host. Every test that touches a real account gets it from
+``MAIL_TEST_ACCOUNT`` — the same variable the server's safety gate
+checks — and everything about that account (its address, IMAP host,
+port, login) is read from Mail.app at run time. The one real address a
+test may send to, the loopback, comes from ``MAIL_TEST_LOOPBACK`` the
+same way. A literal in a fixture is a second configuration path that
+nobody maintains, and a default is a literal that only applies when you
+forgot to set the real one.
 """
 
 import os
@@ -48,6 +50,40 @@ def test_account() -> str:
             "exactly the account it names; there is no default."
         )
     return account
+
+
+@pytest.fixture
+def test_account_address(test_account: str) -> str:
+    """The test account's email address, as Mail.app has it configured.
+
+    The first of the account's addresses, which is the one the server
+    resolves an account to when it names a sender. Tests compare a From
+    header against it rather than against a literal.
+    """
+    for account in AppleMailConnector().list_accounts():
+        if test_account in (account.get("name"), account.get("id")):
+            addresses = account.get("email_addresses") or []
+            if not addresses:
+                pytest.fail(
+                    f"Mail.app has no email address for {test_account!r}."
+                )
+            return str(addresses[0])
+    pytest.fail(f"MAIL_TEST_ACCOUNT={test_account!r} is not a Mail.app account.")
+
+
+@pytest.fixture
+def loopback_address() -> str:
+    """The one real address the loopback tests send to: mail sent there
+    arrives back in the test account's INBOX, where a test can read what
+    was actually delivered. Skips rather than fails when unset; the rest
+    of the integration suite is valid without it."""
+    address = os.getenv("MAIL_TEST_LOOPBACK", "").strip()
+    if not address:
+        pytest.skip(
+            "MAIL_TEST_LOOPBACK is not set; loopback read-back tests send "
+            "to exactly the address it names"
+        )
+    return address
 
 
 def _test_draft_ids(connector: AppleMailConnector, account: str) -> list[str]:
