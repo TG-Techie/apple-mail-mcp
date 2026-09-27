@@ -149,13 +149,14 @@ make test-integration  # Integration tests (requires Mail.app)
 ## Architecture
 
 ```
-server.py (FastMCP tools — thin orchestration)
+server.py + tools/ (FastMCP tools — thin orchestration)
   -> mail_connector.py (AppleScript bridge — domain logic)
      -> subprocess.run(["osascript", ...])
         -> Apple Mail.app
 ```
 
-- **server.py** — MCP tool registration, input validation, response formatting
+- **server.py** — the FastMCP instance, the connector, confirmation and the error envelope
+- **tools/** — the MCP tools, one module per domain: input validation, gates, response formatting
 - **mail_connector.py** — All AppleScript generation and execution
 - **security.py** — Input sanitization, audit logging, confirmation flows
 - **utils.py** — Pure functions: escaping, parsing, validation

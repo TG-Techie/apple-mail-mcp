@@ -84,7 +84,7 @@ def list_mailboxes():
 2. Write unit tests (mock AppleScript)
 3. Write integration tests (real Mail.app)
 4. Implement in `mail_connector.py`
-5. Expose in `server.py`
+5. Expose it as a tool in its domain's module under `src/apple_mail_mcp/tools/`
 6. Run `./scripts/check_client_server_parity.sh`
 7. Update `docs/reference/TOOLS.md`
 8. Add blind eval scenarios if tool has non-obvious parameters

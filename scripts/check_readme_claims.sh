@@ -11,14 +11,16 @@ echo "Checking documentation claims..."
 echo ""
 echo "Check 1: Tool count..."
 README_TOOL_CLAIM=$(grep -oE 'Tools \([0-9]+\)' README.md 2>/dev/null | grep -oE '[0-9]+' || echo "")
-ACTUAL_TOOLS=$(grep -c '@mcp.tool' src/apple_mail_mcp/server.py || echo "0")
+# The tools are registered in the modules under tools/; server.py is
+# included so a registration added there is counted too.
+ACTUAL_TOOLS=$(cat src/apple_mail_mcp/server.py src/apple_mail_mcp/tools/*.py | grep -c '^@mcp\.tool' || echo "0")
 
 if [ -n "$README_TOOL_CLAIM" ]; then
     if [ "$README_TOOL_CLAIM" != "$ACTUAL_TOOLS" ]; then
-        echo "  ERROR: README claims $README_TOOL_CLAIM tools, but server.py has $ACTUAL_TOOLS @mcp.tool() decorators."
+        echo "  ERROR: README claims $README_TOOL_CLAIM tools, but the server registers $ACTUAL_TOOLS tools."
         ERRORS=$((ERRORS + 1))
     else
-        echo "  OK: README tool count ($README_TOOL_CLAIM) matches server.py."
+        echo "  OK: README tool count ($README_TOOL_CLAIM) matches the server."
     fi
 else
     echo "  SKIP: No tool count found in README."
@@ -31,10 +33,10 @@ CLAUDE_TOOL_CLAIM=$(grep -oE '[0-9]+ MCP tools' AGENTS.md 2>/dev/null | grep -oE
 
 if [ -n "$CLAUDE_TOOL_CLAIM" ]; then
     if [ "$CLAUDE_TOOL_CLAIM" != "$ACTUAL_TOOLS" ]; then
-        echo "  ERROR: AGENTS.md claims $CLAUDE_TOOL_CLAIM tools, but server.py has $ACTUAL_TOOLS."
+        echo "  ERROR: AGENTS.md claims $CLAUDE_TOOL_CLAIM tools, but the server registers $ACTUAL_TOOLS."
         ERRORS=$((ERRORS + 1))
     else
-        echo "  OK: AGENTS.md tool count ($CLAUDE_TOOL_CLAIM) matches server.py."
+        echo "  OK: AGENTS.md tool count ($CLAUDE_TOOL_CLAIM) matches the server."
     fi
 else
     echo "  SKIP: No tool count found in AGENTS.md."

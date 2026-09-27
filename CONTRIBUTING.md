@@ -22,7 +22,7 @@ uv sync --dev
 0. **Before you start coding,** open an issue (or comment on an existing one) describing what you plan to fix or build. This lets us flag duplicate or in-flight work and saves you from rebases or wasted effort.
 1. Create a branch: `git checkout -b feature/issue-N-description`
 2. Write tests first (TDD): RED -> GREEN -> REFACTOR
-3. Implement backend (`mail_connector.py`) and frontend (`server.py`) together
+3. Implement backend (`mail_connector.py`) and frontend (the tool's module under `src/apple_mail_mcp/tools/`) together
 4. Run checks: `make check-all`
 5. Open a PR against `main`
 

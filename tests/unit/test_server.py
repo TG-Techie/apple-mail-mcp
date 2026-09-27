@@ -1,7 +1,8 @@
 """
-Unit tests for the FastMCP server layer in apple_mail_mcp.server.
+Unit tests for the FastMCP server layer: apple_mail_mcp.server and the tool
+modules under apple_mail_mcp.tools.
 
-These tests exercise each @mcp.tool() function directly as a regular Python
+These tests exercise each tool function directly as a regular Python
 callable with a mocked AppleMailConnector. They cover server-layer concerns
 that the connector tests cannot: input validation, confirmation flows,
 exception-to-error_type mapping, structured response shape, and
@@ -44,27 +45,30 @@ from apple_mail_mcp.exceptions import (
     MailUnsupportedRuleActionError,
     OutboundAllowlistUnavailableError,
 )
-from apple_mail_mcp.server import (
-    _elicit_confirmation,
-    create_mailbox,
+from apple_mail_mcp.security import operation_logger
+from apple_mail_mcp.server import _elicit_confirmation, error_response
+from apple_mail_mcp.tools.accounts_rules import (
     create_rule,
-    delete_messages,
     delete_rule,
-    delete_template,
-    error_response,
-    get_messages,
-    get_template,
-    get_thread,
     list_accounts,
-    list_mailboxes,
     list_rules,
-    list_templates,
-    render_template,
+    update_rule,
+)
+from apple_mail_mcp.tools.mailboxes import create_mailbox, list_mailboxes
+from apple_mail_mcp.tools.messages import (
+    delete_messages,
+    get_messages,
+    get_thread,
     save_attachments,
-    save_template,
     search_messages,
     update_message,
-    update_rule,
+)
+from apple_mail_mcp.tools.templates import (
+    delete_template,
+    get_template,
+    list_templates,
+    render_template,
+    save_template,
 )
 
 
@@ -76,7 +80,10 @@ def mock_mail() -> Any:
 
 @pytest.fixture
 def mock_logger() -> Any:
-    with patch("apple_mail_mcp.server.operation_logger") as m:
+    """The audit log: the one shared ``operation_logger``, whichever
+    module writes to it, with its ``log_operation`` replaced."""
+    m = MagicMock()
+    with patch.object(operation_logger, "log_operation", m.log_operation):
         yield m
 
 
@@ -2274,7 +2281,7 @@ class TestUpdateMailboxTool:
     def test_a_false_from_the_connector_is_a_typed_error(
         self, mock_mail: MagicMock, mock_logger: MagicMock
     ) -> None:
-        from apple_mail_mcp.server import update_mailbox
+        from apple_mail_mcp.tools.mailboxes import update_mailbox
 
         mock_mail.update_mailbox.return_value = False
         result = update_mailbox(account="Gmail", name="Old", new_name="New")
@@ -2288,7 +2295,7 @@ class TestUpdateMailboxTool:
     def test_rename_success(
         self, mock_mail: MagicMock, mock_logger: MagicMock
     ) -> None:
-        from apple_mail_mcp.server import update_mailbox
+        from apple_mail_mcp.tools.mailboxes import update_mailbox
 
         mock_mail.update_mailbox.return_value = True
         result = update_mailbox(account="Gmail", name="Old", new_name="New")
@@ -2306,7 +2313,7 @@ class TestUpdateMailboxTool:
         self, mock_mail: MagicMock, mock_logger: MagicMock
     ) -> None:
         """#163: new_parent set, new_name None — pure move via IMAP."""
-        from apple_mail_mcp.server import update_mailbox
+        from apple_mail_mcp.tools.mailboxes import update_mailbox
 
         mock_mail.update_mailbox.return_value = True
         result = update_mailbox(
@@ -2320,7 +2327,7 @@ class TestUpdateMailboxTool:
     def test_move_to_top_with_empty_string_parent(
         self, mock_mail: MagicMock, mock_logger: MagicMock
     ) -> None:
-        from apple_mail_mcp.server import update_mailbox
+        from apple_mail_mcp.tools.mailboxes import update_mailbox
 
         mock_mail.update_mailbox.return_value = True
         update_mailbox(account="Gmail", name="A/B", new_parent="")
@@ -2332,7 +2339,7 @@ class TestUpdateMailboxTool:
         self, mock_mail: MagicMock, mock_logger: MagicMock
     ) -> None:
         from apple_mail_mcp.exceptions import MailImapRequiredError
-        from apple_mail_mcp.server import update_mailbox
+        from apple_mail_mcp.tools.mailboxes import update_mailbox
 
         mock_mail.update_mailbox.side_effect = MailImapRequiredError(
             "no creds"
@@ -2345,7 +2352,7 @@ class TestUpdateMailboxTool:
     def test_neither_new_name_nor_parent_validation_error(
         self, mock_mail: MagicMock, mock_logger: MagicMock
     ) -> None:
-        from apple_mail_mcp.server import update_mailbox
+        from apple_mail_mcp.tools.mailboxes import update_mailbox
 
         result = update_mailbox(account="Gmail", name="Old")
         assert result["success"] is False
@@ -2355,7 +2362,7 @@ class TestUpdateMailboxTool:
     def test_empty_name_validation_error(
         self, mock_mail: MagicMock, mock_logger: MagicMock
     ) -> None:
-        from apple_mail_mcp.server import update_mailbox
+        from apple_mail_mcp.tools.mailboxes import update_mailbox
 
         result = update_mailbox(account="Gmail", name="", new_name="New")
         assert result["success"] is False
@@ -2365,7 +2372,7 @@ class TestUpdateMailboxTool:
     def test_empty_new_name_validation_error(
         self, mock_mail: MagicMock, mock_logger: MagicMock
     ) -> None:
-        from apple_mail_mcp.server import update_mailbox
+        from apple_mail_mcp.tools.mailboxes import update_mailbox
 
         result = update_mailbox(account="Gmail", name="Old", new_name="")
         assert result["success"] is False
@@ -2375,7 +2382,7 @@ class TestUpdateMailboxTool:
     def test_whitespace_only_new_name_validation_error(
         self, mock_mail: MagicMock, mock_logger: MagicMock
     ) -> None:
-        from apple_mail_mcp.server import update_mailbox
+        from apple_mail_mcp.tools.mailboxes import update_mailbox
 
         result = update_mailbox(account="Gmail", name="Old", new_name="   ")
         assert result["success"] is False
@@ -2385,7 +2392,7 @@ class TestUpdateMailboxTool:
         self, mock_mail: MagicMock, mock_logger: MagicMock
     ) -> None:
         from apple_mail_mcp.exceptions import MailMailboxNotFoundError
-        from apple_mail_mcp.server import update_mailbox
+        from apple_mail_mcp.tools.mailboxes import update_mailbox
 
         mock_mail.update_mailbox.side_effect = MailMailboxNotFoundError(
             "no mailbox 'Old'"
@@ -2396,7 +2403,7 @@ class TestUpdateMailboxTool:
     def test_account_not_found(
         self, mock_mail: MagicMock, mock_logger: MagicMock
     ) -> None:
-        from apple_mail_mcp.server import update_mailbox
+        from apple_mail_mcp.tools.mailboxes import update_mailbox
 
         mock_mail.update_mailbox.side_effect = MailAccountNotFoundError(
             'Can\'t get account "Bogus".'
@@ -2411,7 +2418,7 @@ class TestUpdateMailboxTool:
         """sanitize_mailbox_name in the connector can reject a new_name
         whose sanitized form is empty (e.g. '../') — surface as
         validation_error to the caller."""
-        from apple_mail_mcp.server import update_mailbox
+        from apple_mail_mcp.tools.mailboxes import update_mailbox
 
         mock_mail.update_mailbox.side_effect = ValueError("Invalid new_name")
         result = update_mailbox(account="Gmail", name="Old", new_name="../")
@@ -2420,7 +2427,7 @@ class TestUpdateMailboxTool:
     def test_applescript_error(
         self, mock_mail: MagicMock, mock_logger: MagicMock
     ) -> None:
-        from apple_mail_mcp.server import update_mailbox
+        from apple_mail_mcp.tools.mailboxes import update_mailbox
 
         mock_mail.update_mailbox.side_effect = MailAppleScriptError("boom")
         result = update_mailbox(account="Gmail", name="Old", new_name="New")
@@ -2429,7 +2436,7 @@ class TestUpdateMailboxTool:
     def test_unexpected_exception_maps_to_unknown(
         self, mock_mail: MagicMock, mock_logger: MagicMock
     ) -> None:
-        from apple_mail_mcp.server import update_mailbox
+        from apple_mail_mcp.tools.mailboxes import update_mailbox
 
         mock_mail.update_mailbox.side_effect = RuntimeError("boom")
         result = update_mailbox(account="Gmail", name="Old", new_name="New")
@@ -2443,7 +2450,7 @@ class TestUpdateMailboxTool:
         from apple_mail_mcp.exceptions import (
             MailUnsupportedGmailSystemLabelError,
         )
-        from apple_mail_mcp.server import update_mailbox
+        from apple_mail_mcp.tools.mailboxes import update_mailbox
 
         mock_mail.update_mailbox.side_effect = (
             MailUnsupportedGmailSystemLabelError(
@@ -2464,7 +2471,7 @@ class TestUpdateMailboxTool:
         from apple_mail_mcp.exceptions import (
             MailUnsupportedGmailSystemLabelError,
         )
-        from apple_mail_mcp.server import update_mailbox
+        from apple_mail_mcp.tools.mailboxes import update_mailbox
 
         mock_mail.update_mailbox.side_effect = (
             MailUnsupportedGmailSystemLabelError(
@@ -2487,7 +2494,7 @@ class TestDeleteMailboxTool:
         mock_logger: MagicMock,
         mock_ctx_accept: MagicMock,
     ) -> None:
-        from apple_mail_mcp.server import delete_mailbox
+        from apple_mail_mcp.tools.mailboxes import delete_mailbox
 
         mock_mail.delete_mailbox.return_value = 0
         result = await delete_mailbox(
@@ -2510,7 +2517,7 @@ class TestDeleteMailboxTool:
         mock_logger: MagicMock,
         mock_ctx_accept: MagicMock,
     ) -> None:
-        from apple_mail_mcp.server import delete_mailbox
+        from apple_mail_mcp.tools.mailboxes import delete_mailbox
 
         mock_mail.delete_mailbox.return_value = 42
         result = await delete_mailbox(
@@ -2526,7 +2533,7 @@ class TestDeleteMailboxTool:
         mock_logger: MagicMock,
         mock_ctx_decline: MagicMock,
     ) -> None:
-        from apple_mail_mcp.server import delete_mailbox
+        from apple_mail_mcp.tools.mailboxes import delete_mailbox
 
         result = await delete_mailbox(
             account="Gmail", name="X", ctx=mock_ctx_decline
@@ -2538,7 +2545,7 @@ class TestDeleteMailboxTool:
     async def test_empty_name_validation_error(
         self, mock_mail: MagicMock, mock_logger: MagicMock
     ) -> None:
-        from apple_mail_mcp.server import delete_mailbox
+        from apple_mail_mcp.tools.mailboxes import delete_mailbox
 
         result = await delete_mailbox(account="Gmail", name="")
         assert result["error_type"] == "validation_error"
@@ -2552,7 +2559,7 @@ class TestDeleteMailboxTool:
         mock_ctx_accept: MagicMock,
     ) -> None:
         from apple_mail_mcp.exceptions import MailImapRequiredError
-        from apple_mail_mcp.server import delete_mailbox
+        from apple_mail_mcp.tools.mailboxes import delete_mailbox
 
         mock_mail.delete_mailbox.side_effect = MailImapRequiredError(
             "no creds"
@@ -2570,7 +2577,7 @@ class TestDeleteMailboxTool:
         mock_ctx_accept: MagicMock,
     ) -> None:
         from apple_mail_mcp.exceptions import MailMailboxNotEmptyError
-        from apple_mail_mcp.server import delete_mailbox
+        from apple_mail_mcp.tools.mailboxes import delete_mailbox
 
         mock_mail.delete_mailbox.side_effect = MailMailboxNotEmptyError(
             "not empty"
@@ -2588,7 +2595,7 @@ class TestDeleteMailboxTool:
         mock_ctx_accept: MagicMock,
     ) -> None:
         from apple_mail_mcp.exceptions import MailMailboxNotFoundError
-        from apple_mail_mcp.server import delete_mailbox
+        from apple_mail_mcp.tools.mailboxes import delete_mailbox
 
         mock_mail.delete_mailbox.side_effect = MailMailboxNotFoundError(
             "no such"
@@ -2605,7 +2612,7 @@ class TestDeleteMailboxTool:
         mock_logger: MagicMock,
         mock_ctx_accept: MagicMock,
     ) -> None:
-        from apple_mail_mcp.server import delete_mailbox
+        from apple_mail_mcp.tools.mailboxes import delete_mailbox
 
         mock_mail.delete_mailbox.side_effect = MailAccountNotFoundError(
             'Can\'t get account "Bogus".'
@@ -2623,7 +2630,7 @@ class TestDeleteMailboxTool:
         mock_logger: MagicMock,
         mock_ctx_accept: MagicMock,
     ) -> None:
-        from apple_mail_mcp.server import delete_mailbox
+        from apple_mail_mcp.tools.mailboxes import delete_mailbox
 
         mock_mail.delete_mailbox.side_effect = RuntimeError("boom")
         result = await delete_mailbox(
@@ -2643,7 +2650,7 @@ class TestDeleteMailboxTool:
         from apple_mail_mcp.exceptions import (
             MailUnsupportedGmailSystemLabelError,
         )
-        from apple_mail_mcp.server import delete_mailbox
+        from apple_mail_mcp.tools.mailboxes import delete_mailbox
 
         mock_mail.delete_mailbox.side_effect = (
             MailUnsupportedGmailSystemLabelError(
@@ -3066,7 +3073,7 @@ class TestDraftCreateTool:
     def stub_security(self, monkeypatch: Any) -> None:
         # Default: the test-mode gate passes.
         monkeypatch.setattr(
-            "apple_mail_mcp.server.check_test_mode_safety",
+            "apple_mail_mcp.tools.drafts.check_test_mode_safety",
             lambda *a, **kw: None,
         )
 
@@ -3076,7 +3083,7 @@ class TestDraftCreateTool:
         mock_mail: MagicMock,
         mock_logger: MagicMock,
     ) -> None:
-        from apple_mail_mcp.server import draft_create
+        from apple_mail_mcp.tools.drafts import draft_create
 
         mock_mail.create_draft.return_value = {
             "draft_id": "161055", "sent_message_id": ""
@@ -3099,7 +3106,7 @@ class TestDraftCreateTool:
         mock_mail: MagicMock,
         mock_logger: MagicMock,
     ) -> None:
-        from apple_mail_mcp.server import draft_create
+        from apple_mail_mcp.tools.drafts import draft_create
 
         mock_mail.create_draft.return_value = {
             "draft_id": "161056", "sent_message_id": ""
@@ -3116,7 +3123,7 @@ class TestDraftCreateTool:
         mock_mail: MagicMock,
         mock_logger: MagicMock,
     ) -> None:
-        from apple_mail_mcp.server import draft_create
+        from apple_mail_mcp.tools.drafts import draft_create
 
         mock_mail.create_draft.return_value = {
             "draft_id": "161057", "sent_message_id": ""
@@ -3135,7 +3142,7 @@ class TestDraftCreateTool:
         mock_mail: MagicMock,
         mock_logger: MagicMock,
     ) -> None:
-        from apple_mail_mcp.server import draft_create
+        from apple_mail_mcp.tools.drafts import draft_create
 
         result = draft_create(reply_to="1", forward_of="2")
         assert result["success"] is False
@@ -3148,7 +3155,7 @@ class TestDraftCreateTool:
         mock_mail: MagicMock,
         mock_logger: MagicMock,
     ) -> None:
-        from apple_mail_mcp.server import draft_create
+        from apple_mail_mcp.tools.drafts import draft_create
 
         result = draft_create(template_vars={"x": "y"})
         assert result["success"] is False
@@ -3160,7 +3167,7 @@ class TestDraftCreateTool:
         mock_mail: MagicMock,
         mock_logger: MagicMock,
     ) -> None:
-        from apple_mail_mcp.server import draft_create
+        from apple_mail_mcp.tools.drafts import draft_create
 
         result = draft_create(subject="hi", body="x")
         assert result["success"] is False
@@ -3172,7 +3179,7 @@ class TestDraftCreateTool:
         mock_mail: MagicMock,
         mock_logger: MagicMock,
     ) -> None:
-        from apple_mail_mcp.server import draft_create
+        from apple_mail_mcp.tools.drafts import draft_create
 
         result = draft_create(to=["a@example.com"], body="x")
         assert result["success"] is False
@@ -3185,7 +3192,7 @@ class TestDraftCreateTool:
         mock_logger: MagicMock,
     ) -> None:
         from apple_mail_mcp.drafts import DraftStateStore
-        from apple_mail_mcp.server import draft_create
+        from apple_mail_mcp.tools.drafts import draft_create
 
         mock_mail.create_draft.return_value = {
             "draft_id": "161056", "sent_message_id": ""
@@ -3202,11 +3209,11 @@ class TestDraftUpdateTool:
     @pytest.fixture(autouse=True)
     def stub_security(self, monkeypatch: Any) -> None:
         monkeypatch.setattr(
-            "apple_mail_mcp.server.check_test_mode_safety",
+            "apple_mail_mcp.tools.drafts.check_test_mode_safety",
             lambda *a, **kw: None,
         )
         monkeypatch.setattr(
-            "apple_mail_mcp.server.check_rate_limit",
+            "apple_mail_mcp.tools.drafts.check_rate_limit",
             lambda *a, **kw: None,
         )
 
@@ -3217,7 +3224,7 @@ class TestDraftUpdateTool:
         mock_logger: MagicMock,
     ) -> None:
         from apple_mail_mcp.drafts import DraftStateStore, SeedRecord
-        from apple_mail_mcp.server import draft_update
+        from apple_mail_mcp.tools.drafts import draft_update
 
         store = DraftStateStore()
         store.set_seed(
@@ -3256,7 +3263,7 @@ class TestDraftUpdateTool:
         mock_mail: MagicMock,
         mock_logger: MagicMock,
     ) -> None:
-        from apple_mail_mcp.server import draft_update
+        from apple_mail_mcp.tools.drafts import draft_update
 
         # No disk state. Must fall back to In-Reply-To header lookup.
         mock_mail.get_draft_state.return_value = {
@@ -3286,7 +3293,7 @@ class TestDraftUpdateTool:
         mock_mail: MagicMock,
         mock_logger: MagicMock,
     ) -> None:
-        from apple_mail_mcp.server import draft_update
+        from apple_mail_mcp.tools.drafts import draft_update
 
         mock_mail.get_draft_state.return_value = {
             "draft_id": "160991",
@@ -3314,7 +3321,7 @@ class TestDraftUpdateTool:
         mock_logger: MagicMock,
         tmp_path: Any,
     ) -> None:
-        from apple_mail_mcp.server import draft_update
+        from apple_mail_mcp.tools.drafts import draft_update
 
         mock_mail.get_draft_state.return_value = {
             "draft_id": "160991",
@@ -3346,7 +3353,7 @@ class TestDraftUpdateTool:
         mock_mail: MagicMock,
         mock_logger: MagicMock,
     ) -> None:
-        from apple_mail_mcp.server import draft_update
+        from apple_mail_mcp.tools.drafts import draft_update
 
         mock_mail.get_draft_state.return_value = {
             "draft_id": "160991",
@@ -3372,7 +3379,7 @@ class TestDraftUpdateTool:
         mock_mail: MagicMock,
         mock_logger: MagicMock,
     ) -> None:
-        from apple_mail_mcp.server import draft_update
+        from apple_mail_mcp.tools.drafts import draft_update
 
         mock_mail.get_draft_state.return_value = {
             "draft_id": "160991",
@@ -3397,7 +3404,7 @@ class TestDraftUpdateTool:
         mock_logger: MagicMock,
     ) -> None:
         from apple_mail_mcp.drafts import DraftStateStore, SeedRecord
-        from apple_mail_mcp.server import draft_update
+        from apple_mail_mcp.tools.drafts import draft_update
 
         store = DraftStateStore()
         store.set_seed(
@@ -3430,7 +3437,7 @@ class TestDraftUpdateTool:
         mock_mail: MagicMock,
         mock_logger: MagicMock,
     ) -> None:
-        from apple_mail_mcp.server import draft_update
+        from apple_mail_mcp.tools.drafts import draft_update
 
         result = draft_update(
             draft_id="160991", template_vars={"x": "y"}
@@ -3447,7 +3454,7 @@ class TestDraftDeleteTool:
         mock_mail: MagicMock,
         mock_logger: MagicMock,
     ) -> None:
-        from apple_mail_mcp.server import draft_delete
+        from apple_mail_mcp.tools.drafts import draft_delete
 
         mock_mail.delete_draft.return_value = True
         result = draft_delete(draft_id="160991")
@@ -3462,7 +3469,7 @@ class TestDraftDeleteTool:
         mock_logger: MagicMock,
     ) -> None:
         from apple_mail_mcp.drafts import DraftStateStore, SeedRecord
-        from apple_mail_mcp.server import draft_delete
+        from apple_mail_mcp.tools.drafts import draft_delete
 
         store = DraftStateStore()
         store.set_seed(
@@ -3482,7 +3489,7 @@ class TestDraftDeleteTool:
         mock_logger: MagicMock,
     ) -> None:
         from apple_mail_mcp.exceptions import MailDraftNotFoundError
-        from apple_mail_mcp.server import draft_delete
+        from apple_mail_mcp.tools.drafts import draft_delete
 
         mock_mail.delete_draft.side_effect = MailDraftNotFoundError(
             "no draft with id '999'"
@@ -3498,7 +3505,7 @@ class TestDraftDeleteTool:
         mock_logger: MagicMock,
     ) -> None:
         from apple_mail_mcp.exceptions import MailDraftInvalidIdError
-        from apple_mail_mcp.server import draft_delete
+        from apple_mail_mcp.tools.drafts import draft_delete
 
         mock_mail.delete_draft.side_effect = MailDraftInvalidIdError(
             "draft_id '../escape' must match ..."
@@ -3518,7 +3525,7 @@ class TestDraftToolErrorPaths:
     @pytest.fixture(autouse=True)
     def stub_security(self, monkeypatch: Any) -> None:
         monkeypatch.setattr(
-            "apple_mail_mcp.server.check_test_mode_safety",
+            "apple_mail_mcp.tools.drafts.check_test_mode_safety",
             lambda *a, **kw: None,
         )
 
@@ -3532,7 +3539,7 @@ class TestDraftToolErrorPaths:
         mock_mail: MagicMock,
         mock_logger: MagicMock,
     ) -> None:
-        from apple_mail_mcp.server import draft_create
+        from apple_mail_mcp.tools.drafts import draft_create
 
         mock_mail.create_draft.side_effect = MailMessageNotFoundError(
             "no message"
@@ -3546,7 +3553,7 @@ class TestDraftToolErrorPaths:
         mock_mail: MagicMock,
         mock_logger: MagicMock,
     ) -> None:
-        from apple_mail_mcp.server import draft_create
+        from apple_mail_mcp.tools.drafts import draft_create
 
         mock_mail.create_draft.side_effect = MailAccountNotFoundError(
             "no account 'Bogus'"
@@ -3563,7 +3570,7 @@ class TestDraftToolErrorPaths:
         mock_mail: MagicMock,
         mock_logger: MagicMock,
     ) -> None:
-        from apple_mail_mcp.server import draft_create
+        from apple_mail_mcp.tools.drafts import draft_create
 
         mock_mail.create_draft.side_effect = FileNotFoundError(
             "attachment missing"
@@ -3580,7 +3587,7 @@ class TestDraftToolErrorPaths:
         mock_mail: MagicMock,
         mock_logger: MagicMock,
     ) -> None:
-        from apple_mail_mcp.server import draft_create
+        from apple_mail_mcp.tools.drafts import draft_create
 
         mock_mail.create_draft.side_effect = MailAppleScriptError(
             "osascript failed"
@@ -3596,7 +3603,7 @@ class TestDraftToolErrorPaths:
         mock_mail: MagicMock,
         mock_logger: MagicMock,
     ) -> None:
-        from apple_mail_mcp.server import draft_create
+        from apple_mail_mcp.tools.drafts import draft_create
 
         mock_mail.create_draft.side_effect = RuntimeError("boom")
         result = draft_create(
@@ -3610,7 +3617,7 @@ class TestDraftToolErrorPaths:
         mock_mail: MagicMock,
         mock_logger: MagicMock,
     ) -> None:
-        from apple_mail_mcp.server import draft_create
+        from apple_mail_mcp.tools.drafts import draft_create
 
         # No template stored at this name → template_not_found.
         result = draft_create(
@@ -3631,7 +3638,7 @@ class TestDraftToolErrorPaths:
         mock_logger: MagicMock,
     ) -> None:
         from apple_mail_mcp.exceptions import MailDraftNotFoundError
-        from apple_mail_mcp.server import draft_update
+        from apple_mail_mcp.tools.drafts import draft_update
 
         mock_mail.get_draft_state.side_effect = MailDraftNotFoundError(
             "no draft"
@@ -3645,7 +3652,7 @@ class TestDraftToolErrorPaths:
         mock_mail: MagicMock,
         mock_logger: MagicMock,
     ) -> None:
-        from apple_mail_mcp.server import draft_update
+        from apple_mail_mcp.tools.drafts import draft_update
 
         mock_mail.get_draft_state.return_value = {
             "draft_id": "160991", "to": [], "cc": [], "bcc": [],
@@ -3663,7 +3670,7 @@ class TestDraftToolErrorPaths:
         mock_mail: MagicMock,
         mock_logger: MagicMock,
     ) -> None:
-        from apple_mail_mcp.server import draft_update
+        from apple_mail_mcp.tools.drafts import draft_update
 
         mock_mail.get_draft_state.return_value = {
             "draft_id": "160991", "to": [], "cc": [], "bcc": [],
@@ -3680,7 +3687,7 @@ class TestDraftToolErrorPaths:
         mock_mail: MagicMock,
         mock_logger: MagicMock,
     ) -> None:
-        from apple_mail_mcp.server import draft_update
+        from apple_mail_mcp.tools.drafts import draft_update
 
         mock_mail.get_draft_state.side_effect = RuntimeError("boom")
         result = draft_update(draft_id="160991", body="x")
@@ -3696,7 +3703,7 @@ class TestDraftToolErrorPaths:
     ) -> None:
         """When extraction populates tempdir, it must be cleaned up
         even on a downstream failure."""
-        from apple_mail_mcp.server import draft_update
+        from apple_mail_mcp.tools.drafts import draft_update
 
         mock_mail.get_draft_state.return_value = {
             "draft_id": "160991", "to": ["a@example.com"],
@@ -3714,7 +3721,7 @@ class TestDraftToolErrorPaths:
             return td
 
         monkeypatch.setattr(
-            "apple_mail_mcp.server.tempfile.TemporaryDirectory",
+            "apple_mail_mcp.tools.drafts.tempfile.TemporaryDirectory",
             tracking_tempdir,
         )
 
@@ -3751,7 +3758,7 @@ class TestDraftToolErrorPaths:
         mock_mail: MagicMock,
         mock_logger: MagicMock,
     ) -> None:
-        from apple_mail_mcp.server import draft_delete
+        from apple_mail_mcp.tools.drafts import draft_delete
 
         mock_mail.delete_draft.side_effect = MailAppleScriptError("boom")
         result = draft_delete(draft_id="160991")
@@ -3763,7 +3770,7 @@ class TestDraftToolErrorPaths:
         mock_mail: MagicMock,
         mock_logger: MagicMock,
     ) -> None:
-        from apple_mail_mcp.server import draft_delete
+        from apple_mail_mcp.tools.drafts import draft_delete
 
         mock_mail.delete_draft.side_effect = RuntimeError("boom")
         result = draft_delete(draft_id="160991")
@@ -3780,7 +3787,7 @@ class TestDraftToolErrorPaths:
         exists and the requested end state holds; report it beside the
         success rather than as a failure."""
         from apple_mail_mcp.exceptions import MailDraftNotFoundError
-        from apple_mail_mcp.server import draft_update
+        from apple_mail_mcp.tools.drafts import draft_update
 
         mock_mail.get_draft_state.return_value = {
             "draft_id": "160991", "to": [], "cc": [], "bcc": [],
@@ -3803,8 +3810,8 @@ class TestDraftToolErrorPaths:
         mock_logger: MagicMock,
     ) -> None:
         """Template renders subject + body when caller didn't supply them."""
-        from apple_mail_mcp.server import draft_update
         from apple_mail_mcp.templates import Template, TemplateStore
+        from apple_mail_mcp.tools.drafts import draft_update
 
         # Write a template the renderer can pick up.
         store = TemplateStore()
@@ -3854,13 +3861,14 @@ class TestDraftSendTool:
         mock_ctx_accept: MagicMock,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        from apple_mail_mcp import server as server_mod
-        from apple_mail_mcp.server import draft_send
+        from apple_mail_mcp.tools.drafts import draft_send
 
         # Force the allowlist bypass off so the prompt is exercised. The
         # connector-layer gate still sees the conftest allowlist
         # (@example.com is on it), so the send completes.
-        monkeypatch.setattr(server_mod, "all_recipients_allowed", lambda r: False)
+        monkeypatch.setattr(
+            "apple_mail_mcp.tools.send.all_recipients_allowed", lambda r: False
+        )
         mock_mail.get_draft_state.return_value = dict(self._STATE)
         mock_mail.create_draft.return_value = {"draft_id": "", "sent_message_id": ""}
 
@@ -3877,10 +3885,11 @@ class TestDraftSendTool:
         mock_ctx_decline: MagicMock,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        from apple_mail_mcp import server as server_mod
-        from apple_mail_mcp.server import draft_send
+        from apple_mail_mcp.tools.drafts import draft_send
 
-        monkeypatch.setattr(server_mod, "all_recipients_allowed", lambda r: False)
+        monkeypatch.setattr(
+            "apple_mail_mcp.tools.send.all_recipients_allowed", lambda r: False
+        )
         mock_mail.get_draft_state.return_value = dict(self._STATE)
 
         result = await draft_send(draft_id="160991", ctx=mock_ctx_decline)
@@ -3898,10 +3907,11 @@ class TestDraftSendTool:
         """#226 integration test: a send that needs the user's
         confirmation surfaces the helper's confirmation_required error
         rather than completing when no ctx is supplied."""
-        from apple_mail_mcp import server as server_mod
-        from apple_mail_mcp.server import draft_send
+        from apple_mail_mcp.tools.drafts import draft_send
 
-        monkeypatch.setattr(server_mod, "all_recipients_allowed", lambda r: False)
+        monkeypatch.setattr(
+            "apple_mail_mcp.tools.send.all_recipients_allowed", lambda r: False
+        )
         mock_mail.get_draft_state.return_value = dict(self._STATE)
 
         result = await draft_send(draft_id="160991", ctx=None)
@@ -3916,7 +3926,7 @@ class TestDraftSendTool:
         mock_logger: MagicMock,
     ) -> None:
         from apple_mail_mcp.drafts import DraftStateStore, SeedRecord
-        from apple_mail_mcp.server import draft_send
+        from apple_mail_mcp.tools.drafts import draft_send
 
         store = DraftStateStore()
         store.set_seed(
@@ -3938,13 +3948,13 @@ class TestDraftSendTool:
         monkeypatch: Any,
         mock_ctx_accept: MagicMock,
     ) -> None:
-        from apple_mail_mcp.server import draft_send
+        from apple_mail_mcp.tools.drafts import draft_send
 
         mock_mail.get_draft_state.return_value = {
             **self._STATE, "to": ["real@gmail.com"],
         }
         monkeypatch.setattr(
-            "apple_mail_mcp.server.check_test_mode_safety",
+            "apple_mail_mcp.tools.drafts.check_test_mode_safety",
             lambda *a, **kw: {
                 "success": False, "error": "blocked",
                 "error_type": "safety_violation",
@@ -3966,7 +3976,7 @@ class TestDraftSendTool:
         whoever Mail derives from the original, and test mode would never
         see them. draft_send reads the recipients from the draft, and one
         with none is refused before any gate or connector call."""
-        from apple_mail_mcp.server import draft_send
+        from apple_mail_mcp.tools.drafts import draft_send
 
         monkeypatch.setenv("MAIL_TEST_MODE", "true")
         monkeypatch.setenv("MAIL_TEST_ACCOUNT", "TestAccount")
@@ -3987,11 +3997,11 @@ class TestDraftSendTool:
         monkeypatch: Any,
         mock_ctx_accept: MagicMock,
     ) -> None:
-        from apple_mail_mcp.server import draft_send
+        from apple_mail_mcp.tools.drafts import draft_send
 
         mock_mail.get_draft_state.return_value = dict(self._STATE)
         monkeypatch.setattr(
-            "apple_mail_mcp.server.check_rate_limit",
+            "apple_mail_mcp.tools.drafts.check_rate_limit",
             lambda *a, **kw: {
                 "success": False, "error": "limit",
                 "error_type": "rate_limit",
@@ -4031,7 +4041,7 @@ class TestRuleToolsBindTheActionToTheConfirmedRule:
     async def test_delete_rule_passes_the_confirmed_name_to_the_connector(
         self, mock_mail: MagicMock, mock_logger: MagicMock, mock_ctx_accept: MagicMock
     ) -> None:
-        from apple_mail_mcp.server import delete_rule
+        from apple_mail_mcp.tools.accounts_rules import delete_rule
 
         mock_mail.list_rules.return_value = [{"index": 2, "name": "Junk filter"}]
         mock_mail.delete_rule.return_value = "Junk filter"
@@ -4046,7 +4056,7 @@ class TestRuleToolsBindTheActionToTheConfirmedRule:
         self, mock_mail: MagicMock, mock_logger: MagicMock, mock_ctx_accept: MagicMock
     ) -> None:
         from apple_mail_mcp.exceptions import MailRuleChangedError
-        from apple_mail_mcp.server import delete_rule
+        from apple_mail_mcp.tools.accounts_rules import delete_rule
 
         mock_mail.list_rules.return_value = [{"index": 2, "name": "Junk filter"}]
         mock_mail.delete_rule.side_effect = MailRuleChangedError(
@@ -4065,7 +4075,7 @@ class TestRuleToolsBindTheActionToTheConfirmedRule:
     async def test_update_rule_passes_the_confirmed_name_to_the_connector(
         self, mock_mail: MagicMock, mock_logger: MagicMock, mock_ctx_accept: MagicMock
     ) -> None:
-        from apple_mail_mcp.server import update_rule
+        from apple_mail_mcp.tools.accounts_rules import update_rule
 
         mock_mail.list_rules.return_value = [{"index": 3, "name": "Newsletters"}]
 
@@ -4079,7 +4089,7 @@ class TestRuleToolsBindTheActionToTheConfirmedRule:
         self, mock_mail: MagicMock, mock_logger: MagicMock, mock_ctx_accept: MagicMock
     ) -> None:
         from apple_mail_mcp.exceptions import MailRuleChangedError
-        from apple_mail_mcp.server import update_rule
+        from apple_mail_mcp.tools.accounts_rules import update_rule
 
         mock_mail.list_rules.return_value = [{"index": 3, "name": "Newsletters"}]
         mock_mail.update_rule.side_effect = MailRuleChangedError(

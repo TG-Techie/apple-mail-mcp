@@ -2,8 +2,9 @@
 for which recipient addresses may receive outbound mail.
 
 Imported by BOTH:
-  - ``server.py``      — to short-circuit MCP elicitation when all
-                          recipients are pre-trusted.
+  - ``tools/send.py`` — to refuse an off-list send before Mail is
+                        touched, and to short-circuit MCP elicitation
+                        when all recipients are pre-trusted.
   - ``mail_connector.py`` — to HARD-BLOCK any attempt to actually dispatch
                             mail (``tell theMessage to send``) when any
                             recipient is off-list. This is the policy

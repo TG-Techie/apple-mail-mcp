@@ -39,7 +39,7 @@ This rejects `..`, slashes, dots, spaces, control characters, and oversized leng
 
 ## Rate limiting
 
-Every MCP tool wrapper in [`server.py`](../../src/apple_mail_mcp/server.py) must call [`check_rate_limit`](../../src/apple_mail_mcp/security.py#L180) as its first action and return immediately if the call is rate-limited. The tool name must be registered in [`OPERATION_TIERS`](../../src/apple_mail_mcp/security.py#L122) under one of three tiers:
+Every MCP tool wrapper in [`tools/`](../../src/apple_mail_mcp/tools/) must call [`check_rate_limit`](../../src/apple_mail_mcp/security.py#L180) as its first action and return immediately if the call is rate-limited. The tool name must be registered in [`OPERATION_TIERS`](../../src/apple_mail_mcp/security.py#L122) under one of three tiers:
 
 | Tier | Cap | Use for |
 |------|-----|---------|

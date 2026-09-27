@@ -42,7 +42,7 @@ class TestDraftCreate:
         isolated_drafts: None,
         mock_mail: MagicMock,
     ) -> None:
-        from apple_mail_mcp.server import draft_create
+        from apple_mail_mcp.tools.drafts import draft_create
 
         mock_mail.create_draft.return_value = {
             "draft_id": "ABCD", "sent_message_id": ""
@@ -68,7 +68,7 @@ class TestDraftCreate:
         monkeypatch.delenv(
             "APPLE_MAIL_MCP_SEND_ELICITATION_ALLOWLIST", raising=False
         )
-        from apple_mail_mcp.server import draft_create
+        from apple_mail_mcp.tools.drafts import draft_create
 
         mock_mail.create_draft.return_value = {
             "draft_id": "X1", "sent_message_id": ""
@@ -91,7 +91,7 @@ class TestDraftCreateAttachmentsAreCheckedLikeASend:
     def test_missing_file_fails_before_connector(
         self, isolated_drafts: None, mock_mail: MagicMock
     ) -> None:
-        from apple_mail_mcp.server import draft_create
+        from apple_mail_mcp.tools.drafts import draft_create
 
         result = draft_create(
             to=["alice@example.com"], subject="x", body="b",
@@ -104,7 +104,7 @@ class TestDraftCreateAttachmentsAreCheckedLikeASend:
     def test_blocked_extension_fails_before_connector(
         self, isolated_drafts: None, mock_mail: MagicMock, tmp_path: Any
     ) -> None:
-        from apple_mail_mcp.server import draft_create
+        from apple_mail_mcp.tools.drafts import draft_create
 
         f = tmp_path / "installer.exe"
         f.write_bytes(b"MZ")
@@ -121,7 +121,7 @@ class TestDraftCreateAttachmentsAreCheckedLikeASend:
         self, isolated_drafts: None, mock_mail: MagicMock, tmp_path: Any,
         monkeypatch: Any,
     ) -> None:
-        from apple_mail_mcp.server import draft_create
+        from apple_mail_mcp.tools.drafts import draft_create
 
         f = tmp_path / "big.bin"
         f.write_bytes(b"x")
@@ -151,7 +151,7 @@ class TestDraftCreateAttachmentsAreCheckedLikeASend:
     ) -> None:
         from pathlib import Path
 
-        from apple_mail_mcp.server import draft_create
+        from apple_mail_mcp.tools.drafts import draft_create
 
         f = tmp_path / "report.pdf"
         f.write_bytes(b"%PDF-1.4 fake")
@@ -184,7 +184,7 @@ class TestDraftUpdateAttachmentsAreCheckedLikeASend:
     def test_blocked_extension_is_refused_and_the_draft_is_untouched(
         self, isolated_drafts: None, mock_mail: MagicMock, tmp_path: Any
     ) -> None:
-        from apple_mail_mcp.server import draft_update
+        from apple_mail_mcp.tools.drafts import draft_update
 
         mock_mail.get_draft_state.return_value = dict(self._STATE)
         f = tmp_path / "payload.sh"
@@ -199,7 +199,7 @@ class TestDraftUpdateAttachmentsAreCheckedLikeASend:
     def test_missing_file_is_refused_and_the_draft_is_untouched(
         self, isolated_drafts: None, mock_mail: MagicMock
     ) -> None:
-        from apple_mail_mcp.server import draft_update
+        from apple_mail_mcp.tools.drafts import draft_update
 
         mock_mail.get_draft_state.return_value = dict(self._STATE)
         result = draft_update(
@@ -213,7 +213,7 @@ class TestDraftUpdateAttachmentsAreCheckedLikeASend:
     def test_clearing_attachments_needs_no_files(
         self, isolated_drafts: None, mock_mail: MagicMock
     ) -> None:
-        from apple_mail_mcp.server import draft_update
+        from apple_mail_mcp.tools.drafts import draft_update
 
         mock_mail.get_draft_state.return_value = dict(self._STATE)
         mock_mail.create_draft.return_value = {
@@ -228,7 +228,7 @@ class TestDraftUpdateAttachmentsAreCheckedLikeASend:
     ) -> None:
         from pathlib import Path
 
-        from apple_mail_mcp.server import draft_update
+        from apple_mail_mcp.tools.drafts import draft_update
 
         state = dict(self._STATE)
         state["attachment_names"] = ["old.exe"]
@@ -266,7 +266,7 @@ class TestAFreshSendCannotChooseTheSender:
     async def test_email_send_html_fresh_is_refused_before_compose(
         self, isolated_drafts: None, mock_mail: MagicMock
     ) -> None:
-        from apple_mail_mcp.server import email_send_html
+        from apple_mail_mcp.tools.send import email_send_html
 
         result = await email_send_html(
             to=["alice@example.com"], subject="x", body="<p>b</p>",
@@ -281,7 +281,7 @@ class TestAFreshSendCannotChooseTheSender:
     async def test_email_send_html_reply_still_honours_it(
         self, isolated_drafts: None, mock_mail: MagicMock
     ) -> None:
-        from apple_mail_mcp.server import email_send_html
+        from apple_mail_mcp.tools.send import email_send_html
 
         mock_mail._send_html_email.return_value = {
             "draft_id": "", "sent_message_id": ""
@@ -302,11 +302,12 @@ class TestAFreshSendCannotChooseTheSender:
     ) -> None:
         """The other limit of the mailto: path. Before this the user
         confirmed the send and the connector then refused it."""
-        from apple_mail_mcp import server as server_mod
-        from apple_mail_mcp.server import draft_send
+        from apple_mail_mcp.tools.drafts import draft_send
 
         # Without the allowlist bypass the send would be put to the user.
-        monkeypatch.setattr(server_mod, "all_recipients_allowed", lambda r: False)
+        monkeypatch.setattr(
+            "apple_mail_mcp.tools.send.all_recipients_allowed", lambda r: False
+        )
         state = dict(self._FRESH_STATE)
         state["attachment_names"] = ["report.pdf"]
         mock_mail.get_draft_state.return_value = state
@@ -322,7 +323,7 @@ class TestAFreshSendCannotChooseTheSender:
     def test_draft_create_saved_keeps_the_sender(
         self, isolated_drafts: None, mock_mail: MagicMock
     ) -> None:
-        from apple_mail_mcp.server import draft_create
+        from apple_mail_mcp.tools.drafts import draft_create
 
         mock_mail.create_draft.return_value = {
             "draft_id": "ABCD", "sent_message_id": ""
@@ -337,7 +338,7 @@ class TestAFreshSendCannotChooseTheSender:
     def test_draft_update_saved_keeps_the_sender(
         self, isolated_drafts: None, mock_mail: MagicMock
     ) -> None:
-        from apple_mail_mcp.server import draft_update
+        from apple_mail_mcp.tools.drafts import draft_update
 
         mock_mail.get_draft_state.return_value = dict(self._FRESH_STATE)
         mock_mail.create_draft.return_value = {
@@ -366,7 +367,7 @@ class TestDraftUpdateKeepsTheDraftInItsAccount:
     def test_carries_the_existing_sender_over(
         self, isolated_drafts: None, mock_mail: MagicMock
     ) -> None:
-        from apple_mail_mcp.server import draft_update
+        from apple_mail_mcp.tools.drafts import draft_update
 
         mock_mail.get_draft_state.return_value = dict(self._STATE)
         mock_mail.create_draft.return_value = {"draft_id": "NEW", "sent_message_id": ""}
@@ -378,7 +379,7 @@ class TestDraftUpdateKeepsTheDraftInItsAccount:
     def test_an_explicit_override_wins(
         self, isolated_drafts: None, mock_mail: MagicMock
     ) -> None:
-        from apple_mail_mcp.server import draft_update
+        from apple_mail_mcp.tools.drafts import draft_update
 
         mock_mail.get_draft_state.return_value = dict(self._STATE)
         mock_mail.create_draft.return_value = {"draft_id": "NEW", "sent_message_id": ""}
@@ -388,7 +389,7 @@ class TestDraftUpdateKeepsTheDraftInItsAccount:
     def test_a_draft_with_no_sender_recorded_is_left_to_mail(
         self, isolated_drafts: None, mock_mail: MagicMock
     ) -> None:
-        from apple_mail_mcp.server import draft_update
+        from apple_mail_mcp.tools.drafts import draft_update
 
         state = dict(self._STATE)
         state["sender"] = ""
@@ -404,7 +405,7 @@ class TestDraftUpdateKeepsTheDraftInItsAccount:
         """Reply sends go through the AppleScript compose path, which sets
         the sender; the carried-over sender reaches it."""
         from apple_mail_mcp.drafts import SeedRecord
-        from apple_mail_mcp.server import _get_draft_state_store, draft_send
+        from apple_mail_mcp.tools.drafts import _get_draft_state_store, draft_send
 
         _get_draft_state_store().set_seed(
             "OLD", SeedRecord(seed_kind="reply", seed_id="msg-1", body="x")
@@ -429,7 +430,7 @@ class TestDraftUpdateKeepsTheDraftInItsAccount:
         sender to set. The carried-over sender is not passed there — the
         connector would refuse it — and whether that draft's sender matches
         what mailto: will use is not knowable here (DESIGN-QUEUE)."""
-        from apple_mail_mcp.server import draft_send
+        from apple_mail_mcp.tools.drafts import draft_send
 
         mock_mail.get_draft_state.return_value = dict(self._STATE)
         mock_mail.create_draft.return_value = {"draft_id": "", "sent_message_id": ""}
@@ -446,7 +447,7 @@ class TestDraftUpdate:
         isolated_drafts: None,
         mock_mail: MagicMock,
     ) -> None:
-        from apple_mail_mcp.server import draft_update
+        from apple_mail_mcp.tools.drafts import draft_update
 
         mock_mail.get_draft_state.return_value = {
             "draft_id": "OLD",
@@ -471,7 +472,7 @@ class TestDraftDelete:
         isolated_drafts: None,
         mock_mail: MagicMock,
     ) -> None:
-        from apple_mail_mcp.server import draft_delete
+        from apple_mail_mcp.tools.drafts import draft_delete
 
         result = draft_delete(draft_id="ABCD")
         assert result["success"] is True
@@ -491,7 +492,7 @@ class TestDraftSend:
         monkeypatch.delenv(
             "APPLE_MAIL_MCP_SEND_ELICITATION_ALLOWLIST", raising=False
         )
-        from apple_mail_mcp.server import draft_send
+        from apple_mail_mcp.tools.drafts import draft_send
 
         mock_mail.get_draft_state.return_value = {
             "draft_id": "ABCD",
@@ -518,7 +519,7 @@ class TestDraftSend:
         monkeypatch.delenv(
             "APPLE_MAIL_MCP_SEND_ELICITATION_ALLOWLIST", raising=False
         )
-        from apple_mail_mcp.server import draft_send
+        from apple_mail_mcp.tools.drafts import draft_send
 
         mock_mail.get_draft_state.return_value = {
             "draft_id": "ABCD",
@@ -543,7 +544,7 @@ class TestDraftSend:
         monkeypatch.delenv(
             "APPLE_MAIL_MCP_SEND_ELICITATION_ALLOWLIST", raising=False
         )
-        from apple_mail_mcp.server import draft_send
+        from apple_mail_mcp.tools.drafts import draft_send
 
         mock_mail.get_draft_state.return_value = {
             "draft_id": "ABCD",
@@ -574,7 +575,7 @@ class TestDraftSend:
     ) -> None:
         """A draft with no recipients can't be sent — distinct from
         outbound_disallowed; this is a validation error."""
-        from apple_mail_mcp.server import draft_send
+        from apple_mail_mcp.tools.drafts import draft_send
 
         mock_mail.get_draft_state.return_value = {
             "draft_id": "ABCD",
@@ -596,7 +597,7 @@ class TestDraftSend:
         """draft_send on a nonexistent id returns an error from the
         draft-state read, no destructive ops."""
         from apple_mail_mcp.exceptions import MailDraftNotFoundError
-        from apple_mail_mcp.server import draft_send
+        from apple_mail_mcp.tools.drafts import draft_send
 
         mock_mail.get_draft_state.side_effect = MailDraftNotFoundError(
             "no draft with id 'GONE'"
@@ -622,7 +623,7 @@ class TestDraftSend:
         monkeypatch.delenv(
             "APPLE_MAIL_MCP_SEND_ELICITATION_ALLOWLIST", raising=False
         )
-        from apple_mail_mcp.server import draft_send
+        from apple_mail_mcp.tools.drafts import draft_send
 
         mock_mail.get_draft_state.return_value = {
             "draft_id": "1390",
@@ -671,7 +672,7 @@ class TestAReplyOrForwardIsRebuiltFromTheCallersOwnText:
         return state
 
     def _create_forward(self, mock_mail: MagicMock, **kwargs: Any) -> str:
-        from apple_mail_mcp.server import draft_create
+        from apple_mail_mcp.tools.drafts import draft_create
 
         mock_mail.create_draft.return_value = {"draft_id": "D1", "sent_message_id": ""}
         created = draft_create(forward_of="msg-1", to=["alice@example.com"], **kwargs)
@@ -681,7 +682,7 @@ class TestAReplyOrForwardIsRebuiltFromTheCallersOwnText:
     async def test_a_forward_created_with_a_note_sends_the_note(
         self, isolated_drafts: None, mock_mail: MagicMock
     ) -> None:
-        from apple_mail_mcp.server import draft_send
+        from apple_mail_mcp.tools.drafts import draft_send
 
         draft_id = self._create_forward(mock_mail, body="note")
         mock_mail.get_draft_state.return_value = self._state()
@@ -697,7 +698,7 @@ class TestAReplyOrForwardIsRebuiltFromTheCallersOwnText:
     async def test_a_forward_created_without_a_body_sends_none(
         self, isolated_drafts: None, mock_mail: MagicMock
     ) -> None:
-        from apple_mail_mcp.server import draft_send
+        from apple_mail_mcp.tools.drafts import draft_send
 
         draft_id = self._create_forward(mock_mail)
         mock_mail.get_draft_state.return_value = self._state(body="the original text")
@@ -709,7 +710,7 @@ class TestAReplyOrForwardIsRebuiltFromTheCallersOwnText:
     async def test_an_update_that_leaves_the_body_keeps_the_callers_text(
         self, isolated_drafts: None, mock_mail: MagicMock
     ) -> None:
-        from apple_mail_mcp.server import draft_send, draft_update
+        from apple_mail_mcp.tools.drafts import draft_send, draft_update
 
         draft_id = self._create_forward(mock_mail, body="note")
         mock_mail.get_draft_state.return_value = self._state()
@@ -728,7 +729,7 @@ class TestAReplyOrForwardIsRebuiltFromTheCallersOwnText:
     def test_an_update_with_a_new_body_records_it(
         self, isolated_drafts: None, mock_mail: MagicMock
     ) -> None:
-        from apple_mail_mcp.server import _get_draft_state_store, draft_update
+        from apple_mail_mcp.tools.drafts import _get_draft_state_store, draft_update
 
         draft_id = self._create_forward(mock_mail, body="note")
         mock_mail.get_draft_state.return_value = self._state()
@@ -744,7 +745,7 @@ class TestAReplyOrForwardIsRebuiltFromTheCallersOwnText:
     ) -> None:
         """Created outside this server: the reply is found by its
         In-Reply-To header, and the only body there is is the read-back."""
-        from apple_mail_mcp.server import draft_send
+        from apple_mail_mcp.tools.drafts import draft_send
 
         mock_mail.get_draft_state.return_value = self._state(
             subject="Re: hi", in_reply_to="<orig@example.com>",
@@ -762,7 +763,7 @@ class TestAReplyOrForwardIsRebuiltFromTheCallersOwnText:
         self, isolated_drafts: None, mock_mail: MagicMock
     ) -> None:
         from apple_mail_mcp.drafts import SeedRecord
-        from apple_mail_mcp.server import _get_draft_state_store, draft_send
+        from apple_mail_mcp.tools.drafts import _get_draft_state_store, draft_send
 
         _get_draft_state_store().set_seed(
             "OLD1", SeedRecord(seed_kind="forward", seed_id="msg-1")
@@ -778,7 +779,7 @@ class TestAReplyOrForwardIsRebuiltFromTheCallersOwnText:
     ) -> None:
         """A fresh draft quotes nothing, so its read-back content is its
         whole body."""
-        from apple_mail_mcp.server import draft_send
+        from apple_mail_mcp.tools.drafts import draft_send
 
         mock_mail.get_draft_state.return_value = self._state(
             subject="hi", body="the whole body",
@@ -826,7 +827,7 @@ class TestAReplyOrForwardCarriesOnlyTheCallersAttachments:
     def _create_forward(
         self, mock_mail: MagicMock, attachment_paths: list[str]
     ) -> str:
-        from apple_mail_mcp.server import draft_create
+        from apple_mail_mcp.tools.drafts import draft_create
 
         mock_mail.create_draft.return_value = {"draft_id": "D1", "sent_message_id": ""}
         created = draft_create(
@@ -839,7 +840,7 @@ class TestAReplyOrForwardCarriesOnlyTheCallersAttachments:
     async def test_a_send_re_attaches_only_what_the_caller_added(
         self, isolated_drafts: None, mock_mail: MagicMock, tmp_path: Any
     ) -> None:
-        from apple_mail_mcp.server import draft_send
+        from apple_mail_mcp.tools.drafts import draft_send
 
         mine = tmp_path / "mine.pdf"
         mine.write_bytes(b"%PDF")
@@ -861,7 +862,7 @@ class TestAReplyOrForwardCarriesOnlyTheCallersAttachments:
     async def test_a_forward_the_caller_attached_nothing_to_re_attaches_nothing(
         self, isolated_drafts: None, mock_mail: MagicMock
     ) -> None:
-        from apple_mail_mcp.server import draft_send
+        from apple_mail_mcp.tools.drafts import draft_send
 
         draft_id = self._create_forward(mock_mail, [])
         mock_mail.get_draft_state.return_value = self._state(
@@ -877,7 +878,7 @@ class TestAReplyOrForwardCarriesOnlyTheCallersAttachments:
     def test_an_update_that_leaves_attachments_carries_only_the_callers(
         self, isolated_drafts: None, mock_mail: MagicMock, tmp_path: Any
     ) -> None:
-        from apple_mail_mcp.server import _get_draft_state_store, draft_update
+        from apple_mail_mcp.tools.drafts import _get_draft_state_store, draft_update
 
         mine = tmp_path / "mine.pdf"
         mine.write_bytes(b"%PDF")
@@ -897,7 +898,7 @@ class TestAReplyOrForwardCarriesOnlyTheCallersAttachments:
     def test_an_update_that_replaces_attachments_records_the_new_ones(
         self, isolated_drafts: None, mock_mail: MagicMock, tmp_path: Any
     ) -> None:
-        from apple_mail_mcp.server import _get_draft_state_store, draft_update
+        from apple_mail_mcp.tools.drafts import _get_draft_state_store, draft_update
 
         draft_id = self._create_forward(mock_mail, [])
         other = tmp_path / "other.pdf"
@@ -919,7 +920,7 @@ class TestAReplyOrForwardCarriesOnlyTheCallersAttachments:
         """Mail no longer lists a file the caller attached under the name
         it was recorded with, or saving it out failed: sending without it
         would drop it quietly, so nothing is sent and the draft stays."""
-        from apple_mail_mcp.server import draft_send
+        from apple_mail_mcp.tools.drafts import draft_send
 
         mine = tmp_path / "mine.pdf"
         mine.write_bytes(b"%PDF")
@@ -967,7 +968,7 @@ class TestAFailureLeavesTheDraftWhereItWas:
     ) -> None:
         from apple_mail_mcp.drafts import SeedRecord
         from apple_mail_mcp.exceptions import MailAppleScriptError
-        from apple_mail_mcp.server import _get_draft_state_store, draft_send
+        from apple_mail_mcp.tools.drafts import _get_draft_state_store, draft_send
 
         _get_draft_state_store().set_seed(
             "ABCD", SeedRecord(seed_kind="reply", seed_id="msg-1")
@@ -984,7 +985,7 @@ class TestAFailureLeavesTheDraftWhereItWas:
         self, isolated_drafts: None, mock_mail: MagicMock
     ) -> None:
         from apple_mail_mcp.exceptions import MailMessageNotFoundError
-        from apple_mail_mcp.server import draft_update
+        from apple_mail_mcp.tools.drafts import draft_update
 
         mock_mail.get_draft_state.return_value = dict(self._STATE)
         mock_mail.create_draft.side_effect = MailMessageNotFoundError(
@@ -998,7 +999,7 @@ class TestAFailureLeavesTheDraftWhereItWas:
     def test_the_old_draft_goes_only_after_the_new_one_exists(
         self, isolated_drafts: None, mock_mail: MagicMock
     ) -> None:
-        from apple_mail_mcp.server import draft_update
+        from apple_mail_mcp.tools.drafts import draft_update
 
         mock_mail.get_draft_state.return_value = dict(self._STATE)
         mock_mail.create_draft.return_value = {"draft_id": "EFGH", "sent_message_id": ""}
@@ -1015,7 +1016,7 @@ class TestAFailureLeavesTheDraftWhereItWas:
         self, isolated_drafts: None, mock_mail: MagicMock
     ) -> None:
         from apple_mail_mcp.exceptions import MailAppleScriptError
-        from apple_mail_mcp.server import draft_send
+        from apple_mail_mcp.tools.drafts import draft_send
 
         mock_mail.get_draft_state.return_value = dict(self._STATE)
         mock_mail.create_draft.return_value = {"draft_id": "", "sent_message_id": ""}
@@ -1030,7 +1031,7 @@ class TestAFailureLeavesTheDraftWhereItWas:
         self, isolated_drafts: None, mock_mail: MagicMock
     ) -> None:
         from apple_mail_mcp.exceptions import MailDraftNotFoundError
-        from apple_mail_mcp.server import draft_update
+        from apple_mail_mcp.tools.drafts import draft_update
 
         mock_mail.get_draft_state.return_value = dict(self._STATE)
         mock_mail.create_draft.return_value = {"draft_id": "EFGH", "sent_message_id": ""}
@@ -1054,7 +1055,7 @@ class TestAllowlistUnavailableFailClosed:
         mock_mail: MagicMock,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        from apple_mail_mcp.server import draft_send
+        from apple_mail_mcp.tools.drafts import draft_send
 
         monkeypatch.setenv(
             "APPLE_MAIL_MCP_COMMS_CONFIG", "/nonexistent/comms.yaml"
@@ -1080,7 +1081,7 @@ class TestAllowlistUnavailableFailClosed:
         mock_mail: MagicMock,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        from apple_mail_mcp.server import email_send_html
+        from apple_mail_mcp.tools.send import email_send_html
 
         monkeypatch.setenv(
             "APPLE_MAIL_MCP_COMMS_CONFIG", "/nonexistent/comms.yaml"
@@ -1102,7 +1103,8 @@ class TestBothSendsMeetOneOutboundGate:
     UNSENT = " Nothing was sent; the draft, if any, is unchanged."
 
     async def _send(self, tool: str, to: list[str], mock_mail: MagicMock) -> Any:
-        from apple_mail_mcp.server import draft_send, email_send_html
+        from apple_mail_mcp.tools.drafts import draft_send
+        from apple_mail_mcp.tools.send import email_send_html
 
         if tool == "draft_send":
             mock_mail.get_draft_state.return_value = {
@@ -1168,7 +1170,7 @@ class TestDraftSendHtml:
         """attachment_paths flow through to the connector as Paths."""
         from pathlib import Path
 
-        from apple_mail_mcp.server import email_send_html
+        from apple_mail_mcp.tools.send import email_send_html
 
         f = tmp_path / "report.pdf"
         f.write_bytes(b"%PDF-1.4 fake")
@@ -1191,7 +1193,7 @@ class TestDraftSendHtml:
         isolated_drafts: None,
         mock_mail: MagicMock,
     ) -> None:
-        from apple_mail_mcp.server import email_send_html
+        from apple_mail_mcp.tools.send import email_send_html
 
         result = await email_send_html(
             to=["alice@example.com"],
@@ -1210,7 +1212,7 @@ class TestDraftSendHtml:
         tmp_path: Any,
     ) -> None:
         """Executable attachments are refused (security checklist)."""
-        from apple_mail_mcp.server import email_send_html
+        from apple_mail_mcp.tools.send import email_send_html
 
         f = tmp_path / "installer.exe"
         f.write_bytes(b"MZ")
@@ -1232,7 +1234,7 @@ class TestDraftSendHtml:
         tmp_path: Any,
         monkeypatch: Any,
     ) -> None:
-        from apple_mail_mcp.server import email_send_html
+        from apple_mail_mcp.tools.send import email_send_html
 
         f = tmp_path / "big.bin"
         f.write_bytes(b"x")
@@ -1268,7 +1270,7 @@ class TestDraftSendHtml:
     ) -> None:
         """reply_to + attachments is explicitly unsupported for now —
         clear validation error, no connector call, nothing sent."""
-        from apple_mail_mcp.server import email_send_html
+        from apple_mail_mcp.tools.send import email_send_html
 
         f = tmp_path / "a.txt"
         f.write_text("x")
@@ -1289,7 +1291,7 @@ class TestDraftSendHtml:
         mock_mail: MagicMock,
     ) -> None:
         """Happy path: allowlisted recipient → _send_html_email is called."""
-        from apple_mail_mcp.server import email_send_html
+        from apple_mail_mcp.tools.send import email_send_html
 
         mock_mail._send_html_email.return_value = {
             "draft_id": "", "sent_message_id": ""
@@ -1319,7 +1321,7 @@ class TestDraftSendHtml:
         monkeypatch.delenv(
             "APPLE_MAIL_MCP_SEND_ELICITATION_ALLOWLIST", raising=False
         )
-        from apple_mail_mcp.server import email_send_html
+        from apple_mail_mcp.tools.send import email_send_html
 
         result = await email_send_html(
             to=["random@other.com"],
@@ -1360,7 +1362,7 @@ class TestEmailSendHtmlIsConfinedInTestMode:
         mock_mail: MagicMock,
         allowlisted_real_domain: None,
     ) -> None:
-        from apple_mail_mcp.server import email_send_html
+        from apple_mail_mcp.tools.send import email_send_html
 
         result = await email_send_html(
             to=["someone@partner.com"], subject="s", body="<p>b</p>",
@@ -1380,7 +1382,7 @@ class TestEmailSendHtmlIsConfinedInTestMode:
         """Outside test mode the connector reads the derived set back
         from Mail and gates it; in test mode nothing can vouch for it
         before the send, so it must be explicit."""
-        from apple_mail_mcp.server import email_send_html
+        from apple_mail_mcp.tools.send import email_send_html
 
         result = await email_send_html(
             reply_to="12345", body="<p>b</p>",
@@ -1396,7 +1398,7 @@ class TestEmailSendHtmlIsConfinedInTestMode:
         mock_mail: MagicMock,
         allowlisted_real_domain: None,
     ) -> None:
-        from apple_mail_mcp.server import email_send_html
+        from apple_mail_mcp.tools.send import email_send_html
 
         mock_mail._send_html_email.return_value = {
             "draft_id": "", "sent_message_id": "",
@@ -1418,7 +1420,7 @@ class TestEmailSendHtmlIsConfinedInTestMode:
         """MAIL_TEST_LOOPBACK admits one real address, so a read-back
         test can send to a mailbox that delivers back to the test
         account. The allowlist still applies on top: this one is on it."""
-        from apple_mail_mcp.server import email_send_html
+        from apple_mail_mcp.tools.send import email_send_html
 
         monkeypatch.setenv("MAIL_TEST_LOOPBACK", "someone@partner.com")
         mock_mail._send_html_email.return_value = {
@@ -1458,7 +1460,7 @@ class TestANamedSenderIsConfinedInTestMode:
     def test_draft_create_from_another_account_is_refused(
         self, isolated_drafts: None, mock_mail: MagicMock, test_mode: None,
     ) -> None:
-        from apple_mail_mcp.server import draft_create
+        from apple_mail_mcp.tools.drafts import draft_create
 
         result = draft_create(
             to=["alice@example.com"], subject="s", body="b",
@@ -1471,7 +1473,7 @@ class TestANamedSenderIsConfinedInTestMode:
     def test_draft_create_from_the_test_account_proceeds(
         self, isolated_drafts: None, mock_mail: MagicMock, test_mode: None,
     ) -> None:
-        from apple_mail_mcp.server import draft_create
+        from apple_mail_mcp.tools.drafts import draft_create
 
         mock_mail.create_draft.return_value = {
             "draft_id": "NEW", "sent_message_id": "",
@@ -1485,7 +1487,7 @@ class TestANamedSenderIsConfinedInTestMode:
     def test_draft_update_to_another_account_is_refused(
         self, isolated_drafts: None, mock_mail: MagicMock, test_mode: None,
     ) -> None:
-        from apple_mail_mcp.server import draft_update
+        from apple_mail_mcp.tools.drafts import draft_update
 
         mock_mail.get_draft_state.return_value = dict(self._STATE)
         result = draft_update(draft_id="OLD", from_account="Other")
@@ -1499,7 +1501,7 @@ class TestANamedSenderIsConfinedInTestMode:
     ) -> None:
         """The sender read back from Mail is an address, not an account
         the caller named; the draft is recreated where it already is."""
-        from apple_mail_mcp.server import draft_update
+        from apple_mail_mcp.tools.drafts import draft_update
 
         mock_mail.get_draft_state.return_value = dict(self._STATE)
         mock_mail.create_draft.return_value = {
@@ -1512,7 +1514,7 @@ class TestANamedSenderIsConfinedInTestMode:
     async def test_email_send_html_from_another_account_is_refused(
         self, isolated_drafts: None, mock_mail: MagicMock, test_mode: None,
     ) -> None:
-        from apple_mail_mcp.server import email_send_html
+        from apple_mail_mcp.tools.send import email_send_html
 
         result = await email_send_html(
             reply_to="12345", to=["alice@example.com"], body="<p>b</p>",
@@ -1552,7 +1554,7 @@ class TestADraftIdReachesEveryAccountInTestMode:
     def test_delete_of_a_draft_in_another_account_is_refused(
         self, isolated_drafts: None, mock_mail: MagicMock, test_mode: None,
     ) -> None:
-        from apple_mail_mcp.server import draft_delete
+        from apple_mail_mcp.tools.drafts import draft_delete
 
         mock_mail.get_draft_state.return_value = self._state("Work")
         result = draft_delete(draft_id="OLD")
@@ -1563,7 +1565,7 @@ class TestADraftIdReachesEveryAccountInTestMode:
     def test_delete_of_a_draft_with_no_account_is_refused(
         self, isolated_drafts: None, mock_mail: MagicMock, test_mode: None,
     ) -> None:
-        from apple_mail_mcp.server import draft_delete
+        from apple_mail_mcp.tools.drafts import draft_delete
 
         mock_mail.get_draft_state.return_value = self._state("")
         result = draft_delete(draft_id="OLD")
@@ -1574,7 +1576,7 @@ class TestADraftIdReachesEveryAccountInTestMode:
     def test_delete_of_a_draft_in_the_test_account_proceeds(
         self, isolated_drafts: None, mock_mail: MagicMock, test_mode: None,
     ) -> None:
-        from apple_mail_mcp.server import draft_delete
+        from apple_mail_mcp.tools.drafts import draft_delete
 
         mock_mail.get_draft_state.return_value = self._state("TestAccount")
         result = draft_delete(draft_id="OLD")
@@ -1585,7 +1587,7 @@ class TestADraftIdReachesEveryAccountInTestMode:
         self, isolated_drafts: None, mock_mail: MagicMock, test_mode: None,
     ) -> None:
         from apple_mail_mcp.exceptions import MailDraftNotFoundError
-        from apple_mail_mcp.server import draft_delete
+        from apple_mail_mcp.tools.drafts import draft_delete
 
         mock_mail.get_draft_state.side_effect = MailDraftNotFoundError("no")
         result = draft_delete(draft_id="OLD")
@@ -1598,7 +1600,7 @@ class TestADraftIdReachesEveryAccountInTestMode:
         mock_mail: MagicMock,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        from apple_mail_mcp.server import draft_delete
+        from apple_mail_mcp.tools.drafts import draft_delete
 
         monkeypatch.delenv("MAIL_TEST_MODE", raising=False)
         mock_mail.get_draft_state.return_value = self._state("")
@@ -1607,7 +1609,7 @@ class TestADraftIdReachesEveryAccountInTestMode:
     def test_update_of_a_draft_in_another_account_is_refused(
         self, isolated_drafts: None, mock_mail: MagicMock, test_mode: None,
     ) -> None:
-        from apple_mail_mcp.server import draft_update
+        from apple_mail_mcp.tools.drafts import draft_update
 
         mock_mail.get_draft_state.return_value = self._state("Work")
         result = draft_update(draft_id="OLD", body="revised")
@@ -1620,7 +1622,7 @@ class TestADraftIdReachesEveryAccountInTestMode:
     async def test_send_of_a_draft_in_another_account_is_refused(
         self, isolated_drafts: None, mock_mail: MagicMock, test_mode: None,
     ) -> None:
-        from apple_mail_mcp.server import draft_send
+        from apple_mail_mcp.tools.drafts import draft_send
 
         mock_mail.get_draft_state.return_value = self._state("Work")
         result = await draft_send(draft_id="OLD")

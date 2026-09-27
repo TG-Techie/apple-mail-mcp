@@ -379,7 +379,7 @@ def test_forward_without_note_via_tool_lifecycle_carries_original_and_attachment
     gone. After it, the recreate carries that text as a note, which opens
     a compose window named like the one the dictionary save left open,
     and draft_send refuses with COMPOSE_WINDOW_NOT_UNIQUE."""
-    from apple_mail_mcp import server
+    from apple_mail_mcp.tools.drafts import draft_create, draft_send
 
     hexid = _hex()
     seed_subject = f"{PREFIX}lifecycle-forward-seed-{hexid}"
@@ -398,9 +398,9 @@ def test_forward_without_note_via_tool_lifecycle_carries_original_and_attachment
         trash.windows(forward_subject)
         trash.drafts(forward_subject)
         loop.prepare(trash, forward_subject)
-        created = server.draft_create(forward_of=seed.mail_id, to=[loop.address])
+        created = draft_create(forward_of=seed.mail_id, to=[loop.address])
         assert created["success"] is True, created
-        result = asyncio.run(server.draft_send(draft_id=created["draft_id"]))
+        result = asyncio.run(draft_send(draft_id=created["draft_id"]))
         assert result["success"] is True, result
         forward_sent, forward = loop.receive(trash, forward_subject)
 
@@ -422,7 +422,7 @@ def test_draft_create_then_send_arrives_intact(loop: Loopback) -> None:
     tool reads the draft back, gates it, sends a rebuilt copy and retires
     the draft. So this calls the tool itself, which also puts the
     test-mode gate's loopback admission on the live path."""
-    from apple_mail_mcp import server
+    from apple_mail_mcp.tools.drafts import draft_send
 
     hexid = _hex()
     subject = f"{PREFIX}draft-send-{hexid}"
@@ -435,7 +435,7 @@ def test_draft_create_then_send_arrives_intact(loop: Loopback) -> None:
             send_now=False,
         )
         assert created["draft_id"]
-        result = asyncio.run(server.draft_send(draft_id=created["draft_id"]))
+        result = asyncio.run(draft_send(draft_id=created["draft_id"]))
         assert result["success"] is True, result
         sent, arrival = loop.receive(trash, subject)
 

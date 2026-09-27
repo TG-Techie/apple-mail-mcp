@@ -7,8 +7,8 @@ Claude Desktop / MCP Client
         |
         | (MCP JSON-RPC over stdio)
         v
-server.py (FastMCP)
-  |-- 25 @mcp.tool() functions
+server.py (FastMCP) + tools/
+  |-- 25 tools, one module per domain under tools/
   |-- Input validation
   |-- Response formatting
   |-- Error wrapping (exceptions -> dicts)
@@ -74,11 +74,17 @@ operation log become fleet-wide.
 
 | Module | Role | Local dependencies |
 |--------|------|-------------|
-| `server.py` | MCP tool registration (25 `@mcp.tool()` functions), input validation, response shaping, error-to-dict wrapping | `mail_connector`, `drafts`, `imap_connector` (pool only), `outbound_allowlist`, `security`, `templates`, `exceptions` |
+| `server.py` | The root the tools hang off: the FastMCP instance and its instructions, the connector (`server.mail`) and IMAP pool, the user's confirmation and the thread-pool helpers, the error table and `envelope` every tool answers through, and `main`. Imports the tool modules at its end | `mail_connector`, `imap_connector` (pool only), `security`, `exceptions`, `tools` |
+| `tools/accounts_rules.py` | `list_accounts` and the rule tools; a forwarding rule's `forward_to` meets the outbound allowlist here | `server`, `outbound_allowlist`, `security`, `exceptions` |
+| `tools/mailboxes.py` | The mailbox tools: list, create, rename or move, delete | `server`, `security` |
+| `tools/messages.py` | The message tools: search, read, thread, update, save attachments, delete | `server`, `security`, `exceptions` |
+| `tools/templates.py` | The template tools over `TemplateStore` | `server`, `security`, `templates` |
+| `tools/drafts.py` | The draft tools, `draft_create` to `draft_send`; a rebuild takes the caller's own part from the seed record | `server`, `drafts`, `security`, `exceptions`, `tools.send`, `tools.templates` |
+| `tools/send.py` | `email_send_html`, and the gates it shares with `draft_send`: the outbound allowlist, the user's confirmation, the checks on files to attach | `server`, `outbound_allowlist`, `security`, `exceptions` |
 | `mail_connector.py` | All AppleScript generation and execution (`AppleMailConnector`); dispatches to the IMAP fast path for a few bulk ops | `drafts`, `imap_connector`, `keychain`, `outbound_allowlist`, `utils`, `exceptions` |
 | `imap_connector.py` | Stateless IMAP client wrapper (`ImapConnector`) and a pooled-connection helper (`ImapConnectionPool`); deliberately unaware of Mail.app and Keychain — callers hand it resolved `(host, port, email, password)` | `exceptions` |
 | `keychain.py` | Reads/writes IMAP passwords in the macOS Keychain under the `apple-mail-mcp.imap.<account>` service name; backs the `apple-mail-mcp setup-imap` CLI and the IMAP fallback path | `exceptions` |
-| `outbound_allowlist.py` | The single point of truth for which recipient addresses may receive outbound mail. Sourced from a YAML config (`APPLE_MAIL_MCP_COMMS_CONFIG`); fails closed if that config is missing or unreadable. Consulted by both `server.py` (to skip elicitation for pre-trusted recipients) and `mail_connector.py` (as the hard send-time block) | `exceptions` |
+| `outbound_allowlist.py` | The single point of truth for which recipient addresses may receive outbound mail. Sourced from a YAML config (`APPLE_MAIL_MCP_COMMS_CONFIG`); fails closed if that config is missing or unreadable. Consulted by the tools (`tools/send.py` refuses an off-list send before Mail is touched and skips elicitation for pre-trusted recipients; `tools/accounts_rules.py` checks a rule's `forward_to`) and by `mail_connector.py` (as the hard send-time block) | `exceptions` |
 | `security.py` | Rate limiting, audit logging (`OperationLogger`), attachment validation, and the `MAIL_TEST_MODE` safety gate (`check_test_mode_safety`) that confines destructive/send/rule operations to a named test account and reserved test domains | `utils` |
 | `drafts.py` | Persists seed metadata (`seed_kind`, `seed_id`, `reply_all`) and the caller's own text and attachment names per reply or forward draft under `<root>/<draft_id>.json`, since Mail.app forbids mutating a saved draft and `draft_update` and `draft_send` rebuild it | `exceptions` |
 | `templates.py` | Email template storage and `str.format`-style rendering (`TemplateStore`, `Template`); one `<name>.md` file per template under `<root>/templates/` | `exceptions` |
@@ -90,7 +96,7 @@ operation log become fleet-wide.
 
 ## Design Decisions
 
-**Two-file separation, plus a narrow IMAP escape hatch:** `server.py` is thin (MCP plumbing), `mail_connector.py` is thick (domain logic). Business logic never goes in `server.py`. `imap_connector.py` is not a third domain layer — it's a private acceleration path `mail_connector.py` reaches for when it has the credentials, always with an AppleScript fallback.
+**Two-layer separation, plus a narrow IMAP escape hatch:** the server layer, `server.py` and the tool modules under `tools/`, is thin (MCP plumbing: gates, validation, response shape); `mail_connector.py` is thick (domain logic). Business logic never goes in the server layer. A tool module reads the connector as `server.mail` when a tool runs, and another tool module's helpers the same way, through the module (`send.confirm_send`): every tool module loads inside `server`'s own import, so the one imported first is still half-loaded while the rest load. `imap_connector.py` is not a third domain layer — it's a private acceleration path `mail_connector.py` reaches for when it has the credentials, always with an AppleScript fallback.
 
 **Single execution point:** All AppleScript runs through `_run_applescript()`. This is the mock boundary for unit tests and the single place where timeout/error handling lives.
 

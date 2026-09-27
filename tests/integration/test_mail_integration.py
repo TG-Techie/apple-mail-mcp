@@ -584,12 +584,13 @@ class TestDraftsLifecycleIntegration:
         8/8 for the class on both accounts otherwise."""
         from apple_mail_mcp import server
         from apple_mail_mcp.exceptions import MailDraftNotFoundError
+        from apple_mail_mcp.tools.drafts import draft_create, draft_update
 
         monkeypatch.setenv("APPLE_MAIL_MCP_HOME", str(tmp_path))
         monkeypatch.setattr(server, "mail", connector)
         address = _first_address_of(connector, test_account)
 
-        created = server.draft_create(
+        created = draft_create(
             to=["target@example.com"],
             subject="ZZZ-AMM-INTEG-UPDATE-SENDER",
             body="v1",
@@ -599,7 +600,7 @@ class TestDraftsLifecycleIntegration:
         draft_id = created["draft_id"]
         new_draft_id = ""
         try:
-            updated = server.draft_update(draft_id=draft_id, body="v2")
+            updated = draft_update(draft_id=draft_id, body="v2")
             assert updated["success"] is True, updated
             new_draft_id = updated["draft_id"]
             state = connector.get_draft_state(new_draft_id)

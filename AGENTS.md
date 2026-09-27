@@ -79,7 +79,7 @@ quoted original and a forward's own attachments.
 ## Core Principles
 
 - **TDD always** — RED/GREEN/REFACTOR. Tests before implementation.
-- **Backend + frontend together** — Every feature touches `mail_connector.py` AND `server.py`. Verify with `check_client_server_parity.sh`.
+- **Backend + frontend together** — Every feature touches `mail_connector.py` AND its tool module under `tools/`. Verify with `check_client_server_parity.sh`.
 - **Sanitize everything twice** — All user input: `sanitize_input()` then `escape_applescript_string()` before AppleScript.
 - **Structured responses** — Every tool returns `{"success": bool, ...}`. Errors include `error` and `error_type`.
 - **Security checklist per feature** — see [`docs/guides/SECURITY_CHECKLIST.md`](docs/guides/SECURITY_CHECKLIST.md) for the canonical reference (6 concerns: input sanitization, AppleScript escaping, path-traversal-safe name validation, rate limiting, audit logging, the outbound allowlist on every path by which mail leaves). Don't duplicate guidance here; link out instead.
@@ -113,7 +113,7 @@ quoted original and a forward's own attachments.
 - Current layout: `templates/` (one `<name>.md` file per email template, see `src/apple_mail_mcp/templates.py`), `drafts/` (seed metadata per draft, `src/apple_mail_mcp/drafts.py`), `audit.jsonl` plus one rotated generation `audit.jsonl.1` (one line per logged operation, `audit_log_path()` in `src/apple_mail_mcp/security.py`), and `mail_automation.lock` (the cross-process Mail automation lock).
 - **`audit.jsonl` is personal data at rest**, not ordinary logging: it records who the user corresponds with and about what (recipients, subjects, sender account; never bodies). It lives outside the repository and is never committed, never pasted into a message or a report, and not something an agent reads to answer a question about the user's mail. It is bounded at about twice `AUDIT_ROTATE_BYTES` on disk.
 - Names that get used as filename stems must be regex-validated **before** building any path — see `_validate_name` in `templates.py` for the path-traversal-safe pattern. Don't `Path(user_input)` directly.
-- Storage objects should resolve their root at use time, not import time, so env-var overrides and test-time monkeypatching are honored. Example: `_get_template_store()` in `server.py`.
+- Storage objects should resolve their root at use time, not import time, so env-var overrides and test-time monkeypatching are honored. Example: `get_template_store()` in `tools/templates.py`.
 
 ## Testing Requirements
 
@@ -150,7 +150,8 @@ Load these skills when working in their domains:
 ## Key Files
 
 - `src/apple_mail_mcp/mail_connector.py` — Core AppleScript client (~1120 lines)
-- `src/apple_mail_mcp/server.py` — FastMCP server wrapping the connector (~1120 lines)
+- `src/apple_mail_mcp/server.py` — the FastMCP instance, the connector, confirmation, the error envelope and `main`
+- `src/apple_mail_mcp/tools/` — the MCP tools, one module per domain
 - `src/apple_mail_mcp/security.py` — Input validation, audit logging, confirmation flows
 - `src/apple_mail_mcp/utils.py` — Pure functions: escaping, parsing, validation
 - `src/apple_mail_mcp/exceptions.py` — Custom exception hierarchy
