@@ -18,8 +18,11 @@ import pytest
 
 from apple_mail_mcp.mail_connector import AppleMailConnector
 
+from .conftest import TEST_DRAFT_SUBJECT_PREFIX
 from .mail_readback import (
+    MailTrash,
     assert_html_rendered,
+    compose_window_count,
     sent_count_for_subject,
     sent_source_for_subject,
 )
@@ -147,6 +150,38 @@ class TestDiscardCompose:
             f'to return (exists window "{subject}") as text'
         ).strip()
         assert still_open == "false"
+
+
+class TestSalvageCompose:
+    def test_salvage_saves_the_window_to_drafts(
+        self, connector: AppleMailConnector, test_account: str
+    ) -> None:
+        """The salvage every failed send ends in, on a window with no
+        sheet: close, Save, the window gone and its draft in Drafts.
+        Nothing is sent. The branch for Mail's send-error sheet cannot be
+        provoked on demand; only the unit tests on the script's text
+        cover it."""
+        subject = f"{TEST_DRAFT_SUBJECT_PREFIX}salvage-{uuid.uuid4().hex[:8]}"
+        with MailTrash(connector, test_account) as trash:
+            trash.windows(subject)
+            trash.drafts(subject)
+            connector._run_applescript(
+                f'tell application "Mail" to make new outgoing message '
+                f'with properties {{subject:"{subject}", content:"x", visible:true}}'
+            )
+            time.sleep(1)
+            assert connector._salvage_compose_to_draft(subject) == "SALVAGED"
+            assert compose_window_count(connector, subject) == 0
+            saved = "0"
+            for _ in range(20):
+                saved = connector._run_applescript(
+                    'tell application "Mail" to return (count of (messages of '
+                    f'drafts mailbox whose subject is "{subject}")) as text'
+                ).strip()
+                if saved != "0":
+                    break
+                time.sleep(0.5)
+            assert saved != "0", "the salvaged window's draft never reached Drafts"
 
 
 class TestHtmlSendWithAttachments:

@@ -23,6 +23,7 @@ from apple_mail_mcp.exceptions import (
     MailKeychainEntryNotFoundError,
     MailMailboxNotFoundError,
     MailMessageNotFoundError,
+    MailOutboundDisallowedError,
 )
 from apple_mail_mcp.mail_connector import AppleMailConnector, _wrap_as_json_script
 from apple_mail_mcp.utils import SANITIZE_MAX_LENGTH
@@ -5785,23 +5786,6 @@ class TestCreateDraft:
             )
         assert captured == []
 
-    def test_new_send_body_longer_than_a_paste_composes_nothing(
-        self, connector: AppleMailConnector
-    ) -> None:
-        """The paste goes through sanitize_input, which cuts at
-        SANITIZE_MAX_LENGTH without a word; the mailto: path this
-        replaced did not cut. A longer body is refused, not cut."""
-        captured = _scripted(connector, ["unused"])
-        with pytest.raises(ValueError, match="at most"):
-            connector.create_draft(
-                seed="new",
-                to=["a@example.com"],
-                subject="hi",
-                body="x" * (SANITIZE_MAX_LENGTH + 1),
-                send_now=True,
-            )
-        assert captured == []
-
     def test_the_mailto_send_path_is_gone(self) -> None:
         """One composition for every fresh send: the mailto: path and its
         helpers were deleted, not kept beside it."""
@@ -7114,6 +7098,37 @@ class TestSendHtmlEmail:
         paste_s = scripts[1]
         assert '\\"' in paste_s or "\\\\back" in paste_s
 
+    @pytest.mark.parametrize("group", ["to", "cc", "bcc"])
+    def test_html_fresh_refuses_an_off_list_recipient_itself(
+        self,
+        connector: AppleMailConnector,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        group: str,
+    ) -> None:
+        """The allowlist is met at the connector as well as at the tool
+        (docs/guides/SECURITY_CHECKLIST.md): a fresh send refuses an
+        off-list recipient in any group itself, before any AppleScript
+        runs, whatever its caller checked."""
+        policy = tmp_path / "only-example-org.yaml"
+        policy.write_text("email:\n  allowed_outbound:\n    - '*@example.org'\n")
+        monkeypatch.setenv("APPLE_MAIL_MCP_COMMS_CONFIG", str(policy))
+        recipients: dict[str, list[str] | None] = {
+            "to": ["a@example.org"], "cc": None, "bcc": None,
+        }
+        recipients[group] = ["off@example.com"]
+        captured = _scripted(connector, ["unused"])
+        with pytest.raises(MailOutboundDisallowedError, match="off@example.com"):
+            connector._send_html_email(
+                to=recipients["to"] or [],
+                cc=recipients["cc"],
+                bcc=recipients["bcc"],
+                subject="Hi",
+                body="<p>x</p>",
+                from_account=None,
+            )
+        assert captured == []
+
 
 class TestSendHtmlWithAttachments:
     """Fresh HTML send WITH attachments: the fresh composition with the
@@ -7237,6 +7252,115 @@ class TestSendHtmlWithAttachments:
         assert isinstance(err, MailAppleScriptError)
         assert "WAS sent" in str(err)
         assert len(scripts) == 7
+
+    def test_ax_verify_accepts_a_file_shown_as_an_image(self) -> None:
+        """A compose window shows a PNG inline, as an AXImage described
+        by its file name, and a PDF or text file as an AXButton described
+        "name.ext, N KB" (measured 2026-09-27,
+        docs/research/icloud-draft-resync.md, Observation 10). The
+        check matching only AXButton refused every image. What an image
+        looks like live is covered by test_loopback.py; here, that the
+        script accepts either role for a description naming the file."""
+        script = AppleMailConnector._build_attachment_ax_verify_script(
+            window_name="w", filenames=["probe.png"],
+        )
+        assert (
+            '(r is "AXButton" or r is "AXImage") and '
+            "((description of el) as text) contains fname"
+        ) in script
+        assert '"probe.png"' in script
+
+
+_OVERLONG = SANITIZE_MAX_LENGTH + 1
+
+
+def _overlong_fresh_html(c: AppleMailConnector) -> None:
+    c._send_html_email(
+        to=["a@example.com"], cc=None, bcc=None, subject="s",
+        body="x" * _OVERLONG, from_account=None,
+    )
+
+
+def _overlong_html_reply(c: AppleMailConnector) -> None:
+    c._send_html_email(
+        to=["a@example.com"], cc=None, bcc=None, subject="",
+        body="x" * _OVERLONG, from_account=None, reply_to="12345",
+    )
+
+
+def _overlong_fresh_plain_send(c: AppleMailConnector) -> None:
+    c.create_draft(
+        seed="new", to=["a@example.com"], subject="s",
+        body="x" * _OVERLONG, send_now=True,
+    )
+
+
+def _overlong_fresh_saved_draft(c: AppleMailConnector) -> None:
+    c.create_draft(
+        seed="new", to=["a@example.com"], subject="s", body="x" * _OVERLONG,
+    )
+
+
+def _overlong_reply_note(c: AppleMailConnector) -> None:
+    c.create_draft(
+        seed="reply", seed_id="12345", to=["a@example.com"],
+        body="x" * _OVERLONG,
+    )
+
+
+def _overlong_forward_note_sent(c: AppleMailConnector) -> None:
+    c.create_draft(
+        seed="forward", seed_id="12345", to=["a@example.com"],
+        body="x" * _OVERLONG, send_now=True,
+    )
+
+
+class TestAnOverlongBodyIsRefusedNotCut:
+    """``sanitize_input`` cuts at SANITIZE_MAX_LENGTH without a word, and
+    every body a caller hands the connector passed through it: a paste
+    (fresh send, HTML reply, a note above a reply or forward) or a saved
+    fresh draft's ``set content``. A longer body is refused, on every
+    path, with one message, before anything is composed or looked up."""
+
+    @pytest.fixture
+    def connector(self) -> AppleMailConnector:
+        return AppleMailConnector(timeout=30)
+
+    @pytest.mark.parametrize(
+        "call",
+        [
+            _overlong_fresh_html,
+            _overlong_html_reply,
+            _overlong_fresh_plain_send,
+            _overlong_fresh_saved_draft,
+            _overlong_reply_note,
+            _overlong_forward_note_sent,
+        ],
+        ids=lambda f: f.__name__.removeprefix("_overlong_"),
+    )
+    def test_refused_before_any_applescript(
+        self, connector: AppleMailConnector, call: Any
+    ) -> None:
+        captured = _scripted(connector, ["unused"])
+        with pytest.raises(ValueError) as refused:
+            call(connector)
+        assert str(refused.value) == (
+            f"body is {_OVERLONG} characters; a message body carries at "
+            f"most {SANITIZE_MAX_LENGTH}. Nothing was composed, saved or "
+            "sent."
+        )
+        assert captured == []
+
+    def test_a_body_at_the_limit_is_carried_whole(
+        self, connector: AppleMailConnector
+    ) -> None:
+        captured = _scripted(connector, ["4242"])
+        body = "y" * SANITIZE_MAX_LENGTH
+        result = connector.create_draft(
+            seed="new", to=["a@example.com"], subject="s", body=body,
+        )
+        assert result["draft_id"] == "4242"
+        assert f'set content of theMessage to "{body}"' in captured[0]
 
 
 class TestVerifiedSendPrimitives:
@@ -7450,6 +7574,67 @@ class TestVerifiedSendPrimitives:
         block = connector._as_discard_compose_block("targetName")
         assert "Don’t Save" in block
         assert "DISCARD_FAILED" in block
+
+    # -- salvage, and Mail's send-error sheet --------------------------------
+    #
+    # When Mail cannot send through the account's server it puts a sheet
+    # on the compose window, "Cannot send message using the server …",
+    # with Try Later / Try With Selected Server / Connection Doctor /
+    # Edit SMTP Server List / Edit Message, and no Save: pressing Save on
+    # it, as the salvage did, failed and left the window open. The sheet
+    # cannot be provoked on demand, so these read the script's text; no
+    # live test covers it.
+
+    def _salvage_script(self, connector: AppleMailConnector) -> str:
+        captured = _scripted(connector, ["SALVAGED"])
+        assert connector._salvage_compose_to_draft('Probe "1"') == "SALVAGED"
+        assert len(captured) == 1
+        return captured[0]
+
+    def test_salvage_dismisses_the_send_error_sheet_before_closing(
+        self, connector: AppleMailConnector
+    ) -> None:
+        script = self._salvage_script(connector)
+        edit_at = script.index(
+            'click button "Edit Message" of first sheet of window "Probe \\"1\\""'
+        )
+        close_at = script.index('whose subrole is "AXCloseButton"')
+        save_at = script.index('click button "Save" of first sheet')
+        assert edit_at < close_at < save_at
+        # Only that sheet is dismissed that way: the button is looked for
+        # before it is pressed.
+        assert 'exists button "Edit Message" of first sheet' in script
+
+    def test_salvage_reports_the_send_error_sheet_text(
+        self, connector: AppleMailConnector
+    ) -> None:
+        script = self._salvage_script(connector)
+        assert "static texts of first sheet of window" in script
+        assert "Mail's send-error sheet: " in script
+        # The text rides on every outcome after the sheet was read,
+        # failures included.
+        assert 'return "SALVAGED" & sheetNote' in script
+        assert 'return "SALVAGE_FAILED:window still open" & sheetNote' in script
+        assert 'return "SALVAGE_FAILED:" & errMsg & sheetNote' in script
+
+    def test_the_sheet_text_reaches_the_raised_error(
+        self, connector: AppleMailConnector
+    ) -> None:
+        """Whatever the salvage reports is part of the send's error."""
+        sheet = (
+            "SALVAGED (Mail's send-error sheet: Cannot send message using "
+            "the server smtp.example.com. | )"
+        )
+        outcomes = _fresh_outcomes("<p>Hi there probe</p>", window="Probe")
+        _scripted(connector, outcomes[:-1] + ["POSTCONDITION_TIMEOUT:x", sheet])
+        with pytest.raises(MailAppleScriptError) as exc:
+            connector._send_html_email(
+                to=["test@example.com"], cc=None, bcc=None, subject="Probe",
+                body="<p>Hi there probe</p>", from_account=None,
+            )
+        assert "Cannot send message using the server smtp.example.com." in str(
+            exc.value
+        )
 
 
 class TestMailAutomationLock:

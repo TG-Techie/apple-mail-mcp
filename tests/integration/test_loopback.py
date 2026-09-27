@@ -25,7 +25,9 @@ pass or fail (see ``MailTrash``). Every subject starts with the suite's
 """
 
 import asyncio
+import struct
 import uuid
+import zlib
 from dataclasses import dataclass
 from email import message_from_string
 from email.utils import parseaddr
@@ -74,6 +76,28 @@ def _two_files(tmp_path: Path, hexid: str) -> list[Path]:
     second = tmp_path / "second.txt"
     second.write_text(f"loopback attachment two {hexid}\n")
     return [first, second]
+
+
+def _png(tmp_path: Path, hexid: str) -> Path:
+    """A 2x2 PNG whose bytes are this run's own: a tEXt chunk carries
+    ``hexid``, so a byte-for-byte match cannot be an earlier run's file."""
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data)) + kind + data
+            + struct.pack(">I", zlib.crc32(kind + data))
+        )
+
+    pixels = b"".join(b"\x00" + b"\x20\x60\xc0" * 2 for _ in range(2))
+    path = tmp_path / "probe.png"
+    path.write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", 2, 2, 8, 2, 0, 0, 0))
+        + chunk(b"tEXt", b"Comment\x00" + hexid.encode())
+        + chunk(b"IDAT", zlib.compress(pixels))
+        + chunk(b"IEND", b"")
+    )
+    return path
 
 
 def _attachment_bytes(source: str) -> dict[str, bytes]:
@@ -281,6 +305,38 @@ def test_plain_fresh_send_from_a_named_sender_carries_attachments(
         assert _attachment_bytes(arrival.source) == {
             f.name: f.read_bytes() for f in files
         }
+        assert_not_quoted(arrival.source)
+
+
+def test_fresh_html_carries_an_image_and_a_text_file(
+    loop: Loopback, tmp_path: Path
+) -> None:
+    """An image is attached like any other file. Mail shows a PNG in the
+    compose window as an AXImage, not the AXButton a text file shows as,
+    and the attachment check once refused it before Send."""
+    hexid = _hex()
+    subject = f"{PREFIX}html-image-{hexid}"
+    files = [_png(tmp_path, hexid), _two_files(tmp_path, hexid)[0]]
+    with MailTrash(loop.connector, loop.account) as trash:
+        trash.windows(subject)
+        loop.prepare(trash, subject)
+        result = loop.connector._send_html_email(
+            to=[loop.address], cc=None, bcc=None, subject=subject,
+            body=f"<p>an image and a file <b>marker-{hexid}</b></p>",
+            from_account=loop.account, attachment_paths=files,
+        )
+        assert result == SENT
+        sent, arrival = loop.receive(trash, subject)
+
+        assert sorted(sent.attachment_names) == ["first.txt", "probe.png"]
+        loop.assert_delivered(arrival, sent, subject)
+        loop.assert_from_named_sender(arrival)
+        assert sorted(arrival.attachment_names) == ["first.txt", "probe.png"]
+        assert arrival.attachment_count == 2
+        assert _attachment_bytes(arrival.source) == {
+            f.name: f.read_bytes() for f in files
+        }
+        assert_html_rendered(arrival.source, f"<b>marker-{hexid}</b>")
         assert_not_quoted(arrival.source)
 
 

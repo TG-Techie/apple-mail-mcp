@@ -117,6 +117,21 @@ _PASTE_CARET_KEYS: dict[_PastePlacement, str] = {
 }
 
 
+def _refuse_overlong_body(body: str) -> None:
+    """Refuse a caller's message body longer than ``sanitize_input``
+    carries. Every body reaches Mail through it, pasted or set through
+    ``content``, and it cuts at SANITIZE_MAX_LENGTH without a word, so a
+    longer body would go out or be saved shortened. Called where a body
+    enters the connector (``create_draft``, ``_send_html_email``), before
+    anything is looked up or composed."""
+    if len(body) > SANITIZE_MAX_LENGTH:
+        raise ValueError(
+            f"body is {len(body)} characters; a message body carries at "
+            f"most {SANITIZE_MAX_LENGTH}. Nothing was composed, saved or "
+            "sent."
+        )
+
+
 # MCP-tool field name → Mail.app AppleScript `rule type` enum identifier.
 # Verified against Mail.app's running rules: 'from header', 'subject header',
 # 'message content' all confirmed live. Other values follow the same naming
@@ -4452,23 +4467,57 @@ return "PASTED_UNVERIFIED"
         automation. Returns "SALVAGED", "NO_WINDOW", or the observed
         state on failure — callers append this to their error, never
         mask the original failure with it.
+
+        A send Mail could not make through the account's server leaves a
+        sheet on the window, "Cannot send message using the server …",
+        whose buttons are Try Later, Try With Selected Server, Connection
+        Doctor, Edit SMTP Server List and Edit Message (seen 2026-09-27),
+        and no Save. Found (by its Edit Message button), its text is
+        read, Edit Message pressed, and the window then closed with Save
+        as any other; the outcome carries the text, as "(Mail's
+        send-error sheet: …)", so the caller's error says why Mail did
+        not send. It cannot be provoked on demand, and no live test has
+        met it.
         """
         win_safe = escape_applescript_string(window_name)
+        win = f'window "{win_safe}"'
         try:
             return self._run_applescript(f"""
 tell application "System Events"
     tell application process "Mail"
-        if not (exists window "{win_safe}") then return "NO_WINDOW"
-        click (first button of window "{win_safe}" whose subrole is "AXCloseButton")
-        delay 0.8
-        if exists window "{win_safe}" then
-            if exists (first sheet of window "{win_safe}") then
-                click button "Save" of first sheet of window "{win_safe}"
-                delay 0.8
+        if not (exists {win}) then return "NO_WINDOW"
+        set sheetNote to ""
+        try
+            if exists (first sheet of {win}) then
+                if exists button "Edit Message" of first sheet of {win} then
+                    set sheetText to ""
+                    try
+                        -- NB: "st" is a reserved AppleScript token; do not shorten this name.
+                        repeat with sheetTextEl in static texts of first sheet of {win}
+                            set sheetText to sheetText & (value of sheetTextEl) & " | "
+                        end repeat
+                    end try
+                    set sheetNote to " (Mail's send-error sheet: " & sheetText & ")"
+                    click button "Edit Message" of first sheet of {win}
+                    repeat 10 times
+                        if not (exists (first sheet of {win})) then exit repeat
+                        delay 0.3
+                    end repeat
+                end if
             end if
-        end if
-        if exists window "{win_safe}" then return "SALVAGE_FAILED:window still open"
-        return "SALVAGED"
+            click (first button of {win} whose subrole is "AXCloseButton")
+            delay 0.8
+            if exists {win} then
+                if exists (first sheet of {win}) then
+                    click button "Save" of first sheet of {win}
+                    delay 0.8
+                end if
+            end if
+        on error errMsg
+            return "SALVAGE_FAILED:" & errMsg & sheetNote
+        end try
+        if exists {win} then return "SALVAGE_FAILED:window still open" & sheetNote
+        return "SALVAGED" & sheetNote
     end tell
 end tell
 """).strip()
@@ -4828,11 +4877,14 @@ end tell
             NotImplementedError: attachments on a reply.
             MailAccountNotFoundError: ``from_account`` matches no account.
             FileNotFoundError: a listed attachment does not exist.
-            ValueError: the body is longer than a paste carries.
+            ValueError: the body is longer than a message body carries.
+            MailOutboundDisallowedError: a recipient is not on the
+                outbound allowlist.
             MailAppleScriptError: a mechanical read-back failed. Nothing
                 was sent, except when the error says the message WAS sent
                 and its Sent copy has the wrong number of attachments.
         """
+        _refuse_overlong_body(body)
         if attachment_paths and reply_to is not None:
             raise NotImplementedError(
                 "HTML replies with attachments are not supported yet — "
@@ -4902,23 +4954,22 @@ end tell
         which composes from Mail's default account and cannot carry
         attachments.
 
-        Checked before anything is composed: every attachment exists
-        (``FileNotFoundError``), the body fits a paste (``ValueError``;
-        ``sanitize_input`` would cut it silently), and ``from_account``
-        names an account (``MailAccountNotFoundError``). A later failure
-        salvages the window to Drafts and raises
+        Checked before anything is composed: every recipient passes the
+        outbound allowlist (``MailOutboundDisallowedError``), here as
+        well as at every caller, since the connector is the hard block
+        on a path by which mail leaves; every attachment exists
+        (``FileNotFoundError``); and ``from_account`` names an account
+        (``MailAccountNotFoundError``). The body's length was refused
+        where it entered the connector (``_refuse_overlong_body``). A
+        later failure salvages the window to Drafts and raises
         ``MailAppleScriptError``, which says so when the message was in
-        fact sent. The outbound allowlist gate is the caller's.
+        fact sent.
         """
+        assert_recipients_allowed_for_send(to, cc, bcc, seed="new")
         files = [Path(p) for p in attachment_paths or []]
         for f in files:
             if not f.is_file():
                 raise FileNotFoundError(f"attachment not found: {f}")
-        if len(body) > SANITIZE_MAX_LENGTH:
-            raise ValueError(
-                f"body is {len(body)} characters; a send carries at most "
-                f"{SANITIZE_MAX_LENGTH}. Nothing was composed or sent."
-            )
         sender = (
             self._resolve_account_to_sender(from_account)
             if from_account is not None
@@ -5022,10 +5073,16 @@ set resultData to {{|window|:newName}}
         filenames: list[str],
     ) -> str:
         """AppleScript: poll the compose window until every attachment
-        shows up in the body WebArea as an AXButton whose description
-        carries the filename (observed form: "name.ext, N bytes" — live
-        2026-08-24), or time out. Returns "ATTACHMENTS_VERIFIED" or
-        "ATTACH_MISSING:<filename>".
+        shows up in the body WebArea as an element whose description
+        carries the filename, or time out. Returns "ATTACHMENTS_VERIFIED"
+        or "ATTACH_MISSING:<filename>".
+
+        Mail shows a file one of two ways, whether it was attached
+        through the dictionary or pasted: an image inline, as an AXImage
+        described by its file name, and anything else as an AXButton
+        described "name.ext, N KB" (both measured 2026-09-27,
+        docs/research/icloud-draft-resync.md, Observation 10; the button
+        form first live 2026-08-24). Either role is accepted.
 
         Walks the same groups → scroll area → AXWebArea path as the
         paste script and descends recursively from there. NEVER uses
@@ -5039,21 +5096,22 @@ set resultData to {{|window|:newName}}
             f'"{escape_applescript_string(n)}"' for n in filenames
         )
         return f"""
-on searchButtons(el, fname, depthLeft)
+on searchAttachment(el, fname, depthLeft)
     tell application "System Events"
         try
-            if (role of el) is "AXButton" and ((description of el) as text) contains fname then return true
+            set r to role of el
+            if (r is "AXButton" or r is "AXImage") and ((description of el) as text) contains fname then return true
         end try
         if depthLeft > 0 then
             try
                 repeat with c in UI elements of el
-                    if my searchButtons(c, fname, depthLeft - 1) then return true
+                    if my searchAttachment(c, fname, depthLeft - 1) then return true
                 end repeat
             end try
         end if
         return false
     end tell
-end searchButtons
+end searchAttachment
 
 tell application "Mail" to activate
 delay 0.3
@@ -5076,7 +5134,7 @@ repeat with fname in {{{names_safe}}}
                         end try
                     end repeat
                     if bodyArea is not missing value then
-                        set foundIt to my searchButtons(bodyArea, fname as text, 6)
+                        set foundIt to my searchAttachment(bodyArea, fname as text, 6)
                     end if
                 end if
             end tell
@@ -5148,12 +5206,14 @@ end if
             ``{"draft_id": <persisted-id>, "sent_message_id": <id-or-empty>}``.
 
         Raises:
-            ValueError: invalid seed or missing required fields.
+            ValueError: invalid seed, missing required fields, or a body
+                longer than a message body carries.
             MailAccountNotFoundError: ``from_account`` doesn't match.
             MailMessageNotFoundError: ``seed_id`` not found in any mailbox.
             MailAppleScriptError: AppleScript failure.
         """
         self._validate_create_draft_args(seed, seed_id, to, subject)
+        _refuse_overlong_body(body)
 
         # HARD POLICY GATE — the actual-send enforcement perimeter for the
         # outbound recipient allowlist. Any code path that reaches this
