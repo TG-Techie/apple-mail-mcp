@@ -4236,15 +4236,21 @@ class TestRecipientFields:
     def test_search_script_reads_recipients(
         self, mock_run: MagicMock, connector: AppleMailConnector
     ) -> None:
+        """Both of the search's paths read them: the bulk path, which
+        falls back to one message's list when a run's bulk read
+        failed, and the one-message-at-a-time path it gives way to."""
         mock_run.return_value = '{"messages":[],"warnings":[]}'
         connector._search_messages_applescript("Gmail", "INBOX")
-        script = mock_run.call_args[0][0]
-        self._assert_reads_recipients(script, "msg")
-        self._assert_each_kind_guarded(script)
-        # Failures go to the search's own warning list.
-        assert "set end of warnList to" in script.split(
-            "set rcpts to properties of to recipients"
-        )[1]
+        bulk, _marker, one_at_a_time = mock_run.call_args[0][0].partition(
+            "set msgs to messages of mailboxRef"
+        )
+        for part, message_var in ((bulk, "msgRef"), (one_at_a_time, "msg")):
+            self._assert_reads_recipients(part, message_var)
+            self._assert_each_kind_guarded(part)
+            # Failures go to the search's own warning list.
+            assert "set end of warnList to" in part.split(
+                "set rcpts to properties of to recipients"
+            )[1]
 
     @patch.object(AppleMailConnector, "_run_applescript")
     def test_search_rows_render_recipients(
@@ -4510,6 +4516,252 @@ class TestRecipientFields:
         assert applescript_row["to"] == imap_row["to"] == [
             "Jörg Müller <jorg@example.com>"
         ]
+
+
+_ROW_PROPERTIES = (
+    "message id", "subject", "sender", "date received", "read status",
+    "flagged status",
+)
+
+
+class TestSearchReadsInBulk:
+    """The AppleScript search reads each property once for many
+    messages, not once per message: a filter's property once for the
+    whole mailbox (``<prop> of messages of mailboxRef``), and each row
+    property once per run of matched positions (``<prop> of messages
+    runStart thru runEnd of mailboxRef``). A bulk read that fails is
+    redone one message at a time and says so; lists that no longer line
+    up send the whole search down the one-message-at-a-time path it had
+    before. What runs against Mail is pinned by the integration tests;
+    these pin the script's shape."""
+
+    @pytest.fixture
+    def connector(self) -> AppleMailConnector:
+        return AppleMailConnector(timeout=30)
+
+    @staticmethod
+    def _script(
+        mock_run: MagicMock, connector: AppleMailConnector, **criteria: Any
+    ) -> str:
+        mock_run.return_value = '{"messages":[],"warnings":[]}'
+        connector._search_messages_applescript("Gmail", "INBOX", **criteria)
+        return str(mock_run.call_args[0][0])
+
+    @staticmethod
+    def _bulk(script: str) -> str:
+        return script.partition("set msgs to messages of mailboxRef")[0]
+
+    @staticmethod
+    def _guarded_reads(script: str, marker: str) -> list[str]:
+        """Each read starting with ``marker``, up to its ``end try``;
+        not the line that empties the variable before the read."""
+        return [
+            block.partition("end try")[0]
+            for block in script.split(marker)[1:]
+            if not block.startswith(" {}")
+        ]
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_no_filter_reads_rows_over_a_run_and_nothing_mailbox_wide(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        script = self._script(mock_run, connector, limit=50)
+        bulk = self._bulk(script)
+        assert "set total to count of messages of mailboxRef" in bulk
+        # Nothing is read for every message of the mailbox: with no
+        # filter the rows are the first `limit` positions.
+        assert "of messages of mailboxRef" not in bulk.replace(
+            "count of messages of mailboxRef", ""
+        )
+        assert (
+            "set runIds to id of messages runStart thru runEnd of mailboxRef"
+            in bulk
+        )
+        for prop in _ROW_PROPERTIES:
+            assert f"{prop} of messages runStart thru runEnd of mailboxRef" in bulk
+        for kind in ("to", "cc", "bcc"):
+            assert (
+                f"properties of {kind} recipients of messages runStart thru "
+                "runEnd of mailboxRef" in bulk
+            )
+        assert "allIds" not in bulk
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_a_filter_property_is_read_once_for_the_whole_mailbox(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        script = self._script(
+            mock_run, connector, subject_contains="meeting",
+            date_from="2026-04-01", date_to="2026-04-15", limit=10,
+        )
+        bulk = self._bulk(script)
+        assert bulk.count("set allIds to id of messages of mailboxRef") == 1
+        assert bulk.count("set subjectAll to subject of messages of mailboxRef") == 1
+        # Both date criteria test one list.
+        assert bulk.count(
+            "set dateReceivedAll to date received of messages of mailboxRef"
+        ) == 1
+        # The checks test a value, which the list supplies.
+        assert "set subjectValue to item i of subjectAllRef" in bulk
+        assert (
+            'if subjectValue does not contain "meeting" then set includeThis to false'
+            in bulk
+        )
+        assert "if dateReceivedValue < dateFromCutoff then set includeThis to false" in bulk
+        assert "if dateReceivedValue >= dateToCutoff then set includeThis to false" in bulk
+        # The rows take the filter's list rather than reading it again.
+        assert "set subjectValue to item idx of subjectAllRef" in bulk
+        # A property no filter read is read over the run.
+        assert "sender of messages runStart thru runEnd of mailboxRef" in bulk
+        assert "whose" not in script
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_attachment_and_body_filters_read_one_message_at_a_time(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        """Mail has no cheap bulk form of these, so they are asked only
+        of a message the other criteria kept, through a reference by id
+        that costs no event to make."""
+        script = self._script(
+            mock_run, connector, subject_contains="q3", has_attachment=True,
+            body_contains="budget",
+        )
+        bulk = self._bulk(script)
+        assert "mail attachments of messages" not in bulk
+        assert "content of messages" not in bulk
+        assert (
+            "set msgRef to a reference to («class mssg» id "
+            "(item i of allIdsRef) of mailboxRef)" in bulk
+        )
+        assert (
+            "if includeThis and ((count of mail attachments of msgRef) = 0) "
+            "then set includeThis to false" in bulk
+        )
+        assert (
+            'if includeThis and ((content of msgRef) does not contain "budget") '
+            "then set includeThis to false" in bulk
+        )
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_every_bulk_read_falls_back_to_one_message_at_a_time(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        script = self._script(mock_run, connector, subject_contains="q3")
+        bulk = self._bulk(script)
+        reads = self._guarded_reads(bulk, "set subjectAll to") + [
+            read
+            for stem in ("messageId", "sender", "dateReceived", "readStatus",
+                         "flaggedStatus", "to", "cc", "bcc")
+            for read in self._guarded_reads(bulk, f"set {stem}Run to")
+        ]
+        assert len(reads) == 9
+        for read in reads:
+            assert "on error errMsg number errNum" in read
+            assert "could not be read in bulk" in read
+        # ...and what the fallback reads, one message at a time.
+        for prop in _ROW_PROPERTIES:
+            assert f"({prop} of msgRef)" in bulk
+        for kind in ("to", "cc", "bcc"):
+            assert f"set rcpts to properties of {kind} recipients of msgRef" in bulk
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_every_bulk_list_must_have_the_id_lists_length(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        bulk = self._bulk(self._script(mock_run, connector, subject_contains="q3"))
+        assert (
+            "if subjectInBulk and (count of subjectAll) is not total "
+            "then set aligned to false" in bulk
+        )
+        assert "if (count of runIds) is not (runEnd - runStart + 1) then" in bulk
+        for stem in ("messageId", "sender", "dateReceived", "readStatus",
+                     "flaggedStatus", "to", "cc", "bcc"):
+            assert (
+                f"if {stem}RunRead and (count of {stem}Run) is not "
+                "(count of runIds) then set aligned to false" in bulk
+            )
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_a_row_must_be_the_message_the_filter_matched(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        bulk = self._bulk(self._script(mock_run, connector, sender_contains="a"))
+        assert (
+            "if msgId is not (item idx of allIdsRef) then set aligned to false" in bulk
+        )
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_the_first_and_last_rows_are_read_again_at_the_end(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        """A message that arrived, moved or went while the rows were read
+        shifts every position after it; the ids at the first and last
+        matched positions say whether that happened."""
+        bulk = self._bulk(self._script(mock_run, connector, limit=5))
+        assert (
+            "if (id of message (item 1 of matched) of mailboxRef) is not "
+            "firstRowId then set aligned to false" in bulk
+        )
+        assert (
+            "if (id of message (item matchCount of matched) of mailboxRef) "
+            "is not lastRowId then set aligned to false" in bulk
+        )
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_lists_out_of_line_send_the_search_one_message_at_a_time(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        script = self._script(
+            mock_run, connector, subject_contains="meeting", limit=10
+        )
+        before, _marker, fallback = script.rpartition("if not aligned then")
+        assert "set aligned to true" in before
+        # Whatever the bulk path gathered is discarded, with a warning
+        # saying why the search went the slow way.
+        head, _msgs, loop = fallback.partition("set msgs to messages of mailboxRef")
+        assert "set resultData to {}" in head
+        assert "the mailbox changed while" in head
+        assert (
+            'if (subject of msg) does not contain "meeting" '
+            "then set includeThis to false" in loop
+        )
+        assert "|id|:(id of msg as text)" in loop
+        # The limit ends both scans.
+        assert script.count("if matchCount >= 10 then exit repeat") == 2
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_a_run_absorbs_a_short_gap(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        from apple_mail_mcp.mail_connector import _SEARCH_RUN_GAP
+
+        bulk = self._bulk(self._script(mock_run, connector, subject_contains="q3"))
+        assert f"else if idx - runEnd > {_SEARCH_RUN_GAP + 1} then" in bulk
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_the_fallback_warnings_reach_the_caller(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        """What the script reports when it fell back is passed on in
+        order, and the rows it built the slow way are rendered like any
+        other."""
+        bulk_failure = (
+            "subject could not be read in bulk for mailbox positions 1-2: "
+            "x (error -1728); read one message at a time"
+        )
+        realigned = (
+            "the mailbox changed while the search read it in bulk; "
+            "searched it one message at a time instead"
+        )
+        mock_run.return_value = json.dumps(
+            {"messages": [_as_record()], "warnings": [realigned, bulk_failure]}
+        )
+        seen: list[str] = []
+        [row] = connector._search_messages_applescript(
+            "Gmail", "INBOX", on_warning=seen.append
+        )
+        assert seen == [realigned, bulk_failure]
+        assert {k: row[k] for k in ("to", "cc", "bcc")} == _RECIPIENT_ROWS
 
 
 class TestDualEmitRfcMessageId:

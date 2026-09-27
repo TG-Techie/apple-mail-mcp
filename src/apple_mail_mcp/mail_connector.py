@@ -684,7 +684,34 @@ def _render_recipients(record: dict[str, Any]) -> None:
             )
 
 
-def _search_filter_statements(
+@dataclass(frozen=True)
+class _SearchCriterion:
+    """One search predicate, as the script tests a message against it.
+
+    ``prop`` is the one message property the test reads (``subject``,
+    ``date received``), which the bulk path reads for the whole mailbox
+    in one event; None when the test needs the message itself (its
+    attachments, its content), which is asked one message at a time.
+    ``excludes`` renders the AppleScript condition that drops a
+    message, given the expression for that property's value, or for the
+    message when ``prop`` is None.
+    """
+
+    prop: str | None
+    excludes: Callable[[str], str]
+
+
+def _does_not_contain(text: str) -> Callable[[str], str]:
+    safe = escape_applescript_string(sanitize_input(text))
+    return lambda value: f'{value} does not contain "{safe}"'
+
+
+def _is_not(flag: bool) -> Callable[[str], str]:
+    target = "true" if flag else "false"
+    return lambda value: f"{value} is not {target}"
+
+
+def _search_criteria(
     *,
     sender_contains: str | None,
     subject_contains: str | None,
@@ -695,48 +722,30 @@ def _search_filter_statements(
     has_attachment: bool | None,
     body_contains: str | None,
     text_contains: str | None,
-) -> tuple[list[str], list[str]]:
-    """Translate search predicates into per-message AppleScript checks.
+) -> tuple[list[_SearchCriterion], list[str]]:
+    """Translate search predicates into the criteria the script tests.
 
-    Returns ``(filter_checks, date_setup)``: one ``if … then set
-    includeThis to false`` statement per active predicate, to run inside
-    the message loop, and the date-cutoff statements that must run once
-    before it. Pure: no Mail access, so the translation is testable on
-    its own, and ``_search_messages_applescript`` is left with the loop.
+    Returns ``(criteria, date_setup)``: one criterion per active
+    predicate, and the date-cutoff statements that must run once before
+    any message is tested. Pure: no Mail access, so the translation is
+    testable on its own.
 
     Raises:
         ValueError: If date_from or date_to is not ISO 8601 YYYY-MM-DD.
     """
-    filter_checks: list[str] = []
+    criteria: list[_SearchCriterion] = []
     date_setup: list[str] = []
 
     if sender_contains:
-        sender_safe = escape_applescript_string(sanitize_input(sender_contains))
-        filter_checks.append(
-            f'if (sender of msg) does not contain "{sender_safe}" '
-            f'then set includeThis to false'
-        )
-
+        criteria.append(_SearchCriterion("sender", _does_not_contain(sender_contains)))
     if subject_contains:
-        subject_safe = escape_applescript_string(sanitize_input(subject_contains))
-        filter_checks.append(
-            f'if (subject of msg) does not contain "{subject_safe}" '
-            f'then set includeThis to false'
+        criteria.append(
+            _SearchCriterion("subject", _does_not_contain(subject_contains))
         )
-
     if read_status is not None:
-        target = "true" if read_status else "false"
-        filter_checks.append(
-            f'if (read status of msg) is not {target} '
-            f'then set includeThis to false'
-        )
-
+        criteria.append(_SearchCriterion("read status", _is_not(read_status)))
     if is_flagged is not None:
-        target = "true" if is_flagged else "false"
-        filter_checks.append(
-            f'if (flagged status of msg) is not {target} '
-            f'then set includeThis to false'
-        )
+        criteria.append(_SearchCriterion("flagged status", _is_not(is_flagged)))
 
     if date_from is not None:
         if not _ISO_DATE_RE.match(date_from):
@@ -746,9 +755,8 @@ def _search_filter_statements(
         date_setup.append(
             applescript_iso_date_statements("dateFromCutoff", date_from)
         )
-        filter_checks.append(
-            'if (date received of msg) < dateFromCutoff '
-            'then set includeThis to false'
+        criteria.append(
+            _SearchCriterion("date received", lambda v: f"{v} < dateFromCutoff")
         )
 
     if date_to is not None:
@@ -764,21 +772,15 @@ def _search_filter_statements(
         date_setup.append(
             applescript_iso_date_statements("dateToCutoff", next_day)
         )
-        filter_checks.append(
-            'if (date received of msg) >= dateToCutoff '
-            'then set includeThis to false'
+        criteria.append(
+            _SearchCriterion("date received", lambda v: f"{v} >= dateToCutoff")
         )
 
-    if has_attachment is True:
-        filter_checks.append(
-            "if (count of mail attachments of msg) = 0 "
-            "then set includeThis to false"
-        )
-    elif has_attachment is False:
-        filter_checks.append(
-            "if (count of mail attachments of msg) > 0 "
-            "then set includeThis to false"
-        )
+    if has_attachment is not None:
+        compare = "= 0" if has_attachment else "> 0"
+        criteria.append(_SearchCriterion(
+            None, lambda m: f"(count of mail attachments of {m}) {compare}"
+        ))
 
     # Body / text filters (#145). AppleScript `contains` is
     # case-insensitive by default, matching IMAP `SEARCH BODY`/`TEXT`
@@ -786,10 +788,9 @@ def _search_filter_statements(
     # the proactive warning surfaced before this script runs.
     if body_contains:
         body_safe = escape_applescript_string(sanitize_input(body_contains))
-        filter_checks.append(
-            f'if (content of msg) does not contain "{body_safe}" '
-            f'then set includeThis to false'
-        )
+        criteria.append(_SearchCriterion(
+            None, lambda m: f'(content of {m}) does not contain "{body_safe}"'
+        ))
 
     if text_contains:
         # `text_contains` is the IMAP `TEXT` predicate — substring match
@@ -799,13 +800,418 @@ def _search_filter_statements(
         # callers who need recipient matching should use `sender_contains`
         # or future params. Documented in TOOLS.md.
         text_safe = escape_applescript_string(sanitize_input(text_contains))
-        filter_checks.append(
-            f'if not ((content of msg) contains "{text_safe}" or '
-            f'(subject of msg) contains "{text_safe}" or '
-            f'(sender of msg) contains "{text_safe}") '
-            f'then set includeThis to false'
-        )
-    return filter_checks, date_setup
+        criteria.append(_SearchCriterion(None, lambda m: (
+            f'not ((content of {m}) contains "{text_safe}" or '
+            f'(subject of {m}) contains "{text_safe}" or '
+            f'(sender of {m}) contains "{text_safe}")'
+        )))
+    return criteria, date_setup
+
+
+# What a search row reads from Mail besides its id and recipients, in
+# the order its record lists them: (Mail property, JSON key, whether the
+# value is coerced to text).
+_SEARCH_ROW_PROPERTIES: tuple[tuple[str, str, bool], ...] = (
+    ("message id", "rfc_message_id", False),
+    ("subject", "subject", False),
+    ("sender", "sender", False),
+    ("date received", "date_received", True),
+    ("read status", "read_status", False),
+    ("flagged status", "flagged", False),
+)
+
+# The bulk path reads a row property once per run of matched mailbox
+# positions, and a run takes in up to this many unmatched positions
+# between two matches rather than ending. Reading a property over a
+# range cost about 10 ms per event plus 1.3 ms per message on the test
+# account (2026-09-27), so a gap this wide costs about what one more
+# event would.
+_SEARCH_RUN_GAP = 8
+
+_SEARCH_OUT_OF_LINE_WARNING = (
+    "the search's bulk reads did not line up (the mailbox changed while "
+    "they ran, or its ids could not be read in bulk); searched it one "
+    "message at a time instead"
+)
+
+
+def _as_var(prop: str) -> str:
+    """``date received`` → ``dateReceived``: a variable stem for a property."""
+    first, *rest = prop.split()
+    return first + "".join(word.capitalize() for word in rest)
+
+
+def _indented(lines: list[str], by: int) -> list[str]:
+    pad = " " * by
+    return [pad + line if line else line for line in lines]
+
+
+def _block_lines(block: str) -> list[str]:
+    """A block emitted at indent 0 by one of the helpers above, as lines."""
+    return block.split("\n")
+
+
+def _search_record(
+    *,
+    id_expr: str,
+    value: Callable[[str, str, bool], str],
+    include_attachments: bool,
+) -> str:
+    """The AppleScript record literal for one search row.
+
+    ``value(prop, stem, as_text)`` is the expression for a row
+    property's field, coerced to text when ``as_text``.
+    """
+    fields = [f"|id|:{id_expr}"] + [
+        f"|{key}|:{value(prop, _as_var(prop), as_text)}"
+        for prop, key, as_text in _SEARCH_ROW_PROPERTIES
+    ]
+    fields.append(_RECIPIENT_FIELDS)
+    if include_attachments:
+        fields.append("|attachments|:attList")
+    return "{" + ", ".join(fields) + "}"
+
+
+def _one_at_a_time_search_lines(
+    criteria: list[_SearchCriterion], *, limit: str, include_attachments: bool
+) -> list[str]:
+    """The search one message at a time: every message's criteria and
+    row read with an event per property. What the search did before it
+    read in bulk, and what the bulk path gives way to when its lists do
+    not line up.
+
+    Iterate forward: Mail returns ``messages of mailbox`` newest-first,
+    so a limited search short-circuits on the newest messages. (It once
+    ran backwards, returning the oldest, while its comment claimed
+    newest-first; measuring caught it, reading did not.)
+
+    A message whose criteria cannot be read is left out with a warning
+    rather than failing the search; an unreadable recipient list or
+    attachment walk leaves the row with that list empty and a warning.
+    """
+    checks = [
+        "if "
+        + c.excludes(f"({c.prop} of msg)" if c.prop else "msg")
+        + " then set includeThis to false"
+        for c in criteria
+    ]
+    row: list[str] = []
+    if include_attachments:
+        row += _block_lines(_attachment_walk_block(
+            message_var="msg", warnings_var="warnList", indent=0
+        ))
+    row += _block_lines(_recipient_read_block(
+        message_var="msg", warnings_var="warnList", indent=0
+    ))
+    record = _search_record(
+        id_expr="(id of msg as text)",
+        value=lambda prop, _stem, as_text: (
+            f"({prop} of msg as text)" if as_text else f"({prop} of msg)"
+        ),
+        include_attachments=include_attachments,
+    )
+    return [
+        "set msgs to messages of mailboxRef",
+        "set total to count of msgs",
+        "set matchCount to 0",
+        "repeat with i from 1 to total",
+        f"    if matchCount >= {limit} then exit repeat",
+        "    set msg to item i of msgs",
+        "    set includeThis to true",
+        "    try",
+        *_indented(checks, 8),
+        "    on error errMsg number errNum",
+        "        set includeThis to false",
+        "        try",
+        '            set end of warnList to ("filter check failed for message " & (id of msg as text) & ": " & errMsg & " (error " & errNum & ")")',
+        "        on error",
+        '            set end of warnList to ("filter check failed for message at index " & i & ": " & errMsg & " (error " & errNum & ")")',
+        "        end try",
+        "    end try",
+        "    if includeThis then",
+        *_indented(row, 8),
+        f"        set end of resultData to {record}",
+        "        set matchCount to matchCount + 1",
+        "    end if",
+        "end repeat",
+    ]
+
+
+def _bulk_read_lines(*, target: str, expr: str, what: str, flag: str, where: str) -> list[str]:
+    """Read ``expr`` into ``target`` under a guard: ``flag`` says
+    whether it worked, and a failure is a warning naming ``what`` and
+    ``where``, after which the caller reads one message at a time.
+    ``target`` starts empty, so a reference to it is always valid."""
+    return [
+        f"set {target} to {{}}",
+        f"set {flag} to false",
+        "try",
+        f"    set {target} to {expr}",
+        f"    set {flag} to true",
+        "on error errMsg number errNum",
+        f'    set end of warnList to ("{what} could not be read in bulk{where}: " & errMsg & " (error " & errNum & "); read one message at a time")',
+        "end try",
+    ]
+
+
+def _first_positions_lines(*, limit: str) -> list[str]:
+    """With no criteria the matches are the first ``limit`` positions,
+    and nothing is read for the whole mailbox but its count."""
+    return [
+        "set total to count of messages of mailboxRef",
+        "set matched to {}",
+        "set matchCount to 0",
+        "repeat with i from 1 to total",
+        f"    if matchCount >= {limit} then exit repeat",
+        "    set end of matched to i",
+        "    set matchCount to matchCount + 1",
+        "end repeat",
+    ]
+
+
+def _bulk_match_lines(
+    criteria: list[_SearchCriterion], *, limit: str
+) -> list[str]:
+    """Find the matched positions: read each criterion's property for
+    the whole mailbox in one event, test the values in the script, and
+    ask a message itself only for what has no bulk form, only when the
+    other criteria kept it. Every list must be as long as the id list;
+    one that is not means the mailbox changed between the reads."""
+    props = list(dict.fromkeys(c.prop for c in criteria if c.prop))
+    lines = [
+        "set allIds to id of messages of mailboxRef",
+        "set allIdsRef to a reference to allIds",
+        "set total to count of allIds",
+    ]
+    checks: list[str] = []
+    one_message = "set msgRef to a reference to («class mssg» id (item i of allIdsRef) of mailboxRef)"
+    for prop in props:
+        stem = _as_var(prop)
+        lines += _bulk_read_lines(
+            target=f"{stem}All", expr=f"{prop} of messages of mailboxRef",
+            what=prop, flag=f"{stem}InBulk", where="",
+        ) + [
+            f"set {stem}AllRef to a reference to {stem}All",
+            f"if {stem}InBulk and (count of {stem}All) is not total then set aligned to false",
+        ]
+        checks += [
+            f"if {stem}InBulk then",
+            f"    set {stem}Value to item i of {stem}AllRef",
+            "else",
+            f"    {one_message}",
+            f"    set {stem}Value to ({prop} of msgRef)",
+            "end if",
+        ] + [
+            f"if {c.excludes(stem + 'Value')} then set includeThis to false"
+            for c in criteria if c.prop == prop
+        ]
+    by_message = [c for c in criteria if c.prop is None]
+    if by_message:
+        checks.append(f"if includeThis then {one_message}")
+    checks += [
+        f"if includeThis and ({c.excludes('msgRef')}) then set includeThis to false"
+        for c in by_message
+    ]
+    return lines + [
+        "set matched to {}",
+        "set matchCount to 0",
+        "if aligned then",
+        "    repeat with i from 1 to total",
+        f"        if matchCount >= {limit} then exit repeat",
+        "        set includeThis to true",
+        "        try",
+        *_indented(checks, 12),
+        "        on error errMsg number errNum",
+        "            set includeThis to false",
+        '            set end of warnList to ("filter check failed for message " & ((item i of allIdsRef) as text) & ": " & errMsg & " (error " & errNum & ")")',
+        "        end try",
+        "        if includeThis then",
+        "            set end of matched to i",
+        "            set matchCount to matchCount + 1",
+        "        end if",
+        "    end repeat",
+        "end if",
+    ]
+
+
+def _run_reads_lines(filter_props: list[str]) -> list[str]:
+    """Read each row property, and each kind of recipient, once for the
+    run ``runStart thru runEnd``. A property a criterion already read
+    for the whole mailbox is not read again. Each read's list must be as
+    long as the run's ids."""
+    lines: list[str] = []
+    where = ' for mailbox positions " & runStart & "-" & runEnd & "'
+    reads = [
+        (_as_var(prop), f"{prop} of messages runStart thru runEnd of mailboxRef", prop)
+        for prop, _key, _text in _SEARCH_ROW_PROPERTIES
+    ] + [
+        (key, f"properties of {element} of messages runStart thru runEnd of mailboxRef", element)
+        for element, key, _var in _RECIPIENT_KINDS
+    ]
+    for stem, expr, what in reads:
+        read = _bulk_read_lines(
+            target=f"{stem}Run", expr=expr, what=what, flag=f"{stem}RunRead", where=where,
+        ) + [
+            f"set {stem}RunRef to a reference to {stem}Run",
+            f"if {stem}RunRead and (count of {stem}Run) is not (count of runIds) then set aligned to false",
+        ]
+        if what in filter_props:
+            read = [f"set {stem}RunRead to false", f"if not {stem}InBulk then", *_indented(read, 4), "end if"]
+        lines += read
+    return lines
+
+
+def _row_value_lines(filter_props: list[str]) -> list[str]:
+    """Each row property's value for the message at position ``idx``
+    (item ``j`` of its run): from the criterion's list for the whole
+    mailbox, else from the run's list, else read from the message."""
+    lines: list[str] = []
+    for prop, _key, _text in _SEARCH_ROW_PROPERTIES:
+        stem = _as_var(prop)
+        sources = [(f"{stem}RunRead", f"item j of {stem}RunRef")]
+        if prop in filter_props:
+            sources.insert(0, (f"{stem}InBulk", f"item idx of {stem}AllRef"))
+        for n, (flag, expr) in enumerate(sources):
+            lines += [f"{'else if' if n else 'if'} {flag} then", f"    set {stem}Value to {expr}"]
+        lines += ["else", f"    set {stem}Value to ({prop} of msgRef)", "end if"]
+    return lines
+
+
+def _bulk_rows_lines(
+    *, filter_props: list[str], check_ids: bool, include_attachments: bool
+) -> list[str]:
+    """Build a row for each matched position, reading each property
+    once per run of positions rather than once per message.
+
+    Positions shift when a message arrives, moves or goes, and a list
+    read after the shift no longer lines up with one read before it.
+    So each row's id must be the one the criteria matched at its
+    position (``check_ids``), and once the rows are built the ids at
+    the first and last matched positions are read again; a mismatch
+    leaves ``aligned`` false and the caller searches one message at a
+    time instead.
+    """
+    row: list[str] = [
+        "set j to idx - runStart + 1",
+        "set msgId to item j of runIdsRef",
+    ]
+    if check_ids:
+        row.append("if msgId is not (item idx of allIdsRef) then set aligned to false")
+    row += [
+        "if k is 1 then set firstRowId to msgId",
+        "set lastRowId to msgId",
+        "set msgRef to a reference to («class mssg» id msgId of mailboxRef)",
+        *_row_value_lines(filter_props),
+        *_block_lines(_recipient_read_block(
+            message_var="msgRef", warnings_var="warnList", indent=0,
+            id_expr="(msgId as text)", from_runs=True,
+        )),
+    ]
+    if include_attachments:
+        row += _block_lines(_attachment_walk_block(
+            message_var="msgRef", warnings_var="warnList", indent=0
+        ))
+    record = _search_record(
+        id_expr="(msgId as text)",
+        value=lambda _prop, stem, as_text: (
+            f"({stem}Value as text)" if as_text else f"{stem}Value"
+        ),
+        include_attachments=include_attachments,
+    )
+    row += [f"set end of resultData to {record}", "set k to k + 1"]
+    return [
+        "if aligned and matchCount > 0 then",
+        "    set matchedRef to a reference to matched",
+        "    set runs to {}",
+        "    set runStart to 0",
+        "    set runEnd to 0",
+        "    repeat with k from 1 to matchCount",
+        "        set idx to item k of matchedRef",
+        "        if runStart is 0 then",
+        "            set runStart to idx",
+        f"        else if idx - runEnd > {_SEARCH_RUN_GAP + 1} then",
+        "            set end of runs to {runStart, runEnd}",
+        "            set runStart to idx",
+        "        end if",
+        "        set runEnd to idx",
+        "    end repeat",
+        "    set end of runs to {runStart, runEnd}",
+        "    set k to 1",
+        "    repeat with runBounds in runs",
+        "        set runStart to item 1 of runBounds",
+        "        set runEnd to item 2 of runBounds",
+        "        try",
+        "            set runIds to id of messages runStart thru runEnd of mailboxRef",
+        "        on error",
+        "            set aligned to false",
+        "            exit repeat",
+        "        end try",
+        "        set runIdsRef to a reference to runIds",
+        "        if (count of runIds) is not (runEnd - runStart + 1) then",
+        "            set aligned to false",
+        "            exit repeat",
+        "        end if",
+        *_indented(_run_reads_lines(filter_props), 8),
+        "        repeat while k <= matchCount",
+        "            set idx to item k of matchedRef",
+        "            if idx > runEnd then exit repeat",
+        *_indented(row, 12),
+        "        end repeat",
+        "        if not aligned then exit repeat",
+        "    end repeat",
+        "    if aligned then",
+        "        try",
+        "            if (id of message (item 1 of matched) of mailboxRef) is not firstRowId then set aligned to false",
+        "            if (id of message (item matchCount of matched) of mailboxRef) is not lastRowId then set aligned to false",
+        "        on error",
+        "            set aligned to false",
+        "        end try",
+        "    end if",
+        "end if",
+    ]
+
+
+def _search_script_body(
+    *,
+    account_clause: str,
+    mailbox_safe: str,
+    criteria: list[_SearchCriterion],
+    date_setup: list[str],
+    limit: str,
+    include_attachments: bool,
+) -> str:
+    """The tell block of the AppleScript search; see
+    ``AppleMailConnector._search_messages_applescript`` for the design
+    and the measurements behind it."""
+    filter_props = list(dict.fromkeys(c.prop for c in criteria if c.prop))
+    match = (
+        _bulk_match_lines(criteria, limit=limit)
+        if criteria
+        else _first_positions_lines(limit=limit)
+    )
+    body = [
+        f"set accountRef to {account_clause}",
+        f'set mailboxRef to mailbox "{mailbox_safe}" of accountRef',
+        *"\n".join(date_setup).splitlines(),
+        "set resultData to {}",
+        "set warnList to {}",
+        "set aligned to true",
+        *match,
+        *_bulk_rows_lines(
+            filter_props=filter_props,
+            check_ids=bool(criteria),
+            include_attachments=include_attachments,
+        ),
+        "if not aligned then",
+        "    set resultData to {}",
+        f'    set warnList to {{"{_SEARCH_OUT_OF_LINE_WARNING}"}}',
+        *_indented(_one_at_a_time_search_lines(
+            criteria, limit=limit, include_attachments=include_attachments
+        ), 4),
+        "end if",
+        "set resultData to {|messages|:resultData, |warnings|:warnList}",
+    ]
+    return 'tell application "Mail"\n' + "\n".join(_indented(body, 4)) + "\nend tell"
 
 
 class AppleMailConnector:
@@ -1955,19 +2361,19 @@ class AppleMailConnector:
         Args:
             account: Account name.
             mailbox: Mailbox name.
-            sender_contains: Substring match on sender (server-side).
-            subject_contains: Substring match on subject (server-side).
+            sender_contains: Substring match on sender.
+            subject_contains: Substring match on subject.
             read_status: Filter by read status (True=read, False=unread).
             is_flagged: Filter by flagged status (True=flagged, False=not).
             date_from: Inclusive lower bound on date received. ISO 8601 YYYY-MM-DD.
             date_to: Inclusive upper bound on date received (full day included).
                 ISO 8601 YYYY-MM-DD.
-            has_attachment: Filter messages with/without attachments. Applied
-                post-whose because Mail rejects it inside a whose clause.
+            has_attachment: Filter messages with/without attachments. Asked
+                of each message the other criteria kept.
             limit: Maximum results.
 
         Returns:
-            List of message dictionaries.
+            List of message dictionaries, newest first.
 
         Raises:
             ValueError: If date_from or date_to is not ISO 8601 YYYY-MM-DD.
@@ -1977,23 +2383,58 @@ class AppleMailConnector:
         account_clause = applescript_account_clause(account)
         mailbox_safe = escape_applescript_string(sanitize_input(mailbox))
 
-        # Build per-message AppleScript IF filters instead of a `whose` clause.
+        # No `whose` clause. `messages of mb whose <filter>` makes Mail
+        # evaluate the predicate across the whole mailbox before
+        # returning anything: over 120 s for permissive filters on an
+        # 8443-message MobileMe Sent folder, where testing each message
+        # in the script took about a second.
         #
-        # Empirical finding (probes against an 8443-message Sent folder on
-        # MobileMe): `messages of mb whose <filter>` triggers Mail.app's
-        # internal predicate evaluator across the entire mailbox before any
-        # iteration starts — measured >120s timeout for permissive filters
-        # and effectively unbounded for selective ones. Manual indexed
-        # iteration with the same filter as an IF body completes in ~1s for
-        # the same query.
+        # What costs is the Apple event, about 15 ms each, and the old
+        # loop spent one per message per property it tested or returned:
+        # 8.6 s for a 50-row page of the test account's INBOX
+        # (2026-09-27). The script now reads a property for many
+        # messages in one event. Measured there, the same day:
         #
-        # The pattern: iterate `messages of mailboxRef` in REVERSE order
-        # (newest first, matching typical user intent for mail), apply
-        # filter expressions per-message, short-circuit when matchCount
-        # reaches limit. Cost is bounded by `min(filter_misses + limit, N)`
-        # times per-message-property-fetch — typically dominated by the
-        # first few hundred recent messages, which Mail caches locally.
-        filter_checks, date_setup = _search_filter_statements(
+        #   - `subject of messages of mb`, every message at once, cost
+        #     about 20-30 ms; sender, date received, read and flagged
+        #     status the same; `message id` about 0.13 ms a message and
+        #     `properties of to recipients` about 0.3-0.4 ms a message.
+        #   - `subject of messages 1 thru N of mb`, a range, cost about
+        #     10 ms plus 1.3 ms a message: cheaper than an event per
+        #     message, far dearer than the whole mailbox at once.
+        #   - `subject of <a list of message references>` is refused
+        #     (-1728): AppleScript does not distribute a property over a
+        #     list, so the matched messages cannot be read as a set.
+        #
+        # So each criterion's property is read for the whole mailbox
+        # (a cost in the mailbox's size, as the old loop's `messages of
+        # mb` already was) and tested in the script, and each row
+        # property is read once per run of matched positions (a cost in
+        # the rows returned). Attachments and body content have no
+        # cheap bulk form and are asked one message at a time, of
+        # messages the other criteria kept. Items of those lists are
+        # reached through `a reference to` the list: at the script's
+        # top level `item i of aList` slows with the list's length (26 s
+        # over 50000 items, 83 ms through a reference, measured without
+        # Mail).
+        #
+        # Every bulk read sits under its own guard: one that fails is
+        # warned about and redone one message at a time, with the
+        # guards the old loop had (a criterion that cannot be read
+        # leaves the message out with a warning; an unreadable
+        # recipient list is empty with a warning). And the lists must
+        # line up by position: each is checked against the id list's
+        # length, each row's id against the one the criteria matched,
+        # and the first and last matched positions' ids are read again
+        # at the end. A mailbox that changed under the reads fails one
+        # of those, and the search starts over one message at a time,
+        # the old loop, over references Mail hands out by id, saying
+        # so in a warning.
+        #
+        # The script returns {messages, warnings}; the Python side hands
+        # the warnings to ``on_warning``, which ``search_messages`` lifts
+        # into the response. NO SILENT ERRORS.
+        criteria, date_setup = _search_criteria(
             sender_contains=sender_contains,
             subject_contains=subject_contains,
             read_status=read_status,
@@ -2004,103 +2445,14 @@ class AppleMailConnector:
             body_contains=body_contains,
             text_contains=text_contains,
         )
-
-        # Render filter checks each on their own line, indented for the loop.
-        filter_block = "\n                ".join(filter_checks) if filter_checks else ""
-
-        # Date cutoffs are built ONCE, before the loop, as AppleScript date
-        # objects. They cannot be inlined as `date "YYYY-MM-DD"` literals —
-        # see applescript_iso_date_statements for why that silently yields
-        # the year 12169.
-        date_setup_block = (
-            "\n            ".join("\n".join(date_setup).splitlines())
-            if date_setup
-            else ""
+        tell_body = _search_script_body(
+            account_clause=account_clause,
+            mailbox_safe=mailbox_safe,
+            criteria=criteria,
+            date_setup=date_setup,
+            limit=str(limit) if limit else "999999999",
+            include_attachments=include_attachments,
         )
-
-        # Per-match limit short-circuits the loop, so the ITERATION order
-        # decides which N messages a limited search returns, not just the
-        # order they come back in.
-        #
-        # Mail returns `messages of mailbox` newest-first: item 1 is the
-        # newest message and item (count) is the oldest. This loop used to
-        # run `from total to 1 by -1`, walking that list backwards — oldest
-        # to newest — so `limit=N` short-circuited on the N OLDEST messages
-        # while the comment here claimed newest-first. Reading the code did
-        # not catch that; measuring it did. Iterate forward.
-        effective_limit = str(limit) if limit else "999999999"
-
-        # Per-message filter checks AND attachment iteration are now
-        # wrapped in inner try/on-error blocks. Before this patch, a
-        # single inline-image -10000 message anywhere in the
-        # `messages of mailboxRef` set aborted the whole tell block
-        # and propagated as a loud MailAppleScriptError (-10000) —
-        # the failure mode the iCloud reproducer hit. Now, a per-msg
-        # failure is recorded into ``warnList`` and the loop continues:
-        #
-        #   - Filter-check failure → message excluded, warning emitted.
-        #     This matches the existing semantics for messages that
-        #     fail the predicate, with no silent drop because the
-        #     warning surfaces in the response.
-        #   - Attachment-iteration failure (only when
-        #     ``include_attachments`` is set) → message INCLUDED with
-        #     ``attachments=[]`` and a warning. Mirrors the contract
-        #     of ``_get_message_applescript`` + the shared
-        #     ``_enumerate_attachments_for_message`` helper.
-        #
-        # The script result becomes a record {messages, warnings}; the
-        # Python side unpacks both and forwards warnings via
-        # ``on_warning`` so the public ``search_messages`` lifts them
-        # into the response ``warnings`` field. NO SILENT ERRORS.
-        if include_attachments:
-            attachments_clause = "\n" + _attachment_walk_block(
-                message_var="msg", warnings_var="warnList", indent=20
-            )
-            attachments_field = ", |attachments|:attList"
-        else:
-            attachments_clause = ""
-            attachments_field = ""
-        # Recipients: three reads per matching row, under per-kind
-        # guards whose failures join warnList like the ones above.
-        recipients_clause = _recipient_read_block(
-            message_var="msg", warnings_var="warnList", indent=20
-        )
-
-        tell_body = f'''
-        tell application "Mail"
-            set accountRef to {account_clause}
-            set mailboxRef to mailbox "{mailbox_safe}" of accountRef
-            set msgs to messages of mailboxRef
-            set total to count of msgs
-
-            {date_setup_block}
-            set resultData to {{}}
-            set warnList to {{}}
-            set matchCount to 0
-            repeat with i from 1 to total
-                if matchCount >= {effective_limit} then exit repeat
-                set msg to item i of msgs
-                set includeThis to true
-                try
-                    {filter_block}
-                on error errMsg number errNum
-                    set includeThis to false
-                    try
-                        set end of warnList to ("filter check failed for message " & (id of msg as text) & ": " & errMsg & " (error " & errNum & ")")
-                    on error
-                        set end of warnList to ("filter check failed for message at index " & i & ": " & errMsg & " (error " & errNum & ")")
-                    end try
-                end try
-                if includeThis then{attachments_clause}
-{recipients_clause}
-                    set msgRecord to {{|id|:(id of msg as text), |rfc_message_id|:(message id of msg), |subject|:(subject of msg), |sender|:(sender of msg), |date_received|:(date received of msg as text), |read_status|:(read status of msg), |flagged|:(flagged status of msg), {_RECIPIENT_FIELDS}{attachments_field}}}
-                    set end of resultData to msgRecord
-                    set matchCount to matchCount + 1
-                end if
-            end repeat
-            set resultData to {{|messages|:resultData, |warnings|:warnList}}
-        end tell
-        '''
 
         script = _wrap_as_json_script(tell_body, timeout=self.timeout)
         result = self._run_applescript(script)
