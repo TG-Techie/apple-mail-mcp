@@ -14,18 +14,27 @@ Run with: MAIL_TEST_MODE=true MAIL_TEST_ACCOUNT=<test account name> pytest --run
 
 import datetime as _dt
 import uuid
+from dataclasses import dataclass
+from email import message_from_string
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 from _pytest.monkeypatch import MonkeyPatch
 
-from apple_mail_mcp.mail_connector import AppleMailConnector
+from apple_mail_mcp.mail_connector import AppleMailConnector, _wrap_as_json_script
+from apple_mail_mcp.utils import escape_applescript_string, parse_applescript_json
 
+from .conftest import TEST_DRAFT_SUBJECT_PREFIX
 from .mail_readback import (
+    MailTrash,
     assert_not_quoted,
+    bare_message_id,
     compose_window_count,
     draft_source,
+    html_part,
     outgoing_message_count,
+    plain_part,
     trash_drafts,
 )
 
@@ -1389,6 +1398,223 @@ class TestDraftsLifecycleIntegration:
             )
         finally:
             connector.delete_draft(draft_id)
+
+
+@dataclass(frozen=True)
+class _Seed:
+    """A message the test account already holds, to reply to or forward."""
+
+    mail_id: str
+    subject: str
+    rfc_message_id: str
+    attachment_names: tuple[str, ...]
+
+
+def _file_parts(source: str) -> dict[str, bytes]:
+    """Each attached file in a message's raw source, by name, transfer
+    encoding undone."""
+    return {
+        str(part.get_filename()): cast(bytes, part.get_payload(decode=True))
+        for part in message_from_string(source).walk()
+        if part.get_filename()
+    }
+
+
+class TestHtmlReplyAndForwardComposedAndSaved:
+    """The HTML reply and forward, composed as ``_send_html_email``
+    composes them (``_compose``, ``plain=False``) and saved instead of
+    sent, then read back: sender, recipients, subject, body and files
+    from ``get_draft_state``, and the draft's raw source from Mail. The
+    HTML is above what Mail wrote, which stays: the quote of a reply,
+    and a forward's forwarded-message block and the original's files.
+    The caller's file is there, byte for byte.
+
+    Nothing here sends. The sends themselves are covered by
+    test_verified_send.py and test_loopback.py, written against what
+    these read back.
+
+    The seed is a message the test account already holds: the first in
+    Sent, then in Trash, whose subject carries the suite's prefix, which
+    has files, and which is not a draft. None is sent for this; the test
+    skips when there is none. Each draft is saved under a subject with
+    the prefix, the reply's and forward's own "Re:"/"Fwd:" replaced, and
+    moved to Trash when the test ends.
+
+    Not a draft, because of the first run, 2026-09-27 ~04:56 EDT. The
+    session sweep (conftest.py) had just moved a leftover test draft to
+    Trash; this fixture, then taking the first match, took that draft as
+    the seed; the script opening Mail's forward of it timed out at 60 s,
+    and Mail answered no AppleEvent for the next 20 minutes and more,
+    its main thread inside a scripting command, no dialog or sheet on
+    any of its windows. That the draft was the cause is not established.
+    A draft is told by the header Mail writes on the drafts it saves,
+    ``X-Uniform-Type-Identifier: com.apple.mail-draft``; that the header
+    is on every such draft, and on nothing else, was not checked."""
+
+    @pytest.fixture
+    def seed(self, connector: AppleMailConnector, test_account: str) -> _Seed:
+        prefix = escape_applescript_string(TEST_DRAFT_SUBJECT_PREFIX)
+        account = escape_applescript_string(test_account)
+        raw = connector._run_applescript(_wrap_as_json_script(f"""
+tell application "Mail"
+    set found to missing value
+    repeat with box in {{sent mailbox, trash mailbox}}
+        repeat with m in (messages of box whose subject begins with "{prefix}")
+            try
+                if (name of account of mailbox of m) is "{account}" and (count of mail attachments of m) > 0 then
+                    if (all headers of m) does not contain "com.apple.mail-draft" then
+                        set found to contents of m
+                        exit repeat
+                    end if
+                end if
+            end try
+        end repeat
+        if found is not missing value then exit repeat
+    end repeat
+    if found is missing value then
+        set resultData to {{|found|:false}}
+    else
+        set resultData to {{|found|:true, |id|:(id of found as text), |subject|:(subject of found), |message_id|:(message id of found), |attachment_names|:(name of every mail attachment of found)}}
+    end if
+end tell
+""", timeout=connector.timeout))
+        data = cast(dict[str, Any], parse_applescript_json(raw))
+        if not data.get("found"):
+            pytest.skip(
+                "the test account holds no message in Sent or Trash whose "
+                "subject starts with the suite's prefix, that has files, "
+                "and that is not a draft"
+            )
+        found = _Seed(
+            mail_id=str(data["id"]),
+            subject=str(data["subject"]),
+            rfc_message_id=bare_message_id(str(data["message_id"])),
+            attachment_names=tuple(str(n) for n in data["attachment_names"]),
+        )
+        print(f"seed: Mail id {found.mail_id}, {found.subject!r}, files {found.attachment_names}")
+        return found
+
+    def _save(
+        self,
+        connector: AppleMailConnector,
+        test_account: str,
+        seed: _Seed,
+        kind: str,
+        subject: str,
+        marker: str,
+        attached: Path,
+    ) -> dict[str, Any]:
+        """Compose and save; return what the saved draft holds, with the
+        compose window and outgoing message it leaves checked gone."""
+        result = connector._compose(
+            seed=kind,
+            seed_id=seed.mail_id,
+            reply_all=False,
+            to=["test1@example.com"],
+            cc=None,
+            bcc=None,
+            subject=subject,
+            body=f"<p>html above <b>{marker}</b></p><p>two &amp; more</p>",
+            plain=False,
+            attachment_paths=[attached],
+            from_account=test_account,
+            send_now=False,
+        )
+        assert result["draft_id"], result
+        assert result["sent_message_id"] == ""
+        assert compose_window_count(connector, subject) == 0, (
+            "the save left its compose window open"
+        )
+        assert outgoing_message_count(connector, subject) == 0
+        state = connector.get_draft_state(result["draft_id"])
+        assert state["subject"] == subject
+        assert state["to"] == ["test1@example.com"]
+        assert state["cc"] == []
+        assert state["bcc"] == []
+        assert state["sender"] == connector._resolve_account_to_sender(test_account)
+        return state
+
+    def _assert_html(self, source: str, marker: str, mails_part: str) -> None:
+        """The HTML rendered as HTML, above ``mails_part``."""
+        html = html_part(source)
+        assert f"<b>{marker}</b>" in html, "the HTML did not render as HTML"
+        assert f"&lt;b&gt;{marker}" not in html, "the HTML was pasted as text"
+        assert "two &amp; more" in html
+        marker_at = html.find(marker)
+        part_at = html.find(mails_part)
+        assert part_at >= 0, f"{mails_part!r} is not in the HTML part"
+        assert marker_at < part_at, f"the HTML is below {mails_part!r}"
+
+    def test_a_forward_keeps_mails_forwarded_message_and_takes_a_file(
+        self,
+        connector: AppleMailConnector,
+        test_account: str,
+        seed: _Seed,
+        tmp_path: Path,
+    ) -> None:
+        hexid = uuid.uuid4().hex[:8]
+        subject = f"{TEST_DRAFT_SUBJECT_PREFIX}html-forward-{hexid}"
+        marker = f"forward-marker-{hexid}"
+        attached = tmp_path / "caller.txt"
+        attached.write_text(f"the caller's file {hexid}\n")
+        with MailTrash(connector, test_account) as trash:
+            trash.windows(subject)
+            trash.drafts(subject)
+            state = self._save(
+                connector, test_account, seed, "forward", subject, marker, attached,
+            )
+            print(f"forward draft files: {state['attachment_names']}")
+            source = draft_source(connector, subject)
+
+            body = state["body"]
+            marker_at = body.find(marker)
+            block_at = body.find("Begin forwarded message")
+            assert marker_at >= 0, "the HTML's text is not in the draft"
+            assert block_at >= 0, "Mail's forwarded-message block is not in the draft"
+            assert marker_at < block_at, "the HTML is below the forwarded message"
+            assert seed.subject in body[block_at:], "the block names no subject"
+            self._assert_html(source, marker, "Begin forwarded message")
+            assert sorted(state["attachment_names"]) == sorted(
+                [*seed.attachment_names, attached.name]
+            )
+            files = _file_parts(source)
+            assert files.get(attached.name) == attached.read_bytes()
+            for name in seed.attachment_names:
+                assert name in files, f"the original's {name!r} is not in the source"
+
+    def test_a_reply_keeps_mails_quote_and_takes_a_file(
+        self,
+        connector: AppleMailConnector,
+        test_account: str,
+        seed: _Seed,
+        tmp_path: Path,
+    ) -> None:
+        hexid = uuid.uuid4().hex[:8]
+        subject = f"{TEST_DRAFT_SUBJECT_PREFIX}html-reply-{hexid}"
+        marker = f"reply-marker-{hexid}"
+        attached = tmp_path / "caller.txt"
+        attached.write_text(f"the caller's file {hexid}\n")
+        with MailTrash(connector, test_account) as trash:
+            trash.windows(subject)
+            trash.drafts(subject)
+            state = self._save(
+                connector, test_account, seed, "reply", subject, marker, attached,
+            )
+            source = draft_source(connector, subject)
+
+            assert bare_message_id(state["in_reply_to"]) == seed.rfc_message_id
+            body = state["body"]
+            marker_at = body.find(marker)
+            wrote_at = body.find("wrote:")
+            assert marker_at >= 0, "the HTML's text is not in the draft"
+            assert wrote_at >= 0, "Mail's quote header is not in the draft"
+            assert marker_at < wrote_at, "the HTML is below the quote"
+            self._assert_html(source, marker, 'type="cite"')
+            assert any(
+                line.startswith(">") for line in plain_part(source).splitlines()
+            ), "the plain part quotes nothing"
+            assert state["attachment_names"] == [attached.name]
+            assert _file_parts(source) == {attached.name: attached.read_bytes()}
 
 
 class TestErrorHandling:

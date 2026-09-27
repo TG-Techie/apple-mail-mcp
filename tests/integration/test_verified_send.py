@@ -21,8 +21,14 @@ from apple_mail_mcp.mail_connector import AppleMailConnector
 from .conftest import TEST_DRAFT_SUBJECT_PREFIX
 from .mail_readback import (
     MailTrash,
+    SentCopy,
     assert_html_rendered,
+    bare_message_id,
     compose_window_count,
+    header,
+    html_part,
+    plain_part,
+    sent_copy,
     sent_count_for_subject,
     sent_source_for_subject,
 )
@@ -31,6 +37,8 @@ pytestmark = pytest.mark.skipif(
     "not config.getoption('--run-integration')",
     reason="Integration tests disabled by default. Use --run-integration to run."
 )
+
+SENT = {"draft_id": "", "sent_message_id": ""}
 
 
 @pytest.fixture
@@ -126,6 +134,108 @@ class TestVerifiedHtmlReply:
             sent_source_for_subject(connector, f"Re: {orig_subject}"),
             "<i>phase-1-3</i>",
         )
+
+
+class TestVerifiedHtmlReplyAndForwardWithAFile:
+    """``_send_html_email(forward_of=...)``, and ``reply_to`` with a file:
+    the Sent copy carries the HTML above what Mail wrote, which stays,
+    and the caller's file after it.
+
+    Written 2026-09-27 and not run: no message was to be sent from the
+    test account until the operator had seen that day's HM108 bounces
+    (iCloud rejecting the account's own sends). They were to be checked
+    against the same composition saved as a draft
+    (test_mail_integration.py, TestHtmlReplyAndForwardComposedAndSaved),
+    whose first run did not get past opening the window (see there).
+    Run them before relying on them.
+
+    Each sends its own seed, a fresh HTML message with two files, and
+    answers the seed's Sent copy, so nothing waits on a delivery."""
+
+    def _seed(
+        self, connector: AppleMailConnector, trash: MailTrash, tmp_path, hexid: str
+    ) -> SentCopy:
+        subject = trash.sent(f"{TEST_DRAFT_SUBJECT_PREFIX}verified-seed-{hexid}")
+        files = []
+        for name in ("seedone.txt", "seedtwo.txt"):
+            f = tmp_path / name
+            f.write_text(f"{name} {hexid}\n")
+            files.append(f)
+        assert connector._send_html_email(
+            to=["probe@example.com"], cc=None, bcc=None, subject=subject,
+            body=f"<p>seed <b>seed-marker-{hexid}</b></p>",
+            from_account=None, attachment_paths=files,
+        ) == SENT
+        return sent_copy(connector, subject)
+
+    def test_html_forward_carries_the_original_and_a_file(
+        self, connector: AppleMailConnector, test_account: str, tmp_path
+    ) -> None:
+        hexid = uuid.uuid4().hex[:8]
+        caller = tmp_path / "caller.txt"
+        caller.write_text(f"caller {hexid}\n")
+        with MailTrash(connector, test_account) as trash:
+            seed = self._seed(connector, trash, tmp_path, hexid)
+            forward_subject = trash.sent(
+                f"{TEST_DRAFT_SUBJECT_PREFIX}verified-forward-{hexid}"
+            )
+            trash.windows(forward_subject)
+            assert connector._send_html_email(
+                to=["probe@example.com"], cc=None, bcc=None,
+                subject=forward_subject,
+                body=f"<p>forward <b>forward-marker-{hexid}</b></p>",
+                from_account=None, forward_of=seed.mail_id,
+                attachment_paths=[caller],
+            ) == SENT
+            assert compose_window_count(connector, forward_subject) == 0
+            forward = sent_copy(connector, forward_subject)
+
+            assert_html_rendered(forward.source, f"<b>forward-marker-{hexid}</b>")
+            html = html_part(forward.source)
+            marker_at = html.find(f"forward-marker-{hexid}")
+            block_at = html.find("Begin forwarded message")
+            assert 0 <= marker_at < block_at, "the HTML is not above the forward"
+            assert f"seed-marker-{hexid}" in html[block_at:]
+            assert sorted(forward.attachment_names) == sorted(
+                [*seed.attachment_names, caller.name]
+            )
+            assert seed.rfc_message_id in (header(forward.headers, "References") or "")
+
+    def test_html_reply_with_a_file_keeps_the_quote(
+        self, connector: AppleMailConnector, test_account: str, tmp_path
+    ) -> None:
+        hexid = uuid.uuid4().hex[:8]
+        caller = tmp_path / "caller.txt"
+        caller.write_text(f"caller {hexid}\n")
+        with MailTrash(connector, test_account) as trash:
+            seed = self._seed(connector, trash, tmp_path, hexid)
+            reply_subject = trash.sent(
+                f"{TEST_DRAFT_SUBJECT_PREFIX}verified-reply-{hexid}"
+            )
+            trash.windows(reply_subject)
+            assert connector._send_html_email(
+                to=["probe@example.com"], cc=None, bcc=None,
+                subject=reply_subject,
+                body=f"<p>reply <b>reply-marker-{hexid}</b></p>",
+                from_account=None, reply_to=seed.mail_id,
+                attachment_paths=[caller],
+            ) == SENT
+            assert compose_window_count(connector, reply_subject) == 0
+            reply = sent_copy(connector, reply_subject)
+
+            assert_html_rendered(reply.source, f"<b>reply-marker-{hexid}</b>")
+            html = html_part(reply.source)
+            marker_at = html.find(f"reply-marker-{hexid}")
+            cite_at = html.find('type="cite"')
+            assert 0 <= marker_at < cite_at, "the HTML is not above the quote"
+            assert f"seed-marker-{hexid}" in html[cite_at:]
+            assert any(
+                line.startswith(">") and f"seed-marker-{hexid}" in line
+                for line in plain_part(reply.source).splitlines()
+            ), "the original went out unquoted"
+            assert reply.attachment_names == (caller.name,)
+            in_reply_to = bare_message_id(header(reply.headers, "In-Reply-To") or "")
+            assert in_reply_to == seed.rfc_message_id
 
 
 class TestDiscardCompose:

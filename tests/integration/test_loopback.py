@@ -765,3 +765,128 @@ def test_a_reply_draft_with_a_note_and_a_file_goes_out_with_both(
         assert 0 <= note_at < quoted_at, "the note is not above the quote"
         assert reply.attachment_names == (attached.name,)
         assert _attachment_bytes(reply.source) == {attached.name: attached.read_bytes()}
+
+
+# The two tests below were written on 2026-09-27 and have not been run:
+# no message was to be sent from the test account until the operator had
+# seen that day's HM108 bounces ("550 5.7.1 [HM108] Message rejected due
+# to local policy", iCloud refusing the account's sends to itself). They
+# were to be checked against the same composition saved as a draft
+# (test_mail_integration.py, TestHtmlReplyAndForwardComposedAndSaved),
+# whose first run did not get past opening the window (see there). Run
+# them before relying on them.
+
+
+def test_html_forward_carries_the_original_its_files_and_the_callers(
+    loop: Loopback, tmp_path: Path
+) -> None:
+    """``_send_html_email(forward_of=..., attachment_paths=[file])``: the
+    HTML above Mail's forwarded message, which keeps its header block and
+    the original's two files, and the caller's file, all byte for byte.
+    What email_send_html sent as a "forward" on 2026-09-26 was a fresh
+    message with the original pasted in; this fails on one. The forward
+    answers the seed's Sent copy, as the reply with a file does, and its
+    Sent copy is checked before its delivered one."""
+    hexid = _hex()
+    seed_subject = f"{PREFIX}html-forward-seed-{hexid}"
+    forward_subject = f"Fwd: {seed_subject}"
+    marker = f"forward-marker-{hexid}"
+    files = _two_files(tmp_path, hexid)
+    caller = tmp_path / "caller.txt"
+    caller.write_text(f"the caller's file {hexid}\n")
+    with MailTrash(loop.connector, loop.account) as trash:
+        loop.prepare(trash, seed_subject)
+        assert loop.connector._send_html_email(
+            to=[loop.address], cc=None, bcc=None, subject=seed_subject,
+            body=f"<p>html forward seed <b>seed-marker-{hexid}</b></p>",
+            from_account=None, attachment_paths=files,
+        ) == SENT
+        seed_sent = sent_copy(loop.connector, seed_subject)
+
+        trash.windows(forward_subject)
+        loop.prepare(trash, forward_subject)
+        assert loop.connector._send_html_email(
+            to=[loop.address], cc=None, bcc=None, subject="",
+            body=f"<p>html forward <b>{marker}</b></p>",
+            from_account=None, forward_of=seed_sent.mail_id,
+            attachment_paths=[caller],
+        ) == SENT
+        assert compose_window_count(loop.connector, forward_subject) == 0, (
+            "the send left its compose window open"
+        )
+        forward_sent = sent_copy(loop.connector, forward_subject)
+        wanted = sorted([*(f.name for f in files), caller.name])
+        assert sorted(forward_sent.attachment_names) == wanted
+        sent_html = html_part(forward_sent.source)
+        assert 0 <= sent_html.find(marker) < sent_html.find("Begin forwarded message")
+        forward_sent, forward = loop.receive(trash, forward_subject)
+
+        loop.assert_delivered(forward, forward_sent, forward_subject)
+        assert seed_sent.rfc_message_id in (header(forward.headers, "References") or "")
+        assert_html_rendered(forward.source, f"<b>{marker}</b>")
+        marker_at = forward.content.find(marker)
+        block_at = forward.content.find("Begin forwarded message")
+        assert marker_at >= 0, "the forward's own HTML did not arrive"
+        assert block_at >= 0, "Mail's forwarded-message block did not arrive"
+        assert marker_at < block_at, "the HTML is below the forwarded message"
+        assert forward.content.count(f"seed-marker-{hexid}") == 1
+        assert seed_subject in forward.content[block_at:]
+        assert sorted(forward.attachment_names) == wanted
+        assert _attachment_bytes(forward.source) == {
+            f.name: f.read_bytes() for f in [*files, caller]
+        }
+
+
+def test_html_reply_with_a_file_keeps_the_quote(loop: Loopback, tmp_path: Path) -> None:
+    """``_send_html_email(reply_to=..., attachment_paths=[file])``: the
+    HTML above the quoted original, which stays quoted, and the file.
+    email_send_html refused files on a reply until its reply was composed
+    as every other message is; attached through the dictionary they cost
+    a reply its quote (docs/research/icloud-draft-resync.md, Observation
+    11). The reply answers the seed's Sent copy."""
+    hexid = _hex()
+    seed_subject = f"{PREFIX}html-reply-file-seed-{hexid}"
+    reply_subject = f"Re: {seed_subject}"
+    marker = f"reply-marker-{hexid}"
+    caller = tmp_path / "caller.txt"
+    caller.write_text(f"the caller's file {hexid}\n")
+    with MailTrash(loop.connector, loop.account) as trash:
+        loop.prepare(trash, seed_subject)
+        assert loop.connector._send_html_email(
+            to=[loop.address], cc=None, bcc=None, subject=seed_subject,
+            body=f"<p>html reply seed <b>seed-marker-{hexid}</b></p>",
+            from_account=None,
+        ) == SENT
+        seed_sent = sent_copy(loop.connector, seed_subject)
+
+        trash.windows(reply_subject)
+        loop.prepare(trash, reply_subject)
+        assert loop.connector._send_html_email(
+            to=[loop.address], cc=None, bcc=None, subject="",
+            body=f"<p>html reply <b>{marker}</b></p>",
+            from_account=None, reply_to=seed_sent.mail_id,
+            attachment_paths=[caller],
+        ) == SENT
+        assert compose_window_count(loop.connector, reply_subject) == 0, (
+            "the send left its compose window open"
+        )
+        reply_sent = sent_copy(loop.connector, reply_subject)
+        assert reply_sent.attachment_names == (caller.name,)
+        sent_text = plain_part(reply_sent.source)
+        assert any(
+            line.startswith(">") and f"seed-marker-{hexid}" in line
+            for line in sent_text.splitlines()
+        ), "the original went out unquoted"
+        sent_html = html_part(reply_sent.source)
+        assert 0 <= sent_html.find(marker) < sent_html.find('type="cite"')
+        reply_sent, reply = loop.receive(trash, reply_subject)
+
+        loop.assert_delivered(reply, reply_sent, reply_subject)
+        in_reply_to = bare_message_id(header(reply.headers, "In-Reply-To") or "")
+        assert in_reply_to == seed_sent.rfc_message_id
+        assert_html_rendered(reply.source, f"<b>{marker}</b>")
+        marker_at = reply.content.find(marker)
+        quoted_at = reply.content.find(f"seed-marker-{hexid}")
+        assert 0 <= marker_at < quoted_at, "the HTML is below the quote"
+        assert reply.attachment_names == (caller.name,)
+        assert _attachment_bytes(reply.source) == {caller.name: caller.read_bytes()}
