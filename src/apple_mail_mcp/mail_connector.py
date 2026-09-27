@@ -579,7 +579,12 @@ _RECIPIENT_FIELDS = ", ".join(
 
 
 def _recipient_read_block(
-    *, message_var: str, warnings_var: str, indent: int
+    *,
+    message_var: str,
+    warnings_var: str,
+    indent: int,
+    id_expr: str | None = None,
+    from_runs: bool = False,
 ) -> str:
     """Emit the AppleScript that reads ``<message_var>``'s to, cc and bcc
     recipients into ``toList``, ``ccList`` and ``bccList``: one
@@ -604,22 +609,45 @@ def _recipient_read_block(
     display name has Mail's ``missing value`` as its name, which JSON
     cannot carry; it becomes ``""``, as does a missing address.
 
+    With ``from_runs``, the search's bulk path is the caller: each kind
+    was read for a run of messages at once into ``<key>Run`` (reached
+    through ``<key>RunRef``), and ``<key>RunRead`` says whether that
+    read worked. The message's list is then item ``j`` of the run's,
+    and only when the run's read failed is it read for the one
+    message, under the same guard.
+
     Args:
         message_var: AppleScript variable holding the message.
         warnings_var: AppleScript list variable collecting warnings.
         indent: Leading spaces for the emitted block.
+        id_expr: AppleScript text expression for the message's id in a
+            warning; by default it is read from the message.
+        from_runs: Take each list from the search's run reads.
 
     Returns:
         AppleScript fragment ready to interpolate. The message record
         takes the lists with ``_RECIPIENT_FIELDS``.
     """
     pad = " " * indent
+    id_text = id_expr or f"(id of {message_var} as text)"
     lines: list[str] = []
     for element, key, var in _RECIPIENT_KINDS:
+        one_message = f"set rcpts to properties of {element} of {message_var}"
+        source = (
+            [
+                f"{pad}    if {key}RunRead then",
+                f"{pad}        set rcpts to item j of {key}RunRef",
+                f"{pad}    else",
+                f"{pad}        {one_message}",
+                f"{pad}    end if",
+            ]
+            if from_runs
+            else [f"{pad}    {one_message}"]
+        )
         lines += [
             f"{pad}set {var} to {{}}",
             f"{pad}try",
-            f"{pad}    set rcpts to properties of {element} of {message_var}",
+            *source,
             f"{pad}    repeat with rcpt in rcpts",
             f"{pad}        set rcptName to name of rcpt",
             f'{pad}        if rcptName is missing value then set rcptName to ""',
@@ -631,7 +659,7 @@ def _recipient_read_block(
             f"{pad}    set {var} to {{}}",
             f"{pad}    set end of {warnings_var} to "
             f'("{key} recipients unreadable for message " & '
-            f'(id of {message_var} as text) & ": " & errMsg & '
+            f'{id_text} & ": " & errMsg & '
             f'" (error " & errNum & ")")',
             f"{pad}end try",
         ]
