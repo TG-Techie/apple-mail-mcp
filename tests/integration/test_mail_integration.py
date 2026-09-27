@@ -1438,7 +1438,9 @@ class TestHtmlReplyAndForwardComposedAndSaved:
     has files, and which is not a draft. None is sent for this; the test
     skips when there is none. Each draft is saved under a subject with
     the prefix, the reply's and forward's own "Re:"/"Fwd:" replaced, and
-    moved to Trash when the test ends.
+    moved to Trash when the test ends. Replacing the subject also covers
+    the retitle a subject set on a reply or forward causes
+    (docs/research/icloud-draft-resync.md, Observation 12).
 
     Not a draft, because of the first run, 2026-09-27 ~04:56 EDT. The
     session sweep (conftest.py) had just moved a leftover test draft to
@@ -1447,9 +1449,12 @@ class TestHtmlReplyAndForwardComposedAndSaved:
     and Mail answered no AppleEvent for the next 20 minutes and more,
     its main thread inside a scripting command, no dialog or sheet on
     any of its windows. That the draft was the cause is not established.
-    A draft is told by the header Mail writes on the drafts it saves,
-    ``X-Uniform-Type-Identifier: com.apple.mail-draft``; that the header
-    is on every such draft, and on nothing else, was not checked."""
+    So a seed is refused when it is listed in Mail's drafts mailbox, and
+    when its headers carry ``X-Uniform-Type-Identifier:
+    com.apple.mail-draft``, which Mail writes on the drafts it saves: on
+    2026-09-27 two drafts this connector saved carried it and the sent
+    message used as seed did not. That it is on every draft, and on
+    nothing else, was not checked."""
 
     @pytest.fixture
     def seed(self, connector: AppleMailConnector, test_account: str) -> _Seed:
@@ -1462,7 +1467,9 @@ tell application "Mail"
         repeat with m in (messages of box whose subject begins with "{prefix}")
             try
                 if (name of account of mailbox of m) is "{account}" and (count of mail attachments of m) > 0 then
-                    if (all headers of m) does not contain "com.apple.mail-draft" then
+                    set mId to id of m
+                    set inDrafts to (count of (messages of drafts mailbox whose id is mId)) > 0
+                    if not inDrafts and (all headers of m) does not contain "com.apple.mail-draft" then
                         set found to contents of m
                         exit repeat
                     end if
