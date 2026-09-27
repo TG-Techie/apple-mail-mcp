@@ -91,7 +91,7 @@ def _open_through_the_connector(
         seed="new", seed_id=None, reply_all=False, to=["tend@example.com"],
         cc=None, bcc=None, subject=subject,
         sender=connector._resolve_account_to_sender(test_account),
-        snapshot_drafts=False, operation="save",
+        operation="save",
     )
 
 

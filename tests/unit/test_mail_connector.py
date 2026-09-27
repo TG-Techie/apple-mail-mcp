@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from imapclient.exceptions import LoginError
 
+from apple_mail_mcp.compose_ledger import WindowOperation
 from apple_mail_mcp.exceptions import (
     MailAccountNotFoundError,
     MailAppleScriptError,
@@ -5267,7 +5268,7 @@ class TestComposition:
         *,
         seed: str = "new",
         to: list[str] | None = None,
-        snapshot_drafts: bool = False,
+        operation: WindowOperation = "save",
     ) -> str:
         return connector._build_open_compose_script(
             seed=seed,
@@ -5278,7 +5279,7 @@ class TestComposition:
             bcc=["b@example.com"],
             subject='Say "hi"',
             sender=sender,
-            snapshot_drafts=snapshot_drafts,
+            operation=operation,
         )
 
     def test_the_window_is_visible_and_its_body_seeded(
@@ -5390,7 +5391,7 @@ class TestComposition:
             seed=seed, seed_id=None if seed == "new" else "160989",
             reply_all=False, to=["a@example.com"], cc=None, bcc=None,
             subject="Fresh" if seed == "new" else None, sender=None,
-            snapshot_drafts=False,
+            operation="save",
         )
         assert script.count("afterCount > beforeCount") == 1
 
@@ -5406,19 +5407,30 @@ class TestComposition:
             assert f"address of {group} recipients of theMessage" in script
             assert f"|{group}|:" in script
 
-    def test_a_save_snapshots_drafts_before_the_window_opens(
-        self, connector: AppleMailConnector
+    @pytest.mark.parametrize(
+        ("operation", "mailbox", "other"),
+        [
+            ("save", "drafts mailbox", "sent mailbox"),
+            ("send", "sent mailbox", "drafts mailbox"),
+        ],
+    )
+    def test_the_mailbox_its_ending_is_found_in_is_snapshot_before_it_opens(
+        self,
+        connector: AppleMailConnector,
+        operation: WindowOperation,
+        mailbox: str,
+        other: str,
     ) -> None:
-        """The saved draft is the Drafts entry that was not there before."""
-        saving = self._compose(connector, snapshot_drafts=True)
-        snapshot_at = saving.index(
-            "set beforeIds to (id of every message of drafts mailbox)"
+        """A saved draft is the Drafts entry that was not there before,
+        and a sent message's copy the Sent entry: the subject alone found
+        an older message of the same subject."""
+        script = self._compose(connector, operation=operation)
+        snapshot_at = script.index(
+            f"set beforeIds to (id of every message of {mailbox})"
         )
-        assert snapshot_at < saving.index("make new outgoing message")
-        assert "|before_ids|:beforeIds" in saving
-        sending = self._compose(connector, snapshot_drafts=False)
-        assert "id of every message of drafts mailbox" not in sending
-        assert "set beforeIds to {}" in sending
+        assert snapshot_at < script.index("make new outgoing message")
+        assert "|before_ids|:beforeIds" in script
+        assert f"id of every message of {other}" not in script
 
     def test_the_fresh_body_paste_replaces_everything(
         self, connector: AppleMailConnector
@@ -8320,8 +8332,9 @@ class TestHtmlReplyAndForward:
         assert "address of to recipients of theMessage" in open_s
         assert "delete (every to recipient of theMessage)" not in open_s
         assert "set subject of theMessage" not in open_s
-        # A send takes no Drafts snapshot; only a save looks for its draft.
-        assert "set beforeIds to {}" in open_s
+        # A send snapshots Sent, where its copy is looked up; never Drafts.
+        assert "set beforeIds to (id of every message of sent mailbox)" in open_s
+        assert "drafts mailbox" not in open_s
 
     def test_a_forward_opens_mails_forward_window_with_its_recipients(
         self, connector: AppleMailConnector

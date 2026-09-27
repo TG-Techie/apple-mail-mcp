@@ -260,7 +260,7 @@ class TestTheOpenScriptIdentifiesItsWindow:
     def script(self, connector: AppleMailConnector) -> str:
         return connector._build_open_compose_script(
             seed="new", seed_id=None, reply_all=False, to=["a@example.com"],
-            cc=None, bcc=None, subject="Hi", sender=None, snapshot_drafts=False,
+            cc=None, bcc=None, subject="Hi", sender=None, operation="save",
         )
 
     def test_by_mails_id_for_it_and_mails_process(self, script: str) -> None:

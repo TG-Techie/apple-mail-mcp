@@ -166,16 +166,28 @@ def _existing_files(attachment_paths: list[Path] | None) -> list[Path]:
     return files
 
 
+# The mailbox a composition's ending is looked up in: the draft a save
+# made, or the copy a send filed. Its ids are taken before the window
+# opens, and the ending is the entry with the window's subject whose id
+# was not among them. The subject alone matched an older message of the
+# same subject: a send's files were checked on a Sent copy sent hours
+# before, and reported missing from a message that carried them.
+_ENDING_MAILBOX: dict[WindowOperation, str] = {
+    "save": "drafts mailbox",
+    "send": "sent mailbox",
+}
+
+
 @dataclass(frozen=True)
 class _ComposeWindow:
     """An open compose window, as the composition's opening script
     reports it: the window's name, the subject and recipients Mail holds
-    for its message after every override, and the Drafts ids that
-    existed before it opened (empty unless a save was asked for). Then
-    what identifies it to the compose ledger: Mail's id for the window
-    and Mail's process id (None when Mail did not say), and the ledger
-    record it was entered under (None when the ledger could not be
-    written)."""
+    for its message after every override, and the ids of the mailbox its
+    ending is looked up in as they were before it opened (Drafts for a
+    save, Sent for a send; ``_ENDING_MAILBOX``). Then what identifies it
+    to the compose ledger: Mail's id for the window and Mail's process
+    id (None when Mail did not say), and the ledger record it was entered
+    under (None when the ledger could not be written)."""
 
     name: str
     subject: str
@@ -5681,7 +5693,6 @@ end if
             bcc=bcc,
             subject=subject,
             sender=sender,
-            snapshot_drafts=not send_now,
             operation="send" if send_now else "save",
         )
         with self._window_lifecycle(window) as end_window:
@@ -5893,14 +5904,15 @@ end if
         bcc: list[str] | None,
         subject: str | None,
         sender: str | None,
-        snapshot_drafts: bool,
+        operation: WindowOperation,
     ) -> str:
         """AppleScript body for ``_wrap_as_json_script``: open the compose
         window (``_build_creation_block``), name it by window-set diff,
         apply the headers (``_draft_headers_block``), and set
         ``resultData`` to what the window holds: its name, subject and
-        recipients, and — when ``snapshot_drafts`` — the Drafts ids that
-        existed before it opened, so the save can find its own.
+        recipients, and the ids of the mailbox the ``operation``'s ending
+        is looked up in, taken before it opened (``_ENDING_MAILBOX``), so
+        a save finds the draft it made and a send the copy it filed.
 
         Mail retitles a compose window the moment its subject is set
         (measured 2026-09-27, docs/research/icloud-draft-resync.md,
@@ -5936,9 +5948,7 @@ end if
             seed=seed, to=to, cc=cc, bcc=bcc, subject=subject, sender=sender,
         )
         snapshot = (
-            "set beforeIds to (id of every message of drafts mailbox)"
-            if snapshot_drafts
-            else "set beforeIds to {}"
+            f"set beforeIds to (id of every message of {_ENDING_MAILBOX[operation]})"
         )
         renamed = (
             self._as_new_compose_window_block()
@@ -6020,7 +6030,6 @@ end if
         bcc: list[str] | None,
         subject: str | None,
         sender: str | None,
-        snapshot_drafts: bool,
         operation: WindowOperation,
     ) -> _ComposeWindow:
         """Open the compose window ``_build_open_compose_script``
@@ -6030,8 +6039,7 @@ end if
         records it as left open and raises ``MailAppleScriptError``."""
         script = self._build_open_compose_script(
             seed=seed, seed_id=seed_id, reply_all=reply_all, to=to, cc=cc,
-            bcc=bcc, subject=subject, sender=sender,
-            snapshot_drafts=snapshot_drafts,
+            bcc=bcc, subject=subject, sender=sender, operation=operation,
         )
         raw = self._run_seeded_script(
             _wrap_as_json_script(script, timeout=self.timeout), seed_id
