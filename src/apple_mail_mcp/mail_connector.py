@@ -876,11 +876,11 @@ _SEARCH_RUN_GAP = 8
 # 6 ms a message) and a range of one per message 330-342 ms, so each
 # further event cost about 11 ms; over 20 older ones, 5-6 s whichever
 # way they were read (215-315 ms a message); five others cost 0.85-6.4 s
-# each on a first read; and one, whose body came back empty, cost from
-# 17 ms to 10.7 s a read, alone or in a range, between reads seconds
-# apart. So the cheapest body a gap would take in costs about the event
-# it saves, and a dear one costs seconds for a message no criterion
-# wanted.
+# each on the one read of them measured; and one, whose body came back
+# empty, cost from 17 ms to 10.7 s a read, alone or in a range, between
+# reads seconds apart. So the cheapest body a gap would take in costs
+# about the event it saves, and a dear one costs seconds for a message
+# no criterion wanted.
 _SEARCH_CONTENT_RUN_GAP = 0
 
 # The kept positions wait for their bodies until there are as many as

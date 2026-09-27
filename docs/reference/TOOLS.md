@@ -29,13 +29,13 @@ Search for messages matching specified criteria.
 | `limit` | integer | No | 50 | Maximum number of results to return |
 | `source` | list[string] \| null | No | null | Optional list of message ids (with optional `"SELECTED"` sentinel) to scope the search to. `null` (default) searches the account/mailbox normally. |
 | `include_attachments` | boolean | No | false | When true, each row includes an `attachments` field with per-attachment metadata. Default off — opt-in because the AppleScript fallback path can be slow on cold caches (#142). Free on the IMAP fast path. |
-| `body_contains` | string | No | None | Substring match against message body content. IMAP: server-side `BODY` predicate (sub-second). AppleScript: per-message body read (very slow — see performance note). Case-insensitive. |
+| `body_contains` | string | No | None | Substring match against message body content. IMAP: server-side `BODY` predicate (sub-second). AppleScript: reads the bodies of the messages the other filters kept (can be slow — see performance note). Case-insensitive. |
 | `text_contains` | string | No | None | Substring match against headers + body (RFC 3501 `TEXT`). IMAP: server-side `TEXT` predicate. AppleScript: matches `content + subject + sender` (recipients omitted). Same perf characteristics as `body_contains`. |
 
 **Notes:**
 - Returns metadata-only rows (id, rfc_message_id, subject, sender, to, cc, bcc, date_received, read_status, flagged; see "Row fields" below). For full bodies, pipe the result ids into `get_messages([ids])`.
 - Malformed `date_from` / `date_to` raise `error_type: validation_error`. Only ISO 8601 YYYY-MM-DD is accepted; relative dates like "7 days ago" are not supported.
-- On the AppleScript path, `has_attachment` (like `body_contains` and `text_contains`) is asked one message at a time, and only of messages the other filters kept; those are read for the whole mailbox at once.
+- On the AppleScript path, the other filters are read for the whole mailbox at once. `has_attachment` is asked one message at a time, and `body_contains` / `text_contains` read bodies a run of messages at a time, in both cases only of messages the other filters kept, and bodies only as far as `limit` needs.
 - `source=[ids]` (folded-in `get_selected_messages` and the `thread_of` use case) scopes the search to a specific id list. Filter parameters (`sender_contains`, `read_status`, etc.) compose with `source` — the resolved messages are post-filtered. The literal token `"SELECTED"` may appear in the list and is server-resolved to Mail.app's current UI selection (zero-or-more ids); mixed lists like `["SELECTED", "12345"]` are valid. Returns `account: null` and `mailbox: null` in the response. Missing ids drop out silently (partial-results convention).
 - For thread retrieval, call `get_thread(message_id)` to expand an anchor into thread member ids; pipe those ids into `source=[ids]` for filtered metadata.
 - Omitting both `account` and `source` returns `error_type: validation_error`.
@@ -43,7 +43,7 @@ Search for messages matching specified criteria.
 
 **Performance note for `body_contains` / `text_contains`:**
 
-On the IMAP path, body search is server-side and sub-second. On the AppleScript fallback, body search is **dramatically slower** — measured 148s for 100 cold-cache messages on a 47k-message INBOX, vs 1s for `subject_contains` on the same slice. This is because Mail.app must read each candidate message's body from disk. To get sub-second body search, run `apple-mail-mcp setup-imap --account <name>` to enable IMAP delegation for that account.
+On the IMAP path, body search is server-side and sub-second. On the AppleScript fallback, body search is **dramatically slower** — measured 148s for 100 cold-cache messages on a 47k-message INBOX, vs 1s for `subject_contains` on the same slice. This is because Mail.app must read each candidate message's body, and what a body costs is the message's: on the test account (2026-09-27), a short body Mail had read lately cost about 6 ms, older ones 215-370 ms, and one message anywhere from milliseconds to over 10 s a read. The AppleScript path reads bodies in bulk, which saves the ~11 ms Apple event a body read on its own costs, but it cannot make a slow body quick; a date bound, a sender or a smaller `limit` means fewer bodies read. To get sub-second body search, run `apple-mail-mcp setup-imap --account <name>` to enable IMAP delegation for that account.
 
 A search the AppleScript path cannot finish within the connector's timeout (60 s by default) answers `error_type: "timeout"`, not `applescript_error`: narrow it (a date bound, a sender, a smaller `limit`) and it may succeed.
 
