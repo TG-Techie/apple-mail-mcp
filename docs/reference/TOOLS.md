@@ -1164,6 +1164,8 @@ every send path.
 
 - `outbound_disallowed`: one or more recipients off the allowlist —
   nothing was sent; in reply mode the compose window was discarded.
+- `allowlist_unavailable`: the outbound allowlist cannot be read, so
+  every send is refused — nothing was sent.
 - `validation_error`: missing `to`/`subject` in fresh mode.
 - `from_account_unsupported`: `from_account` on a fresh message —
   nothing was sent. Omit it, or save a draft (which keeps the chosen

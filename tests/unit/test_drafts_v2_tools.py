@@ -1094,6 +1094,67 @@ class TestAllowlistUnavailableFailClosed:
         mock_mail._send_html_email.assert_not_called()
 
 
+class TestBothSendsMeetOneOutboundGate:
+    """draft_send and email_send_html refuse through the one outbound
+    gate at the server layer, so the same recipients get the same answer
+    from either, and the answer says nothing went out."""
+
+    UNSENT = " Nothing was sent; the draft, if any, is unchanged."
+
+    async def _send(self, tool: str, to: list[str], mock_mail: MagicMock) -> Any:
+        from apple_mail_mcp.server import draft_send, email_send_html
+
+        if tool == "draft_send":
+            mock_mail.get_draft_state.return_value = {
+                "draft_id": "ABCD",
+                "to": to, "cc": [], "bcc": [],
+                "subject": "s", "body": "b",
+                "in_reply_to": "", "references": "", "attachment_names": [],
+            }
+            return await draft_send(draft_id="ABCD")
+        return await email_send_html(to=to, subject="s", body="<p>b</p>")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("tool", ["draft_send", "email_send_html"])
+    async def test_an_off_list_recipient_gets_one_refusal(
+        self, tool: str, isolated_drafts: None, mock_mail: MagicMock
+    ) -> None:
+        result = await self._send(
+            tool, ["alice@example.com", "outsider@other.com"], mock_mail
+        )
+        assert result == {
+            "success": False,
+            "error": (
+                "send blocked — recipients not on outbound allowlist: "
+                "'outsider@other.com'." + self.UNSENT
+            ),
+            "error_type": "outbound_disallowed",
+        }
+        mock_mail.create_draft.assert_not_called()
+        mock_mail._send_html_email.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("tool", ["draft_send", "email_send_html"])
+    async def test_an_unreadable_allowlist_gets_one_refusal(
+        self,
+        tool: str,
+        isolated_drafts: None,
+        mock_mail: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv(
+            "APPLE_MAIL_MCP_COMMS_CONFIG", "/nonexistent/comms.yaml"
+        )
+        monkeypatch.delenv("MAIL_TEST_MODE", raising=False)
+        result = await self._send(tool, ["alice@example.com"], mock_mail)
+        assert result["success"] is False
+        assert result["error_type"] == "allowlist_unavailable"
+        assert result["error"].startswith("outbound allowlist unavailable:")
+        assert result["error"].endswith(self.UNSENT)
+        mock_mail.create_draft.assert_not_called()
+        mock_mail._send_html_email.assert_not_called()
+
+
 class TestDraftSendHtml:
     """Tests for the email_send_html MCP tool."""
 

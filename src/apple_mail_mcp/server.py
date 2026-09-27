@@ -48,7 +48,6 @@ from .mail_connector import AppleMailConnector
 from .outbound_allowlist import (
     all_recipients_allowed,
     assert_forward_targets_allowed,
-    assert_recipients_allowed_for_send,
     disallowed_recipients,
 )
 from .security import (
@@ -2072,6 +2071,46 @@ def _build_draft_send_summary(
     return verb + "\n\n" + "\n".join(lines)
 
 
+def _outbound_refusal(
+    operation: str, recipients: list[str]
+) -> dict[str, Any] | None:
+    """The outbound allowlist gate for a send, at this layer: the refusal
+    for these recipients, or None to go on. draft_send and email_send_html
+    both ask it before Mail is touched, so an off-list send gets its
+    typed error from the tool and nothing changes, a saved draft
+    included. The connector checks the final recipients again at
+    dispatch (``assert_recipients_allowed_for_send``, which also sees the
+    ones Mail derives for a reply); that is the backstop, not the gate.
+
+    An allowlist that cannot be read refuses every send (fail closed) as
+    ``allowlist_unavailable``, told apart from ``outbound_disallowed`` so
+    "fix the comms config" is not read as "edit the recipients".
+    """
+    unsent = " Nothing was sent; the draft, if any, is unchanged."
+    try:
+        bad = disallowed_recipients(recipients)
+    except OutboundAllowlistUnavailableError as e:
+        logger.error("%s blocked — allowlist unavailable: %s", operation, e)
+        return {
+            "success": False,
+            "error": f"{e}{unsent}",
+            "error_type": "allowlist_unavailable",
+        }
+    if not bad:
+        return None
+    logger.warning("%s blocked — off-list recipients: %s", operation, bad)
+    return {
+        "success": False,
+        "error": (
+            "send blocked — recipients not on outbound allowlist: "
+            + ", ".join(repr(b) for b in bad)
+            + "."
+            + unsent
+        ),
+        "error_type": "outbound_disallowed",
+    }
+
+
 def _confirm_send(
     ctx: Context | None,
     operation: str,
@@ -2082,10 +2121,11 @@ def _confirm_send(
     """Ask the user to confirm a send, unless every recipient is on the
     outbound allowlist (see outbound_allowlist.py). The bypass lets
     clients without elicitation support (e.g. Cowork) send to
-    pre-trusted addresses. It is only that: the HARD policy gate runs at
-    the connector (mail_connector.create_draft and _send_html_email →
-    assert_recipients_allowed_for_send), so a send to an off-list
-    address is blocked at dispatch whatever happens here.
+    pre-trusted addresses. It is only that: ``_outbound_refusal`` has
+    already refused any off-list recipient the caller named, and the
+    connector checks the final recipients again at dispatch, so a send
+    to an off-list address is blocked whatever happens here. What is
+    left to confirm is a reply whose recipients Mail derives.
 
     Returns the refusal (declined, or no way to ask), or None to send.
     """
@@ -2599,7 +2639,7 @@ def draft_send(
         "update_draft", {"draft_id": draft_id, "subject": subject}
     ):
         return refused
-    if refused := _draft_send_outbound_refusal(draft_id, recipients):
+    if refused := _outbound_refusal("draft_send", recipients):
         return refused
 
     store = _get_draft_state_store()
@@ -2653,58 +2693,29 @@ def draft_send(
     return response
 
 
-def _draft_send_outbound_refusal(
-    draft_id: str, recipients: list[str]
-) -> dict[str, Any] | None:
-    """The outbound allowlist gate for ``draft_send``: why these
-    recipients may not be sent to, or None. Checked before Mail is
-    touched at all, so an off-list draft gets the typed error from the
-    one obvious tool. The connector re-checks on the send itself; that
-    is the backstop, not the gate.
-    """
-    try:
-        bad = disallowed_recipients(recipients)
-    except OutboundAllowlistUnavailableError as e:
-        # FAIL CLOSED, draft intact — the policy itself is unreadable.
-        logger.error("draft_send blocked — allowlist unavailable: %s", e)
-        return {
-            "success": False,
-            "error": str(e) + " Draft is unchanged.",
-            "error_type": "allowlist_unavailable",
-        }
-    if bad:
-        logger.warning(
-            "draft_send pre-validation blocked draft %s — off-list "
-            "recipients: %s. Draft left intact.",
-            draft_id,
-            bad,
-        )
-        return {
-            "success": False,
-            "error": (
-                "send blocked — recipients not on outbound allowlist: "
-                + ", ".join(repr(b) for b in bad)
-                + ". Draft is unchanged; edit recipients via draft_update "
-                "or open Mail.app to handle manually."
-            ),
-            "error_type": "outbound_disallowed",
-        }
-    return None
-
-
 def _validate_html_send_content(
     *,
+    to: list[str],
+    subject: str,
     reply_to: str | None,
     from_account: str | None,
     attachment_paths: list[str],
 ) -> dict[str, Any] | None:
     """What may go on an email_send_html message, given which compose path
-    it takes. A reply sets the sender on the outgoing message and honours
-    from_account but cannot take attachments; a fresh message takes
-    attachments but composes through mailto:, which cannot set the
+    it takes. A fresh message needs its recipients and subject; a reply
+    has Mail derive them. A reply sets the sender on the outgoing message
+    and honours from_account but cannot take attachments; a fresh message
+    takes attachments but composes through mailto:, which cannot set the
     sender. Files that are allowed at all get the send-path file checks.
-    Returns an error response, or None to proceed.
+    A missing field or a bad file raises ValueError; a path that cannot
+    carry what was asked returns its refusal. None means go on.
     """
+    if reply_to is None and not to:
+        raise ValueError("email_send_html: 'to' is required unless reply_to is given")
+    if reply_to is None and not subject:
+        raise ValueError(
+            "email_send_html: 'subject' is required unless reply_to is given"
+        )
     if from_account is not None and reply_to is None:
         return {
             "success": False,
@@ -2724,84 +2735,6 @@ def _validate_html_send_content(
         }
     if attachment_paths:
         _validate_attachment_files(attachment_paths)
-    return None
-
-
-def _validate_html_send_request(
-    *,
-    to: list[str],
-    cc_list: list[str],
-    bcc_list: list[str],
-    subject: str,
-    reply_to: str | None,
-    from_account: str | None,
-    attachment_paths: list[str],
-    all_recipients: list[str],
-) -> dict[str, Any] | None:
-    """All pre-gate validation for email_send_html: required fields,
-    sender and attachment rules, and the hard outbound-allowlist policy
-    gate (same as draft_send). Returns an error response, or None to
-    proceed.
-
-    Reply mode with no explicit recipients defers the allowlist check to
-    the connector, which reads Mail's DERIVED recipients back from the
-    outgoing-message model and hard-gates those (off-list → verified
-    discard + outbound_disallowed). Explicit recipients are checked here
-    too for a cheap fail-fast; the connector re-gates the final
-    post-override set regardless."""
-    if reply_to is None and not to:
-        return {
-            "success": False,
-            "error": "email_send_html: 'to' is required unless reply_to is given",
-            "error_type": "validation_error",
-        }
-    if reply_to is None and not subject:
-        return {
-            "success": False,
-            "error": "email_send_html: 'subject' is required unless reply_to is given",
-            "error_type": "validation_error",
-        }
-
-    content_err = _validate_html_send_content(
-        reply_to=reply_to, from_account=from_account,
-        attachment_paths=attachment_paths,
-    )
-    if content_err:
-        return content_err
-
-    # Hard allowlist policy gate — same as draft_send.
-    try:
-        bad = disallowed_recipients(all_recipients)
-    except OutboundAllowlistUnavailableError as e:
-        # FAIL CLOSED — the policy itself is unreadable; nothing sent.
-        logger.error("email_send_html blocked — allowlist unavailable: %s", e)
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": "allowlist_unavailable",
-        }
-    if bad:
-        logger.warning(
-            "email_send_html blocked — off-list recipients: %s", bad
-        )
-        return {
-            "success": False,
-            "error": (
-                "send blocked — recipients not on outbound allowlist: "
-                + ", ".join(repr(b) for b in bad)
-            ),
-            "error_type": "outbound_disallowed",
-        }
-
-    if not all_recipients and reply_to is None:
-        return {
-            "success": False,
-            "error": "email_send_html: no recipients specified",
-            "error_type": "validation_error",
-        }
-
-    if all_recipients:
-        assert_recipients_allowed_for_send(to, cc_list or None, bcc_list or None)
     return None
 
 
@@ -2873,11 +2806,14 @@ def email_send_html(
     attachment_paths = attachment_paths or []
     all_recipients = list(to) + list(cc_list) + list(bcc_list)
 
-    if refused := _validate_html_send_request(
-        to=to, cc_list=cc_list, bcc_list=bcc_list, subject=subject,
-        reply_to=reply_to, from_account=from_account,
-        attachment_paths=attachment_paths, all_recipients=all_recipients,
+    if refused := _validate_html_send_content(
+        to=to, subject=subject, reply_to=reply_to,
+        from_account=from_account, attachment_paths=attachment_paths,
     ):
+        return refused
+    # A reply that names no recipients leaves the list empty here: Mail
+    # derives them, and the connector checks those at dispatch.
+    if refused := _outbound_refusal("email_send_html", all_recipients):
         return refused
     # The account the send goes out under, as far as the caller names it.
     if refused := check_test_mode_safety(
