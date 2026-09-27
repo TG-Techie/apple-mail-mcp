@@ -200,6 +200,53 @@ read each id inside a `try` and skip an item that raises. Whether that
 is what the class failure needed is a derivation from the error text,
 not a re-run under the same conditions.
 
+## Observation 10 — what a fresh send delivers, by how it was composed (2026-09-27)
+
+Each row sent one fresh message to the loopback (`MAIL_TEST_LOOPBACK`,
+the iCloud test account's own address) and read the delivered copy back
+from that account's INBOX with `tests/integration/mail_readback.py`
+(`sent_copy`, `wait_for_arrival`, `html_part`), then moved both copies
+to Trash. The plain body was two lines, `plain <text> & symbols
+marker-<hex>` and `second line 2 > 1`; the HTML body was `<p>html probe
+<b>marker-<hex></b></p><p>second &amp; para</p>`. Where a sender was
+set it was the test account's address under a probe display name, so a
+set sender shows in the From header; the test account is also Mail's
+default account. "cite" is `type="cite"` in the raw source or the
+decoded HTML part.
+
+| composition | parts | cite | body | From |
+|---|---|---|---|---|
+| (a) mailto: URL, no sender (the plain fresh send until now) | text/plain | no | verbatim | bare address |
+| (b) invisible `make new outgoing message`, `set content`, `set sender`, dictionary `send` | alternative | yes: body in `Apple-Mail-URLShareWrapperClass` > `blockquote type="cite"` after a leading newline; "> " before each line of the plain part | verbatim, quoted | probe name |
+| (c) visible, `content` the one-space seed, sender set last; plain paste above the seed (cmd+up); verified send | alternative | yes: an empty blockquote holding the seed, below the text; one ">" line in the plain part | verbatim | probe name |
+| (c) with two .txt files attached through the dictionary first | alternative, mixed | yes, as (c) | verbatim; both files | probe name |
+| (c) with the HTML body | alternative | yes, as (c) | rendered | probe name |
+| HTML pasted into a mailto: window, no sender (the HTML fresh send until now) | alternative | no | rendered | bare address |
+| (e) as (c), but cmd+a before the paste | text/plain | no | verbatim | probe name |
+| (e) with the HTML body | alternative | no; the body sits in one `URLShareUserContentTopClass` div | rendered | probe name |
+| (e) with no sender | text/plain | no | verbatim | bare address |
+| empty body: cmd+a, delete, empty paste; no sender | text/plain | no | empty | bare address |
+| (e), then two .txt files attached through the dictionary | alternative, mixed | yes, as (c) | verbatim; both files | probe name |
+| (e), then two .txt files pasted as file URLs at the end (cmd+down) | mixed: text/plain and both files | no | verbatim; both files | probe name |
+
+Without sending, a PNG and a PDF went into one compose window through
+the dictionary and into another as pasted file URLs after a body
+paste, and each window's body WebArea was walked five levels deep.
+Both read the same: the PNG as an `AXImage` described by its file
+name, the PDF as an `AXButton` described "probe.pdf, 5 KB".
+`_build_attachment_ax_verify_script` looks only for `AXButton`, and
+returned `ATTACH_MISSING:probe.png` for both windows.
+
+After the connector sent every fresh message the last row's way, a
+full run of `test_loopback.py` passed 10 of 12. The two failures were
+replies (`test_html_reply_threads_at_the_receiver`,
+`test_reply_via_draft_path_puts_the_note_above_the_quote`) whose
+delivered copy did not appear within the 120 s poll. Their Sent copies
+carried the loopback as To and the seed's Message-ID as In-Reply-To;
+searched afterwards, no mailbox of the account held a delivered copy.
+The two run again together: the HTML reply passed, the other failed
+the same way. That one run alone: passed.
+
 ## Derivations, mine
 
 - On an iCloud account, the id `draft_create` returns is transient. In
@@ -235,6 +282,29 @@ not a re-run under the same conditions.
   waits `_DRAFT_SETTLE_S` (1 s) before returning the id; that number
   is a measured bound, not a signal, and is recorded as such in the
   code.
+- (Observation 10) What Mail's scripting `content` holds is sent
+  quoted: a whole body in (b), just the one-space seed in (c). Where
+  the paste lands does not avoid it; removing that content first does,
+  and a dictionary attachment afterwards brings it back. That fits the
+  dictionary re-rendering its own content model into the window
+  whenever it touches the message, and is **not established**; only
+  the delivered outcomes are.
+- (Observation 10) Setting the body with a separate `set content`, as
+  opposed to in the creation properties, was once recorded as avoiding
+  a stray leading newline and the purple bar. Row (b) had both. Saved
+  fresh drafts are still built that way, so a human sending one from
+  Mail.app sends it quoted.
+- (Observation 10) A sender set on a composed message is honoured,
+  visible window or not. With no sender, both routes sent from the
+  bare address; a named sender sends "Full Name <address>" when the
+  account has a full name. That display name is the only thing that
+  told the two apart here, because the only account a test may send
+  from is also Mail's default.
+- (Observation 10) The undelivered replies were iCloud not delivering
+  to the INBOX, not the composition: Mail sent them whole, the same
+  tests passed on a re-run, and the keys and pasteboard content of the
+  reply path's paste are unchanged by this work. How often it happens
+  was not measured.
 
 ## What this bears on
 
@@ -254,6 +324,13 @@ not a re-run under the same conditions.
   after the last, keeps sweeping until none has appeared for a quiet
   period (Observation 9's spread is why it is a quiet period and not
   a fixed wait).
+- Every fresh message sent at once now goes the last row of
+  Observation 10's way (`_send_fresh`): seeded visible window, sender
+  set last when named, cmd+a and delete, the body pasted and read back,
+  files pasted after it and seen in the AX tree, the verified send. The
+  mailto: route (`_send_new_via_eml`, and the HTML fresh send's
+  mailto: window) is gone. The loopback tests assert nothing arrives
+  quoted.
 
 ## Not tried
 
@@ -264,3 +341,8 @@ not a re-run under the same conditions.
 - Reading the draft through the IMAP path instead of AppleScript inside
   the window.
 - Any account type other than these two.
+- (Observation 10) A live send from an account that is not Mail's
+  default: test mode allows only the test account as sender.
+- (Observation 10) Any attachment but .txt on a live send; image files
+  fail the AX check before Send, by either route.
+- (Observation 10) How iOS Mail draws any of these messages.

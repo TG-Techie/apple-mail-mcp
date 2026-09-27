@@ -6,6 +6,11 @@ from the live UI, not assumed. Purpose: ground the `_send_new_via_eml` /
 `_send_html_email` hardening so every UI action has a **mechanical read-back**
 (scripted verification inside the AppleScript itself — never AI judgment).
 
+Since 2026-09-27 the mailto: path mapped here is gone: every fresh send
+composes in a window made by `make new outgoing message` (`_send_fresh`;
+why, in docs/research/icloud-draft-resync.md, Observation 10). The
+compose-window facts below are the ones it relies on.
+
 ## Resting state
 
 - Mail runs with one **viewer window**; its AX `name` is the mailbox line,

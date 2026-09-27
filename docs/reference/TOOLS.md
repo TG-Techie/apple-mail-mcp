@@ -1180,26 +1180,32 @@ every send path.
   missing, has a blocked extension, or exceeds 25MB — nothing was sent.
 - `applescript_error`: a mechanical read-back failed
   (`SEND_DISABLED`, `SHEET:…`, `POSTCONDITION_TIMEOUT:…`,
-  `NO_COMPOSE_WINDOW:…`, `NO_BODY_AREA`, `ATTACH_MISSING:…`) — the error
-  carries the actual UI state; the message was NOT sent, with ONE
-  exception: an error saying "message WAS sent, but the sent copy
-  shows N of M expected attachments" means dispatch succeeded and the
-  post-send attachment-count check failed — inspect the Sent copy
-  before resending.
+  `NO_COMPOSE_WINDOW:…`, `COMPOSE_WINDOW_NOT_UNIQUE:…`, `NO_BODY_AREA`,
+  `PASTE_FAILED:…`, `ATTACH_MISSING:…`) — the error carries the actual
+  UI state; the message was NOT sent, with ONE exception: an error
+  saying "message WAS sent, but the sent copy shows N of M expected
+  attachments" means dispatch succeeded and the post-send
+  attachment-count check failed — inspect the Sent copy before
+  resending.
 
-**Attachment mechanics (fresh mode):** with `attachment_paths`, the
-message is composed via `make new outgoing message` instead of the
-mailto: URL handler (the mailto window is not scriptable for
-attachments — verified live 2026-08-24). Each attachment must be
-mechanically visible in the compose window's AX tree before Send is
-clicked, and the Sent-mailbox copy is checked for the attachment count
-after dispatch. Known trade-off: this compose path wraps the sent body
-in Mail's URLShare scaffolding with an *empty* `blockquote type="cite"`;
-whether iOS Mail renders a (contentless) purple quote bar for it is
-pending the standing one-time iOS visual re-check.
+**Composition (fresh mode):** the message is composed in a visible
+window made by `make new outgoing message`, found by comparing Mail's
+window names before and after (a window of the same name already open
+stops the send with `COMPOSE_WINDOW_NOT_UNIQUE`). The HTML is pasted
+over the window's whole body and read back, and any attachments are
+pasted after it as files. Each attachment must be mechanically visible
+in the compose window's AX tree before Send is clicked, and the
+Sent-mailbox copy is checked for the attachment count after dispatch.
+Read back from a delivered copy, the message carries nothing quoted: no
+`blockquote type="cite"`, which iOS Mail draws as a purple bar
+(docs/research/icloud-draft-resync.md, Observation 10). A body over
+10,000 characters is refused (`validation_error`) rather than cut.
 
-**Limitations:** attachments not supported in reply mode; en-US Mail UI
-labels; sends require Mail.app UI automation permission.
+**Limitations:** attachments not supported in reply mode; an image
+attachment fails the AX check (`ATTACH_MISSING:…`, nothing sent),
+since Mail shows it inline as an image rather than as the attachment
+button the check looks for (measured with a PNG); en-US Mail UI labels;
+sends require Mail.app UI automation permission.
 
 ---
 

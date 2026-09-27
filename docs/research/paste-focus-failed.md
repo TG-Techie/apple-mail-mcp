@@ -25,9 +25,17 @@ body, live against Mail.app:
 
 Fixed in `0176e88` by seeding the compose body with a single space
 (`_BODY_SEED`). Three later attempts to remove the seed after focus was
-obtained are recorded in the docstring of
+obtained were recorded in the docstring of
 `_build_attach_compose_script`; all three left a visible artifact, which
 is why the seed is a space rather than a character that would show.
+
+Later, 2026-09-27: that function is gone, and the seed is removed now.
+Those attempts failed because the attachments were already in the
+body, where a select-all took them too; the fresh-send composition now
+selects all and deletes before pasting the body, and pastes the
+attachments after it. The seed itself stays, for the focus reason this
+note is about, and this note's open question is unchanged.
+Measurements in docs/research/icloud-draft-resync.md, Observation 10.
 
 ## Observation 3 — it does not reproduce (2026-09-07)
 
