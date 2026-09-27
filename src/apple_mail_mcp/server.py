@@ -1512,7 +1512,7 @@ def save_attachments(
     """
     from pathlib import Path
 
-    attachment_indices = attachment_indices or None
+    attachment_indices_or_none: list[int] | None = attachment_indices or None
     try:
         rate_err = check_rate_limit("save_attachments", {"message_id": message_id})
         if rate_err:
@@ -1542,7 +1542,7 @@ def save_attachments(
         count, warnings = mail.save_attachments(
             message_id=message_id,
             save_directory=save_path,
-            attachment_indices=attachment_indices,
+            attachment_indices=attachment_indices_or_none,
             overwrite=overwrite,
         )
 
@@ -1551,7 +1551,7 @@ def save_attachments(
             {
                 "message_id": message_id,
                 "directory": save_directory,
-                "indices": attachment_indices,
+                "indices": attachment_indices_or_none,
             },
             "success"
         )
@@ -3089,10 +3089,10 @@ def create_draft(
         ``{"success": True, "draft_id": "<id>", "sent_message_id": ""}``
         when saved as draft. ``draft_id`` is empty when sent.
     """
-    to = to or None
-    cc = cc or None
-    bcc = bcc or None
-    attachment_paths = attachment_paths or None
+    to_or_none: list[str] | None = to or None
+    cc_or_none: list[str] | None = cc or None
+    bcc_or_none: list[str] | None = bcc or None
+    attachment_paths_or_none: list[str] | None = attachment_paths or None
     try:
         # ----------------------------------------------------------------
         # Param-shape validation
@@ -3132,12 +3132,12 @@ def create_draft(
 
         # Fresh-seed required-field validation (after template rendering
         # so a template can supply subject/body).
-        fresh_err = _validate_fresh_seed_fields(seed_kind, to, subject)
+        fresh_err = _validate_fresh_seed_fields(seed_kind, to_or_none, subject)
         if fresh_err:
             return fresh_err
 
-        if attachment_paths:
-            attach_err = _validate_attachment_files(attachment_paths)
+        if attachment_paths_or_none:
+            attach_err = _validate_attachment_files(attachment_paths_or_none)
             if attach_err:
                 return attach_err
 
@@ -3147,9 +3147,10 @@ def create_draft(
         # ----------------------------------------------------------------
         if send_now:
             gate_err = _gate_create_draft_send(
-                seed_kind=seed_kind, to=to, cc=cc, bcc=bcc,
-                subject=subject, body=body, from_account=from_account,
-                attachment_paths=attachment_paths, ctx=ctx,
+                seed_kind=seed_kind, to=to_or_none, cc=cc_or_none,
+                bcc=bcc_or_none, subject=subject, body=body,
+                from_account=from_account,
+                attachment_paths=attachment_paths_or_none, ctx=ctx,
             )
             if gate_err:
                 return gate_err
@@ -3158,16 +3159,16 @@ def create_draft(
         # Connector call
         # ----------------------------------------------------------------
         attachment_path_objs = (
-            [Path(p) for p in attachment_paths]
-            if attachment_paths is not None
+            [Path(p) for p in attachment_paths_or_none]
+            if attachment_paths_or_none is not None
             else None
         )
         result = mail.create_draft(
             seed=seed_kind,
             seed_id=seed_id,
-            to=to,
-            cc=cc,
-            bcc=bcc,
+            to=to_or_none,
+            cc=cc_or_none,
+            bcc=bcc_or_none,
             subject=subject,
             body=body,
             attachment_paths=attachment_path_objs,
@@ -3188,9 +3189,9 @@ def create_draft(
                 "seed_id": seed_id,
                 "send_now": send_now,
                 "draft_id": draft_id,
-                "to": to,
-                "cc": cc,
-                "bcc": bcc,
+                "to": to_or_none,
+                "cc": cc_or_none,
+                "bcc": bcc_or_none,
                 "subject": subject,
                 "from_account": from_account,
             },
