@@ -826,9 +826,9 @@ class AppleMailConnector:
         Note:
             Mail.app does not expose a stable rule id via AppleScript;
             ``index`` is the canonical handle for downstream mutation tools
-            (set_rule_enabled / delete_rule / update_rule). Callers that
-            care about reorder-stability should call ``list_rules`` again
-            immediately before each mutation.
+            (delete_rule / update_rule). Callers that care about
+            reorder-stability should call ``list_rules`` again immediately
+            before each mutation.
         """
         tell_body = """
         tell application "Mail"
@@ -845,28 +845,6 @@ class AppleMailConnector:
         script = _wrap_as_json_script(tell_body, timeout=self.timeout)
         result = self._run_applescript(script)
         return cast(list[dict[str, Any]], parse_applescript_json(result))
-
-    def set_rule_enabled(self, rule_index: int, enabled: bool) -> None:
-        """Toggle the enabled state of a rule by 1-based index.
-
-        Args:
-            rule_index: 1-based positional index, as returned by ``list_rules``.
-            enabled: New enabled state.
-
-        Raises:
-            MailRuleNotFoundError: If rule_index is out of range (≤0 or
-                greater than the number of existing rules).
-        """
-        if rule_index < 1:
-            raise MailRuleNotFoundError(
-                f"rule_index must be 1-based and positive, got {rule_index}"
-            )
-        enabled_str = "true" if enabled else "false"
-        script = (
-            f'tell application "Mail" to '
-            f"set enabled of rule {rule_index} to {enabled_str}"
-        )
-        self._run_applescript(script)
 
     def _validate_rule_condition(self, cond: dict[str, Any]) -> None:
         """Validate a single RuleCondition dict.
@@ -2053,63 +2031,6 @@ class AppleMailConnector:
         out["original_subject"] = str(msg.get("subject") or "")
         return out
 
-    def mark_as_read(
-        self,
-        message_ids: list[str],
-        read: bool = True,
-        *,
-        account: str | None = None,
-        source_mailbox: str | None = None,
-    ) -> int:
-        """
-        Mark messages as read or unread.
-
-        Args:
-            message_ids: List of message IDs
-            read: True for read, False for unread
-            account: Optional account name (or UUID) the messages live in.
-                Must be provided together with `source_mailbox`. When both
-                are given, the AppleScript narrows the scan to that single
-                mailbox — O(N) instead of the default cross-scan O(N × M × K).
-            source_mailbox: Optional source mailbox name; see `account`.
-
-        Returns:
-            Number of messages updated
-
-        Raises:
-            ValueError: If exactly one of `account`/`source_mailbox` is given.
-            MailAppleScriptError: If operation fails
-        """
-        if not message_ids:
-            return 0
-
-        repeat_block = _bulk_repeat_block(
-            account=account,
-            source_mailbox=source_mailbox,
-            actions=[f"set read status of msg to {'true' if read else 'false'}"],
-            counter_var="updateCount",
-        )
-
-        # Build list of IDs (sanitize and escape each)
-        id_list = ", ".join(
-            f'"{escape_applescript_string(sanitize_input(mid))}"'
-            for mid in message_ids
-        )
-
-        script = f"""
-        tell application "Mail"
-            set idList to {{{id_list}}}
-            set updateCount to 0
-
-{repeat_block}
-
-            return updateCount
-        end tell
-        """
-
-        result = self._run_applescript(script)
-        return int(result) if result.isdigit() else 0
-
     def get_attachments(
         self,
         message_id: str,
@@ -3138,147 +3059,6 @@ class AppleMailConnector:
         saved = int(parsed.get("saved") or 0)
         save_warnings = cast(list[str], parsed.get("warnings") or [])
         return saved, warnings + save_warnings
-
-    def move_messages(
-        self,
-        message_ids: list[str],
-        destination_mailbox: str,
-        account: str,
-        gmail_mode: bool = False,
-        *,
-        source_mailbox: str | None = None,
-    ) -> int:
-        """
-        Move messages to a different mailbox.
-
-        Args:
-            message_ids: List of message IDs to move
-            destination_mailbox: Name of destination mailbox
-            account: Account name (or UUID) hosting the destination mailbox
-            gmail_mode: Use Gmail-specific handling (copy + delete)
-            source_mailbox: Optional source mailbox name to narrow the
-                AppleScript scan to one mailbox (O(N) instead of O(N × M × K)).
-                When provided, source is assumed to be in the same `account`
-                as the destination — the common case. To move across
-                accounts, omit `source_mailbox` to fall back to the
-                cross-scan path.
-
-        Returns:
-            Number of messages moved
-
-        Raises:
-            MailAccountNotFoundError: If account doesn't exist
-            MailMailboxNotFoundError: If destination mailbox doesn't exist
-        """
-        if not message_ids:
-            return 0
-
-        from .utils import sanitize_input
-
-        account_clause = applescript_account_clause(account)
-        mailbox_safe = escape_applescript_string(sanitize_input(destination_mailbox))
-        id_list = ", ".join(
-            f'"{escape_applescript_string(sanitize_input(mid))}"'
-            for mid in message_ids
-        )
-
-        if gmail_mode:
-            actions = ["duplicate msg to destMailbox", "delete msg"]
-        else:
-            actions = ["set mailbox of msg to destMailbox"]
-
-        # `account` is required by this method (it's where the destination
-        # lives), so source_mailbox is the only "optional" half here. Pass
-        # account through only when the caller explicitly wants the narrow
-        # source-scan path.
-        repeat_block = _bulk_repeat_block(
-            account=account if source_mailbox is not None else None,
-            source_mailbox=source_mailbox,
-            actions=actions,
-            counter_var="moveCount",
-        )
-
-        script = f"""
-        tell application "Mail"
-            set accountRef to {account_clause}
-            set destMailbox to mailbox "{mailbox_safe}" of accountRef
-            set idList to {{{id_list}}}
-            set moveCount to 0
-
-{repeat_block}
-
-            return moveCount
-        end tell
-        """
-
-        result = self._run_applescript(script)
-        return int(result) if result.isdigit() else 0
-
-    def flag_message(
-        self,
-        message_ids: list[str],
-        flag_color: str,
-        *,
-        account: str | None = None,
-        source_mailbox: str | None = None,
-    ) -> int:
-        """
-        Set flag color on messages.
-
-        Args:
-            message_ids: List of message IDs to flag
-            flag_color: Flag color (none, orange, red, yellow, blue, green, purple, gray)
-            account: Optional account name (or UUID); see `source_mailbox`.
-            source_mailbox: Optional source mailbox name. When provided
-                together with `account`, the AppleScript narrows the scan
-                to that single mailbox — O(N) instead of O(N × M × K).
-                Either alone raises ValueError.
-
-        Returns:
-            Number of messages flagged
-
-        Raises:
-            ValueError: If flag color is invalid, or if exactly one of
-                `account`/`source_mailbox` is given.
-        """
-        if not message_ids:
-            return 0
-
-        from .utils import get_flag_index, validate_flag_color
-
-        if not validate_flag_color(flag_color):
-            raise ValueError(f"Invalid flag color: {flag_color}")
-
-        flag_index = get_flag_index(flag_color)
-        flagged_status = "true" if flag_color != "none" else "false"
-        id_list = ", ".join(
-            f'"{escape_applescript_string(sanitize_input(mid))}"'
-            for mid in message_ids
-        )
-
-        repeat_block = _bulk_repeat_block(
-            account=account,
-            source_mailbox=source_mailbox,
-            actions=[
-                f"set flag index of msg to {flag_index}",
-                f"set flagged status of msg to {flagged_status}",
-            ],
-            counter_var="flagCount",
-        )
-
-        script = f"""
-        tell application "Mail"
-            set idList to {{{id_list}}}
-            set flagCount to 0
-
-{repeat_block}
-
-            return flagCount
-        end tell
-        """
-
-        result = self._run_applescript(script)
-        return int(result) if result.isdigit() else 0
 
     def update_message(
         self,
