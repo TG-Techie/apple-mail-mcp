@@ -865,16 +865,16 @@ Mail.app's AppleScript dictionary exposes no path to permanent-delete that bypas
 
 The drafts lifecycle replaces the v0.6 send group (`send_email`,
 `send_email_with_attachments`, `reply_to_message`, `forward_message`)
-with three tools that match Mail.app's actual primitive: every outgoing
-message is a draft until you `send` it. Net surface: 4 → 3, with
-`update_draft` and `delete_draft` being net-new capabilities (deferred
-sends, edit-before-send, discard).
+with four tools that match Mail.app's actual primitive: every outgoing
+message is a draft until it is sent. `draft_create` and `draft_update`
+only save; `draft_send` is the one send from a draft, so the outbound
+allowlist gate sits on one tool and a refused send leaves the draft as
+it was. `email_send_html` sends without saving a draft first.
 
-### create_draft
+### draft_create
 
-Create a draft (fresh, reply, or forward). Optionally send immediately.
-
-**⚠️ Security Note:** When `send_now=True`, requires user confirmation.
+Create a draft (fresh, reply, or forward). Does not send; send it with
+`draft_send`.
 
 **Parameters:**
 
@@ -882,17 +882,16 @@ Create a draft (fresh, reply, or forward). Optionally send immediately.
 |-----------|------|----------|---------|-------------|
 | `reply_to` | string | No | None | Id of a message to reply to. Accepts either Mail's internal numeric id or an RFC 5322 Message-ID — pass the `id` field from any `search_messages` / `get_messages` row verbatim (#205). Mutually exclusive with `forward_of`. When set, `to`/`cc` recipients and `subject` are auto-derived (override by passing them explicitly). |
 | `forward_of` | string | No | None | Id of a message to forward. Accepts the same id forms as `reply_to`. Mutually exclusive with `reply_to`. `to` is required (recipient of the forward). |
-| `to` | array[string] | When fresh | None | Recipient list. For reply/forward: `None` keeps auto-derived; `[]` clears; populated list replaces. |
-| `cc` | array[string] | No | None | CC recipients (same semantics as `to` for reply/forward). |
-| `bcc` | array[string] | No | None | BCC recipients. |
+| `to` | array[string] | When fresh | [] | Recipient list. For reply/forward: empty keeps auto-derived; a populated list replaces. |
+| `cc` | array[string] | No | [] | CC recipients (same semantics as `to` for reply/forward). |
+| `bcc` | array[string] | No | [] | BCC recipients. |
 | `subject` | string | When fresh | None | Subject. For reply/forward, `None` keeps Mail's `Re:`/`Fwd:` prefix. |
 | `body` | string | No | "" | Body text. For reply/forward, a non-empty body goes **above** what Mail wrote, which stays: the quoted original, or the forwarded message with its header block and every attachment Mail carried. It is pasted as plain text in a visible compose window, so Mail comes to the front for a few seconds. An empty body leaves Mail's quote or forward exactly as Mail made it. |
-| `attachment_paths` | array[string] | No | None | List of file paths to attach. Each must exist, must not carry an executable extension (`.exe`, `.sh`, …), and must be under 25MB — the same checks as `email_send_html`. |
+| `attachment_paths` | array[string] | No | [] | List of file paths to attach. Each must exist, must not carry an executable extension (`.exe`, `.sh`, …), and must be under 25MB — the same checks as `email_send_html`. |
 | `reply_all` | boolean | No | False | For `reply_to` only — use `reply to all`. |
 | `template_name` | string | No | None | Optional template to render for `subject` + `body`. Caller-supplied `subject`/`body` override the rendered output. |
 | `template_vars` | object | No | None | Variables for the template renderer. Requires `template_name`. |
-| `from_account` | string | No | None | Mail.app account name or UUID. None = Mail's default. Honoured on saved drafts and on reply/forward sends. A fresh message with `send_now=True` goes out through Mail's mailto: handler, which cannot set the sender, and is refused (`from_account_unsupported`) rather than sent from the wrong account. |
-| `send_now` | boolean | No | False | `False` saves as draft. `True` sends immediately and elicits confirmation. On a reply sent immediately, `to` must be given explicitly (and `cc` too with `reply_all`), since a group left `None` is filled in by Mail from the original message and cannot be checked against the outbound allowlist; `[]` is explicit. Refused with `outbound_disallowed` otherwise. |
+| `from_account` | string | No | None | Mail.app account name or UUID. None = Mail's default. The saved draft keeps it; see `draft_send` for the one send path that cannot. |
 
 **Returns:**
 
@@ -905,39 +904,35 @@ Create a draft (fresh, reply, or forward). Optionally send immediately.
 }
 ```
 
-`draft_id` is empty when sent (`send_now=True`); `sent_message_id` is
-reserved for future use.
+`sent_message_id` is reserved for future use.
 
 **Examples:**
 
 ```python
 # Save a fresh draft for later
-create_draft(
+draft_create(
     to=["alice@example.com"],
     subject="Project Update",
     body="Here's the latest..."
 )
 
 # Reply, save as draft (preserves Mail's auto-quote)
-create_draft(reply_to="160989")
+draft_create(reply_to="160989")
 
-# Reply with custom body, then send
-create_draft(reply_to="160989", body="Sounds good, thanks!", send_now=True)
+# Reply with custom body, then send it
+r = draft_create(reply_to="160989", body="Sounds good, thanks!")
+draft_send(draft_id=r["draft_id"])
 
 # Forward with attachment
-create_draft(
+draft_create(
     forward_of="160989",
     to=["recipient@example.com"],
     body="FYI",
     attachment_paths=["/tmp/report.pdf"]
 )
 
-# Template-driven send
-create_draft(
-    reply_to="160989",
-    template_name="thanks-for-meeting",
-    send_now=True
-)
+# Template-driven reply
+draft_create(reply_to="160989", template_name="thanks-for-meeting")
 ```
 
 **Error Codes:**
@@ -945,38 +940,37 @@ create_draft(
 - `validation_error`: Mutually exclusive seeds, missing required fields, or `template_vars` without `template_name`.
 - `message_not_found`: `reply_to` / `forward_of` doesn't match any Mail.app message.
 - `account_not_found`: `from_account` doesn't match.
-- `from_account_unsupported`: `from_account` with `send_now=True` on a
-  fresh message — refused before the confirmation prompt; nothing was
-  composed or sent.
-- `attachments_unsupported`: `attachment_paths` with `send_now=True` on a
-  fresh message — the mailto: path carries none; refused before the
-  confirmation prompt.
 - `file_not_found` / `validation_error` (attachments): a listed file is
   missing, has a blocked extension, or exceeds 25MB — no draft was created.
 - `draft_not_settled`: Mail accepted the save but the new draft had not
-  appeared in Drafts within 10 s, so there is no id to return. Nothing
-  was sent; look for the draft in Mail.app before saving again.
-- `cancelled`: User declined the elicitation prompt (when `send_now=True`).
+  appeared in Drafts within 10 s, so there is no id to return. Look for
+  the draft in Mail.app before saving again.
 - `applescript_error`, `unknown`: Lower-level failures.
 
 ---
 
-### update_draft
+### draft_update
 
 Update an existing draft. Implemented as **recreate-then-delete** —
 Mail.app forbids mutating saved drafts, so this tool reads the
 current state, creates a new draft with the merged fields, and then
 removes the old one. Threading headers (for replies) and forward
-anchors are preserved via persisted seed metadata.
+anchors are preserved via persisted seed metadata. Does not send.
 
 **⚠️ Returns a NEW `draft_id`** — after a success the input id is no
 longer valid. Callers caching the id must re-read the response.
 
-The old draft is removed only after the new one exists (or, with
-`send_now=True`, after the send went out), so a failure at any point
-leaves it in Drafts under the id you already hold. If the removal
-itself fails after that, the response is still a success and carries
-a `warning` naming the old id, which is then still in Drafts.
+The old draft is removed only after the new one exists, so a failure
+at any point leaves it in Drafts under the id you already hold. If the
+removal itself fails after that, the response is still a success and
+carries a `warning` naming the old id, which is then still in Drafts.
+
+**Your own part:** on a reply or forward, what `draft_update` and
+`draft_send` hand back to Mail when they rebuild the draft is only the
+text and files you gave `draft_create` or the last `draft_update`,
+never what Mail reads back, which already has the quoted original and
+a forward's own attachments; a draft created outside this server has no
+record of your part and is rebuilt from everything Mail reads back.
 
 **Parameters:**
 
@@ -986,10 +980,9 @@ a `warning` naming the old id, which is then still in Drafts.
 | `to` / `cc` / `bcc` | array[string] | No | None | Override recipient groups: `None` keeps existing, `[]` clears, populated list replaces. |
 | `subject` | string | No | None | Override subject. `None` keeps existing. |
 | `body` | string | No | None | Override body. `None` keeps existing; non-None replaces (including `""`). |
-| `attachment_paths` | array[string] | No | None | Override attachments: `None` **preserves existing** (extracted to a temp dir and re-attached, not re-checked); `[]` clears; populated list replaces, and is checked like a send (exists, no executable extension, under 25MB) before the existing draft is touched — a refused list leaves the draft as it was. |
+| `attachment_paths` | array[string] | No | None | Override attachments: `None` **preserves existing** (extracted to a temp dir and re-attached, not re-checked; on a reply or forward only the files you attached, since a forward's own come with Mail's forward); `[]` clears; populated list replaces, and is checked like a send (exists, no executable extension, under 25MB) before the existing draft is touched — a refused list leaves the draft as it was. |
 | `template_name` / `template_vars` | string / object | No | None | Optional template render. User-supplied `subject`/`body` override the rendered output. |
-| `from_account` | string | No | None | Override sender. `None` keeps the draft in the account it was saved from (the sender is read back from Mail and carried over, so an update never silently moves a draft to Mail's default account). With `send_now=True` on a fresh draft an explicit value is refused (`from_account_unsupported`) before anything is deleted — the mailto: send path cannot set it — and the draft is left as it was; on that path the draft's own sender is not carried either. |
-| `send_now` | boolean | No | False | `False` saves new draft. `True` sends after eliciting confirmation. |
+| `from_account` | string | No | None | Override sender. `None` keeps the draft in the account it was saved from (the sender is read back from Mail and carried over, so an update never silently moves a draft to Mail's default account). |
 
 **Returns:**
 
@@ -1002,7 +995,7 @@ a `warning` naming the old id, which is then still in Drafts.
 }
 ```
 
-**Externally-created drafts:** for drafts not created via `create_draft`,
+**Externally-created drafts:** for drafts not created via `draft_create`,
 seed recovery falls back to scanning Mail.app for the draft's
 `In-Reply-To` header — this can take 30s+ on large mailboxes. Forward
 seeds without persisted state are misclassified as fresh.
@@ -1011,26 +1004,29 @@ seeds without persisted state are misclassified as fresh.
 
 ```python
 # Fix a typo in the body, keep recipients/attachments/threading
-update_draft(draft_id="161055", body="Corrected body text")
+draft_update(draft_id="161055", body="Corrected body text")
 
 # Add a recipient (replaces the to list)
-update_draft(draft_id="161055", to=["alice@example.com", "bob@example.com"])
+draft_update(draft_id="161055", to=["alice@example.com", "bob@example.com"])
 
 # Clear all attachments
-update_draft(draft_id="161055", attachment_paths=[])
+draft_update(draft_id="161055", attachment_paths=[])
 
-# Send the draft after editing
-update_draft(draft_id="161055", body="Final version", send_now=True)
+# Edit, then send the new id
+r = draft_update(draft_id="161055", body="Final version")
+draft_send(draft_id=r["draft_id"])
 ```
 
-**Error Codes:** Same as `create_draft`, plus:
+**Error Codes:** Same as `draft_create`, plus:
 
 - `draft_not_found`: `draft_id` doesn't match any existing draft.
 - `invalid_draft_id`: `draft_id` failed validation (path traversal, etc.).
+- `draft_error`: an attachment to carry over could not be read out of
+  the draft; nothing was changed.
 
 ---
 
-### delete_draft
+### draft_delete
 
 Move a draft to Trash. One-way discard for the lifecycle; Mail.app no
 longer treats trashed drafts as editable.
@@ -1057,6 +1053,64 @@ do the same.
 
 - `draft_not_found`: `draft_id` doesn't match any existing draft.
 - `invalid_draft_id`: `draft_id` failed validation.
+
+---
+
+### draft_send
+
+Send a saved draft: the one send from a draft. The draft is rebuilt and
+sent through Mail, then removed; what is handed back to Mail is your
+own part of it, as `draft_update` describes.
+
+**⚠️ Security Note:** every recipient on the draft must be on the
+outbound allowlist. One that is not refuses the whole send
+(`outbound_disallowed`), and an allowlist that cannot be read refuses
+every send (`allowlist_unavailable`). A refused send leaves the draft
+exactly as it was. A send the allowlist does not already cover asks the
+user to confirm.
+
+A fresh draft goes out through Mail's mailto: handler, which composes
+from Mail's default account and carries no attachments: its saved
+sender is not carried over, and a fresh draft with attachments is
+refused (`attachments_unsupported`) before anything is touched. A reply
+or forward keeps the draft's sender.
+
+**Parameters:**
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `draft_id` | string | Yes | - | Mail.app id of the draft to send. |
+
+**Returns:**
+
+```json
+{
+  "success": true,
+  "draft_id": "",
+  "sent_message_id": "",
+  "details": {"seed_kind": "reply", "send_now": true}
+}
+```
+
+`sent_message_id` is empty: recovering the just-sent message across
+IMAP sync is unreliable. The old draft is removed only after the send
+went out; if that removal fails, the response is a success carrying a
+`warning` naming the draft, which is then still in Drafts.
+
+**Error Codes:**
+
+- `validation_error`: the draft has no recipients.
+- `outbound_disallowed`, `allowlist_unavailable`: see the security note.
+- `attachments_unsupported`: a fresh draft with attachments.
+- `safety_violation`: under `MAIL_TEST_MODE`, a draft outside the test
+  account or a recipient outside the reserved test domains.
+- `rate_limited`: too many sends in the window.
+- `cancelled`, `confirmation_required`: the user declined, or could not
+  be asked.
+- `draft_error`: an attachment to carry over could not be read out of
+  the draft; nothing was sent.
+- `draft_not_found`, `invalid_draft_id`, `message_not_found` (a reply's
+  or forward's original is gone), `applescript_error`, `unknown`.
 
 ---
 
@@ -1177,12 +1231,10 @@ results = search_messages(
 # 2. Get full message
 original = get_message(message_id=results["messages"][0]["id"])
 
-# 3. Send reply (use create_draft with send_now=True to skip the
-#    save-then-send dance)
-create_draft(
+# 3. Send the reply (email_send_html sends without saving a draft first)
+email_send_html(
     reply_to=results["messages"][0]["id"],
-    body="Thank you for your proposal...",
-    send_now=True,
+    body="<p>Thank you for your proposal...</p>",
 )
 ```
 
@@ -1456,17 +1508,15 @@ Remove a template by name. **Elicits user confirmation** before deleting.
 ### render_template
 
 Render a template into ready-to-send text. **No side effects** — the
-caller passes the rendered subject + body to `create_draft` to send.
-For most workflows, use `create_draft(template_name=...)` directly,
-which folds rendering into the send call.
+caller passes the rendered subject + body to `draft_create`, and sends
+the draft with `draft_send`. For most workflows, use
+`draft_create(template_name=...)` directly, which folds rendering into
+creating the draft.
 
 ```python
-# Inline render-then-send (one tool call):
-create_draft(
-    reply_to="<abc@example.com>",
-    template_name="polite-decline",
-    send_now=True,
-)
+# Render into a draft, then send it:
+r = draft_create(reply_to="<abc@example.com>", template_name="polite-decline")
+draft_send(draft_id=r["draft_id"])
 
 # Standalone render for a "preview" workflow (no draft created):
 rendered = render_template(

@@ -68,10 +68,13 @@ Always use the returned id for the next call. Off-allowlist
 recipients are fine on saved drafts; they are only blocked at
 ``draft_send``, and a blocked send is a pure no-op on Mail.app state.
 
-Internal Python functions ``create_draft``, ``update_draft``, ``delete_draft``
-remain in ``server.py`` (no ``@mcp.tool`` decorator) for tests + internal
-use; do not call them from new code — go through the ``draft_*`` MCP
-surface.
+The four ``draft_*`` tools are the implementation; there is no internal
+create/update/delete layer beneath them. ``draft_update`` and
+``draft_send`` rebuild the draft through the connector's
+``create_draft``, and on a reply or forward they hand it only the
+caller's own text and attachments, kept in the draft's seed record
+(``drafts.py``), never what Mail reads back, which already carries the
+quoted original and a forward's own attachments.
 
 ## Core Principles
 

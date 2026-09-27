@@ -582,8 +582,6 @@ class TestDraftsLifecycleIntegration:
         inside that window and one class run on the iCloud account failed
         with the error text not captured. Passes 3/3 alone on iCloud and
         8/8 for the class on both accounts otherwise."""
-        import asyncio
-
         from apple_mail_mcp import server
         from apple_mail_mcp.exceptions import MailDraftNotFoundError
 
@@ -591,17 +589,17 @@ class TestDraftsLifecycleIntegration:
         monkeypatch.setattr(server, "mail", connector)
         address = _first_address_of(connector, test_account)
 
-        created = asyncio.run(server.create_draft(
+        created = server.draft_create(
             to=["target@example.com"],
             subject="ZZZ-AMM-INTEG-UPDATE-SENDER",
             body="v1",
             from_account=test_account,
-        ))
+        )
         assert created["success"] is True, created
         draft_id = created["draft_id"]
         new_draft_id = ""
         try:
-            updated = asyncio.run(server.update_draft(draft_id=draft_id, body="v2"))
+            updated = server.draft_update(draft_id=draft_id, body="v2")
             assert updated["success"] is True, updated
             new_draft_id = updated["draft_id"]
             state = connector.get_draft_state(new_draft_id)

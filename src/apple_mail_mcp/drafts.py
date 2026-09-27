@@ -1,20 +1,30 @@
-"""Persistent state for drafts created by ``create_draft``.
+"""Persistent state for reply and forward drafts made by ``draft_create``.
 
-Stores seed metadata so ``update_draft`` can rebuild a draft via the
-correct AppleScript primitive. Mail.app forbids mutating saved drafts,
-so update is implemented as delete + recreate; for reply / forward
-seeds we need to know the original message to re-invoke ``reply`` /
-``forward``. Looking the seed up via ``whose message id is`` against
-Mail.app on demand takes 30+ seconds on large mailboxes, so we
+Stores seed metadata so ``draft_update`` and ``draft_send`` can rebuild
+a draft via the correct AppleScript primitive. Mail.app forbids mutating
+saved drafts, so both are implemented as recreate + delete; for reply /
+forward seeds we need to know the original message to re-invoke
+``reply`` / ``forward``. Looking the seed up via ``whose message id is``
+against Mail.app on demand takes 30+ seconds on large mailboxes, so we
 persist seed metadata at create time instead.
+
+The record also keeps the caller's own part of the draft: its text, and
+the names of the files it attached. Mail's reply and forward verbs write
+the quoted original, and a forward carries the original's attachments,
+so a rebuild must hand back only the caller's part: what Mail reads back
+from the saved draft already has Mail's, and handing that back puts it
+in twice.
 
 File layout: one JSON file per draft at ``<root>/<draft_id>.json``,
 shape::
 
-    {"seed_kind": "reply",   "seed_id": "160989", "reply_all": false}
-    {"seed_kind": "forward", "seed_id": "160989"}
+    {"seed_kind": "reply",   "seed_id": "160989", "reply_all": false,
+     "body": "Thanks", "attachment_names": []}
+    {"seed_kind": "forward", "seed_id": "160989",
+     "body": "", "attachment_names": ["report.pdf"]}
 
-Fresh drafts (no seed) get no file.
+A record written before the caller's part was kept has neither. Fresh
+drafts (no seed) get no file.
 
 ``draft_id`` is regex-validated before any path is constructed so
 user-controlled input cannot escape the drafts directory.
@@ -42,11 +52,19 @@ SeedKind = Literal["reply", "forward"]
 
 @dataclass(frozen=True)
 class SeedRecord:
-    """Persisted seed metadata for a draft created by ``create_draft``."""
+    """Persisted seed metadata for a reply or forward draft.
+
+    ``body`` is the caller's own text, without the original Mail quotes,
+    and ``attachment_names`` the names of the files the caller attached,
+    without those a forward carries. Each is None when the record does
+    not say (written before it was kept).
+    """
 
     seed_kind: SeedKind
     seed_id: str
     reply_all: bool = False
+    body: str | None = None
+    attachment_names: tuple[str, ...] | None = None
 
 
 def _validate_draft_id(draft_id: str) -> None:
@@ -81,7 +99,7 @@ class DraftStateStore:
         """Return the seed record for ``draft_id``, or None.
 
         Corrupt or unreadable state files are treated as "no state"
-        rather than raised — they would just block update_draft for a
+        rather than raised — they would just block draft_update for a
         draft we can't recover anyway, and the user can still
         delete + re-create.
         """
@@ -99,7 +117,19 @@ class DraftStateStore:
         if not isinstance(seed_id, str) or not seed_id:
             return None
         reply_all = bool(data.get("reply_all", False))
-        return SeedRecord(seed_kind=kind, seed_id=seed_id, reply_all=reply_all)
+        body = data.get("body")
+        names = data.get("attachment_names")
+        return SeedRecord(
+            seed_kind=kind,
+            seed_id=seed_id,
+            reply_all=reply_all,
+            body=body if isinstance(body, str) else None,
+            attachment_names=(
+                tuple(names)
+                if isinstance(names, list) and all(isinstance(n, str) for n in names)
+                else None
+            ),
+        )
 
     def set_seed(self, draft_id: str, seed: SeedRecord) -> None:
         """Persist the seed record for ``draft_id``."""
@@ -111,6 +141,10 @@ class DraftStateStore:
         }
         if seed.seed_kind == "reply":
             payload["reply_all"] = seed.reply_all
+        if seed.body is not None:
+            payload["body"] = seed.body
+        if seed.attachment_names is not None:
+            payload["attachment_names"] = list(seed.attachment_names)
         path.write_text(json.dumps(payload), encoding="utf-8")
 
     def delete(self, draft_id: str) -> None:

@@ -13,7 +13,7 @@ The current API has 17 tools organized into 4 phases. Tool count should grow slo
 Can an existing tool handle this with current parameters?  (70% of cases: YES)
   |-- Searching with a new filter? -> Add parameter to search_messages()
   |-- Reading with different format? -> Add parameter to get_messages()
-  |-- Sending/composing with new options? -> Extend create_draft() or update_draft()
+  |-- Sending/composing with new options? -> Extend draft_create() or draft_update()
   |
 Can an existing tool handle this with a NEW parameter?  (20% of cases: YES)
   |-- Example: search by date range -> add date_from, date_to to search_messages()

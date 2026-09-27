@@ -3,11 +3,11 @@
 The resident daemon serves every session from one event loop. A tool
 whose connector call runs on that loop stops the loop for as long as
 osascript takes, up to the connector's 60 s timeout, and every session
-waits. These drive each async tool through the in-process server with a
-connector call that blocks until a concurrent ``list_tools`` has been
-answered, so the call is released only if the other request could be
-served while it waited. A tool that blocks the loop instead waits out
-``STALL_SECONDS`` and fails.
+waits. These drive the tools that confirm or rebuild a draft through
+the in-process server with a connector call that blocks until a
+concurrent ``list_tools`` has been answered, so the call is released
+only if the other request could be served while it waited. A tool that
+blocks the loop instead waits out ``STALL_SECONDS`` and fails.
 """
 
 from __future__ import annotations
@@ -84,9 +84,9 @@ CASES = [
         "_send_html_email",
         {"draft_id": "", "sent_message_id": ""},
     ),
-    # Control: a sync tool, which fastmcp already runs in a worker
-    # thread. It passes whatever the async tools do, so a failure above
-    # is about those tools and not about this harness.
+    # Control: a plain sync tool, which fastmcp runs in a worker thread
+    # and nothing else touches. It passes whatever the tools above do, so
+    # a failure above is about those tools and not about this harness.
     Case("delete_messages", {"message_ids": ["msg-1"]}, "delete_messages", 1),
 ]
 

@@ -20,10 +20,9 @@ EXPECTED_TOOLS = {
     "search_messages",
     "get_messages",
     "get_thread",
-    # Drafts v2 — verb-split surface (d36adc2). The undecorated
-    # create_draft / update_draft / delete_draft functions still exist in
-    # server.py for internal use; they are NOT tools and must not appear
-    # here.
+    # Drafts v2 — verb-split surface (d36adc2). The pre-v2 names
+    # create_draft / update_draft / delete_draft are not tools and must
+    # not appear here.
     "draft_create",
     "draft_update",
     "draft_delete",

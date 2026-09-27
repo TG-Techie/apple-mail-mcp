@@ -4,6 +4,7 @@ FastMCP server for Apple Mail integration.
 
 import argparse
 import atexit
+import dataclasses
 import datetime as _dt
 import functools
 import logging
@@ -57,7 +58,6 @@ from .security import (
     validate_attachment_size,
     validate_attachment_type,
     validate_bulk_operation,
-    validate_send_operation,
 )
 from .templates import Template, TemplateStore
 
@@ -1704,8 +1704,8 @@ def render_template(
     """Render a template into ready-to-send subject and body text.
 
     No side effects — caller is responsible for passing the rendered
-    text to ``create_draft`` or ``update_draft`` (with ``send_now=True``
-    when ready to send).
+    text to ``draft_create`` or ``draft_update``, and sending with
+    ``draft_send`` when ready.
 
     With ``message_id``, the original sender's display name and email,
     the original subject, and today's date are auto-populated as
@@ -1746,86 +1746,189 @@ def _get_draft_state_store() -> DraftStateStore:
     return DraftStateStore()
 
 
-def _resolve_draft_seed(
+def _draft_account(state: dict[str, Any]) -> str | None:
+    """The account a draft sits in, as Mail reads it back; None when Mail
+    cannot name one (a local draft)."""
+    return cast(str, state.get("account") or "") or None
+
+
+def _draft_sender(state: dict[str, Any]) -> str | None:
+    """The sender a draft was saved with, as Mail reads it back, or None.
+
+    A rebuilt draft is built with it unless the caller names another, so
+    an update does not silently move the draft to Mail's default account
+    (the connector resolves the address to its account). The one path
+    that cannot set a sender is a fresh draft sent through mailto:;
+    draft_send passes none there, and whether that draft's sender matches
+    what Mail's URL handler will use is not knowable here (see
+    DESIGN-QUEUE).
+    """
+    return cast(str, state.get("sender") or "") or None
+
+
+@dataclasses.dataclass(frozen=True)
+class _DraftSource:
+    """What a saved draft is built again from: the seed it was made from,
+    and the caller's own part of it — its text, and the names of the
+    files it attached — which is all a rebuild hands back to Mail."""
+
+    seed_kind: str
+    seed_id: str | None
+    reply_all: bool
+    body: str
+    attachment_names: list[str]
+
+
+def _resolve_draft_source(
     draft_id: str,
     state: dict[str, Any],
     store: DraftStateStore,
-) -> tuple[str, str | None, bool]:
-    """Determine the seed kind / id / reply_all for an update_draft call.
+) -> _DraftSource:
+    """How to rebuild a saved draft.
 
     Lookup order: persisted disk state first (fast); In-Reply-To header
     fallback for externally-created reply drafts (slow); fresh seed
     if neither yields anything.
 
-    Returns ``(seed_kind, seed_id, reply_all)``.
+    The connector's reply and forward verbs write the quoted original,
+    and a forward carries the original's attachments, so a reply or
+    forward is rebuilt from the caller's own part only, which the record
+    keeps. What Mail reads back already has Mail's part: handing its
+    body back sent the original twice, once unquoted (measured on a
+    forward created without a body and then sent), and its attachments
+    include the forwarded ones. A draft with no record of the caller's
+    part (created outside this server, or recorded before it was kept)
+    falls back to everything Mail reads back, with a warning. A fresh
+    draft has nothing of Mail's in it, so what Mail reads back is all
+    the caller's.
     """
-    seed_record = store.get_seed(draft_id)
-    if seed_record:
-        return seed_record.seed_kind, seed_record.seed_id, seed_record.reply_all
+    read_back_body = cast(str, state.get("body") or "")
+    read_back_names = list(state.get("attachment_names") or [])
+    record = store.get_seed(draft_id)
+    if record:
+        if record.body is not None and record.attachment_names is not None:
+            return _DraftSource(
+                record.seed_kind, record.seed_id, record.reply_all,
+                record.body, list(record.attachment_names),
+            )
+        logger.warning(
+            "draft %s has no record of what its caller wrote and attached; "
+            "rebuilding it from what Mail reads back, which repeats the "
+            "quoted original and a forward's attachments",
+            draft_id,
+        )
+        return _DraftSource(
+            record.seed_kind, record.seed_id, record.reply_all,
+            read_back_body, read_back_names,
+        )
 
     in_reply_to = state.get("in_reply_to") or ""
     if in_reply_to:
         logger.warning(
-            "update_draft falling back to In-Reply-To lookup for "
-            "externally-created draft %s — this may take 30s+ on "
-            "large mailboxes",
+            "falling back to In-Reply-To lookup for externally-created "
+            "draft %s — this may take 30s+ on large mailboxes",
             draft_id,
         )
         resolved = mail.find_message_by_message_id(in_reply_to)
         if resolved:
-            return "reply", resolved, False
+            return _DraftSource("reply", resolved, False, read_back_body, read_back_names)
 
-    return "new", None, False
+    return _DraftSource("new", None, False, read_back_body, read_back_names)
+
+
+def _persist_draft_source(draft_id: str, source: _DraftSource) -> None:
+    """Record a reply or forward draft's seed, and the caller's own part
+    of it, under its id, so draft_update and draft_send can rebuild it
+    without an O(N) header lookup and without handing Mail back what it
+    wrote itself (see ``_resolve_draft_source``). Called by draft_create,
+    and by draft_update under the new id. No-op for a failed create
+    (empty draft_id) or a seed kind without an anchor message.
+    (#191/#192)
+    """
+    if (
+        not draft_id
+        or source.seed_kind not in ("reply", "forward")
+        or not source.seed_id
+    ):
+        return
+    _get_draft_state_store().set_seed(
+        draft_id,
+        SeedRecord(
+            seed_kind=cast(Any, source.seed_kind),
+            seed_id=source.seed_id,
+            reply_all=source.reply_all,
+            body=source.body,
+            attachment_names=tuple(source.attachment_names),
+        ),
+    )
+
+
+def _retire_old_draft(
+    draft_id: str,
+    store: DraftStateStore,
+    *,
+    new_draft_id: str,
+    sent: bool,
+) -> str | None:
+    """Remove the draft that draft_update has just replaced or draft_send
+    has just sent.
+
+    Runs only once the new message exists, so nothing here can lose the
+    caller's draft. A removal that fails is reported, not raised: the
+    outcome the caller asked for holds, and the old id stays usable
+    until they deal with it. Returns the text to surface as a warning,
+    or None when the old draft is gone as intended.
+    """
+    try:
+        mail.delete_draft(draft_id)
+    except MailDraftNotFoundError:
+        store.delete(draft_id)
+        return (
+            f"the old draft {draft_id!r} was already gone when its removal "
+            "was attempted; the new state is as requested."
+        )
+    except MailAppleScriptError as e:
+        logger.error("old draft %r not removed after update: %s", draft_id, e)
+        outcome = (
+            "the message was sent"
+            if sent
+            else f"the new draft {new_draft_id!r} was saved"
+        )
+        return (
+            f"{outcome}, but the old draft {draft_id!r} could not be removed "
+            f"and is still in Drafts: {e}. Delete it with draft_delete."
+        )
+    store.delete(draft_id)
+    return None
 
 
 _FROM_ACCOUNT_UNSUPPORTED_ON_FRESH_SEND = (
     "a fresh message sent immediately goes out through Mail's mailto: "
     "handler, which always composes from Mail's default account, so "
     "from_account cannot be honoured on this path. Nothing was sent. "
-    "Omit from_account to send from the default account, or save the "
-    "draft without send_now — a saved draft keeps the chosen sender — "
-    "and send it from Mail.app."
+    "Omit from_account to send from the default account, or save it "
+    "with draft_create — a saved draft keeps the chosen sender — and "
+    "send it from Mail.app."
 )
 
 
 def _fresh_send_guard(
-    send_now: bool,
-    seed_kind: str,
-    *,
-    from_account: str | None,
-    attachment_paths: list[str] | None,
-    existing_names: list[str],
+    seed_kind: str, attachment_names: list[str]
 ) -> dict[str, Any] | None:
-    """Refuse send_now on a fresh-seed draft asking for what the mailto:
-    dispatch path cannot carry: a chosen sender, or attachments.
+    """Refuse draft_send on a fresh draft that carries attachments, which
+    the mailto: dispatch path cannot.
 
-    Fresh drafts sent immediately dispatch via the mailto: URL path
-    (connector ``_send_new_via_eml``). Mail's URL handler composes from
-    the default account and carries no attachments, so a call asking
-    for either would go out wrong while reporting success; it is
-    refused here instead. Must be called BEFORE any destructive op,
-    attachment extraction, or confirmation prompt: without that, the
-    delete-and-recreate ran first and the connector's refusal landed
-    AFTER the draft was deleted — destroying it (drafts 1390/1393,
-    2026-08-24).
+    Fresh drafts are sent via the mailto: URL path (connector
+    ``_send_new_via_eml``). Mail's URL handler carries no attachments, so
+    such a send is refused here instead of by the connector. Must be
+    called BEFORE any destructive op, attachment extraction, or
+    confirmation prompt: without that, the delete-and-recreate ran first
+    and the connector's refusal landed AFTER the draft was deleted —
+    destroying it (drafts 1390/1393, 2026-08-24).
 
     Returns an error response, or None to proceed.
     """
-    if not send_now or seed_kind != "new":
-        return None
-    if from_account is not None:
-        return {
-            "success": False,
-            "error": _FROM_ACCOUNT_UNSUPPORTED_ON_FRESH_SEND
-            + " The draft, if any, is unchanged.",
-            "error_type": "from_account_unsupported",
-        }
-    will_have_attachments = (
-        bool(attachment_paths)
-        if attachment_paths is not None
-        else bool(existing_names)
-    )
-    if not will_have_attachments:
+    if seed_kind != "new" or not attachment_names:
         return None
     return {
         "success": False,
@@ -1841,37 +1944,6 @@ def _fresh_send_guard(
     }
 
 
-def _update_draft_preflight(
-    send_now: bool,
-    seed_kind: str,
-    *,
-    from_account: str | None,
-    attachment_paths: list[str] | None,
-    existing_names: list[str],
-) -> dict[str, Any] | None:
-    """Can the updated draft be built, and sent if asked, as requested?
-    Runs before anything is deleted, so a refusal leaves the draft as it
-    was.
-
-    Two questions, in order: what a fresh immediate send cannot carry,
-    which applies to carried-over attachments as much as new ones; then
-    the file checks on a replacement attachment list, which is caller
-    input. ``None`` (carry over) and ``[]`` (clear) hand in no files and
-    get no file checks.
-    """
-    guard_err = _fresh_send_guard(
-        send_now, seed_kind,
-        from_account=from_account,
-        attachment_paths=attachment_paths,
-        existing_names=existing_names,
-    )
-    if guard_err:
-        return guard_err
-    if attachment_paths:
-        _validate_attachment_files(attachment_paths)
-    return None
-
-
 def _validate_attachment_files(attachment_paths: list[str]) -> None:
     """Validate files the caller asks to attach, before anything is composed.
 
@@ -1879,10 +1951,10 @@ def _validate_attachment_files(attachment_paths: list[str]) -> None:
     executable blocklist, size within the 25MB cap. Raises
     ``FileNotFoundError`` or ``ValueError`` on the first file that fails.
     Every path that takes attachment paths from the caller runs this —
-    email_send_html, create_draft and update_draft alike — so a draft
-    cannot carry what a send would refuse. Attachments update_draft
-    carries over from the existing draft are Mail's state, not caller
-    input, and are not re-checked here.
+    email_send_html, draft_create and draft_update alike — so a draft
+    cannot carry what a send would refuse. Attachments a rebuild carries
+    over from the existing draft are Mail's state, not caller input, and
+    are not re-checked here.
     """
     for raw in attachment_paths:
         path = Path(raw)
@@ -1902,33 +1974,75 @@ def _validate_attachment_files(attachment_paths: list[str]) -> None:
 def _resolve_draft_attachments(
     draft_id: str,
     attachment_paths: list[str] | None,
-    existing_names: list[str],
+    listed: list[str],
+    carried: list[str],
 ) -> tuple[list[Path] | None, "tempfile.TemporaryDirectory[str] | None"]:
-    """Compute final attachment paths for an update_draft call.
+    """Compute final attachment paths for a rebuilt draft.
 
     Semantics:
-        - ``attachment_paths is None`` AND draft has attachments
-            → extract existing to a temp dir; caller must clean it up.
-        - ``attachment_paths is None`` AND no existing attachments → None.
-        - ``attachment_paths == []`` → explicitly clear.
         - ``attachment_paths == [...]`` → replace with caller-supplied list.
+        - ``attachment_paths == []`` → explicitly clear.
+        - ``attachment_paths is None`` → carry over the draft's own
+          attachments named in ``carried`` (the caller's; see
+          ``_resolve_draft_source``), extracted to a temp dir the caller
+          must clean up; None when there are none.
 
-    Returns ``(final_paths, tempdir_to_clean_up)``. Caller is responsible
-    for the tempdir's lifecycle (typically via ``finally`` cleanup).
+    The connector saves a draft's attachments by position, not by name,
+    so every attachment Mail ``listed`` is saved out and only the carried
+    ones are kept. One that cannot be (Mail no longer lists it under that
+    name, or saving it failed) raises ``MailDraftError`` rather than
+    rebuilding the draft without it.
+
+    Returns ``(final_paths, tempdir_to_clean_up)``.
     """
     if attachment_paths is not None:
-        if attachment_paths == []:
-            return [], None
         return [Path(p) for p in attachment_paths], None
-
-    if not existing_names:
+    if not carried:
         return None, None
 
     tempdir = tempfile.TemporaryDirectory(prefix="amm-update-attach-")
-    extracted = mail.extract_draft_attachments(
-        draft_id, existing_names, Path(tempdir.name)
+    extracted = mail.extract_draft_attachments(draft_id, listed, Path(tempdir.name))
+    missing = list(carried)
+    kept: list[Path] = []
+    for path in extracted:
+        if path.name in missing:
+            missing.remove(path.name)
+            kept.append(path)
+    if missing:
+        tempdir.cleanup()
+        raise MailDraftError(
+            f"could not carry {missing} over from draft {draft_id!r}: Mail "
+            f"lists its attachments as {listed}. Nothing was changed."
+        )
+    return kept, tempdir
+
+
+def _rebuild_draft(
+    draft_id: str,
+    attachment_paths: list[str] | None,
+    listed: list[str],
+    carried: list[str],
+    **compose: Any,
+) -> dict[str, str]:
+    """Build a saved draft again through the connector's create_draft:
+    saved, for draft_update, or sent, for draft_send. Mail forbids
+    changing a saved draft, so this is how both act on one. ``compose``
+    is the rest of create_draft's arguments.
+
+    The old draft is left where it is: the caller holds its id, so it
+    goes (``_retire_old_draft``) only once this has succeeded, and a
+    failure here leaves it in Drafts. Attachments carried over from it
+    are extracted to a temporary directory for the rebuild, which is
+    removed whatever happens.
+    """
+    attachments, tempdir = _resolve_draft_attachments(
+        draft_id, attachment_paths, listed, carried
     )
-    return extracted, tempdir
+    try:
+        return mail.create_draft(attachment_paths=attachments, **compose)
+    finally:
+        if tempdir is not None:
+            tempdir.cleanup()
 
 
 def _build_draft_send_summary(
@@ -1939,7 +2053,7 @@ def _build_draft_send_summary(
     subject: str | None,
     body: str,
 ) -> str:
-    """Confirmation summary when create_draft / update_draft is sending."""
+    """Confirmation summary for a send (draft_send, email_send_html)."""
     verb = {"reply": "Send this reply?", "forward": "Forward this message?"}.get(
         seed_kind, "Send this email?"
     )
@@ -1958,11 +2072,36 @@ def _build_draft_send_summary(
     return verb + "\n\n" + "\n".join(lines)
 
 
-def _resolve_create_draft_seed(
+def _confirm_send(
+    ctx: Context | None,
+    operation: str,
+    recipients: list[str],
+    summary: str,
+    elicit_extra: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Ask the user to confirm a send, unless every recipient is on the
+    outbound allowlist (see outbound_allowlist.py). The bypass lets
+    clients without elicitation support (e.g. Cowork) send to
+    pre-trusted addresses. It is only that: the HARD policy gate runs at
+    the connector (mail_connector.create_draft and _send_html_email →
+    assert_recipients_allowed_for_send), so a send to an off-list
+    address is blocked at dispatch whatever happens here.
+
+    Returns the refusal (declined, or no way to ask), or None to send.
+    """
+    if all_recipients_allowed(recipients):
+        operation_logger.log_operation(
+            operation, {**elicit_extra, "recipients": recipients}, "send_allowlisted",
+        )
+        return None
+    return _confirm_from_threadpool(ctx, summary, operation, elicit_extra)
+
+
+def _resolve_draft_create_seed(
     reply_to: str | None,
     forward_of: str | None,
 ) -> tuple[str, str | None]:
-    """Resolve (seed_kind, seed_id) from create_draft's reply_to/forward_of
+    """Resolve (seed_kind, seed_id) from draft_create's reply_to/forward_of
     params. Param-shape validation (reply_to AND forward_of both set) is
     caller's responsibility; this helper assumes valid input. (#191)
     """
@@ -2000,156 +2139,18 @@ def _maybe_apply_template(
 
 def _validate_fresh_seed_fields(
     seed_kind: str,
-    to: list[str] | None,
+    to: list[str],
     subject: str | None,
-) -> dict[str, Any] | None:
+) -> None:
     """For seed_kind=='new', require both `to` and `subject` (post-template
-    rendering). Returns a validation_error dict if missing, None otherwise. (#191)
+    rendering). Raises ValueError for the first one missing. (#191)
     """
     if seed_kind != "new":
-        return None
-    if not to:
-        return {
-            "success": False,
-            "error": "'to' is required when not replying or forwarding",
-            "error_type": "validation_error",
-        }
-    if not subject:
-        return {
-            "success": False,
-            "error": "'subject' is required when not replying or forwarding",
-            "error_type": "validation_error",
-        }
-    return None
-
-
-def _run_send_now_gates(
-    operation: str,
-    ctx: Context | None,
-    recipients: list[str],
-    rate_params: dict[str, Any],
-    summary: str,
-    elicit_extra: dict[str, Any],
-    *,
-    account: str | None,
-    validate_recipient_shape: bool = False,
-    validate_args: tuple[Any, ...] = (),
-) -> dict[str, Any] | None:
-    """Run the standard send_now gate chain (#191):
-
-    1. ``check_test_mode_safety(operation, account=account,
-       recipients=recipients)`` — ``account`` is the one the send goes
-       out under, as far as the caller can name it: the sender it was
-       given, or the account the draft being sent sits in.
-    2. ``check_rate_limit(operation, rate_params)``
-    3. If ``validate_recipient_shape``: ``validate_send_operation(*validate_args)``
-    4. ``_confirm_from_threadpool(ctx, summary, operation, elicit_extra)``
-
-    Returns the first failure response, or ``None`` if all pass.
-
-    The ``validate_recipient_shape`` flag exists so ``update_draft``
-    (#192) can adopt this helper — its send path inherits recipients
-    from existing draft state and doesn't need the shape check.
-    """
-    safety_err = check_test_mode_safety(
-        operation, account=account, recipients=recipients,
-    )
-    if safety_err:
-        return safety_err
-    rate_err = check_rate_limit(operation, rate_params)
-    if rate_err:
-        return rate_err
-    if validate_recipient_shape:
-        is_valid, error_msg = validate_send_operation(*validate_args)
-        if not is_valid:
-            return {
-                "success": False,
-                "error": error_msg,
-                "error_type": "validation_error",
-            }
-    # Skip elicitation when all recipients are on the centralized outbound
-    # allowlist (see outbound_allowlist.py). Lets clients without
-    # elicitation support (e.g. Cowork) auto-send to pre-trusted addresses.
-    # NOTE: this is only the UX bypass. The HARD policy gate runs at the
-    # connector layer (mail_connector.create_draft → assert_recipients_allowed_for_send),
-    # so even if a future tool bypasses this server-layer check, sends to
-    # off-list addresses are still blocked at AppleScript dispatch.
-    if all_recipients_allowed(recipients):
-        operation_logger.log_operation(
-            operation,
-            {**elicit_extra, "recipients": recipients},
-            "send_allowlisted",
-        )
-    else:
-        cancel_err = _confirm_from_threadpool(
-            ctx, summary, operation, elicit_extra,
-        )
-        if cancel_err:
-            return cancel_err
-    return None
-
-
-def _retire_old_draft(
-    draft_id: str,
-    store: DraftStateStore,
-    *,
-    new_draft_id: str,
-    sent: bool,
-) -> str | None:
-    """Remove the draft that update_draft has just replaced or sent.
-
-    Runs only once the new message exists, so nothing here can lose the
-    caller's draft. A removal that fails is reported, not raised: the
-    outcome the caller asked for holds, and the old id stays usable
-    until they deal with it. Returns the text to surface as a warning,
-    or None when the old draft is gone as intended.
-    """
-    try:
-        mail.delete_draft(draft_id)
-    except MailDraftNotFoundError:
-        store.delete(draft_id)
-        return (
-            f"the old draft {draft_id!r} was already gone when its removal "
-            "was attempted; the new state is as requested."
-        )
-    except MailAppleScriptError as e:
-        logger.error("old draft %r not removed after update: %s", draft_id, e)
-        outcome = (
-            "the message was sent"
-            if sent
-            else f"the new draft {new_draft_id!r} was saved"
-        )
-        return (
-            f"{outcome}, but the old draft {draft_id!r} could not be removed "
-            f"and is still in Drafts: {e}. Delete it with draft_delete."
-        )
-    store.delete(draft_id)
-    return None
-
-
-def _persist_draft_seed(
-    draft_id: str,
-    seed_kind: str,
-    seed_id: str | None,
-    reply_all: bool,
-    send_now: bool,
-) -> None:
-    """Persist seed metadata for reply/forward drafts so update_draft can
-    rebuild without an O(N) header lookup. Called by both create_draft
-    (under the new draft id) and update_draft (under the new draft id
-    after delete-and-recreate). No-op for `send_now=True`, failed creates
-    (empty draft_id), or seed kinds without an anchor message. (#191/#192)
-    """
-    if send_now or not draft_id or seed_kind not in ("reply", "forward") or not seed_id:
         return
-    _get_draft_state_store().set_seed(
-        draft_id,
-        SeedRecord(
-            seed_kind=cast(Any, seed_kind),
-            seed_id=seed_id,
-            reply_all=reply_all,
-        ),
-    )
+    if not to:
+        raise ValueError("'to' is required when not replying or forwarding")
+    if not subject:
+        raise ValueError("'subject' is required when not replying or forwarding")
 
 
 def _resolve_update_subject_body(
@@ -2158,12 +2159,15 @@ def _resolve_update_subject_body(
     template_name: str | None,
     template_vars: dict[str, str] | None,
     seed_id: str | None,
-    state: dict[str, Any],
+    current_subject: str | None,
+    current_body: str,
 ) -> tuple[str | None, str]:
-    """Three-tier resolution for update_draft's subject + body:
-    caller-supplied > template-rendered > existing draft state.
+    """Three-tier resolution for draft_update's subject + body:
+    caller-supplied > template-rendered > the draft's current values (its
+    subject as Mail reads it back; its body as ``_resolve_draft_source``
+    resolved it).
 
-    Differs from create_draft's `_maybe_apply_template`: update treats
+    Differs from draft_create's `_maybe_apply_template`: update treats
     `body=""` as a deliberate clear (preserved through the chain), while
     create treats `not body` as "fall through to template". Raises
     MailTemplateError on bad templates. (#192)
@@ -2179,36 +2183,9 @@ def _resolve_update_subject_body(
             merged_subject = rendered["subject"]
         if merged_body is None:
             merged_body = rendered["body"] or ""
-    final_subject = (
-        merged_subject if merged_subject is not None else state.get("subject")
-    )
-    final_body = (
-        merged_body if merged_body is not None else state.get("body", "")
-    )
+    final_subject = merged_subject if merged_subject is not None else current_subject
+    final_body = merged_body if merged_body is not None else current_body
     return final_subject, final_body
-
-
-def _resolve_update_sender(
-    from_account: str | None,
-    state: dict[str, Any],
-    seed_kind: str,
-    send_now: bool,
-) -> str | None:
-    """The account the recreated draft is built in.
-
-    The caller's override wins. Otherwise the draft's own sender, read
-    back from Mail, is carried over, so an update does not silently move
-    the draft to Mail's default account (the connector resolves the
-    address to its account). The one path that cannot set a sender is a
-    fresh draft sent immediately, which goes through mailto:; nothing is
-    passed there, and whether that draft's sender matches what Mail's URL
-    handler will use is not knowable here (see DESIGN-QUEUE).
-    """
-    if from_account is not None:
-        return from_account
-    if send_now and seed_kind == "new":
-        return None
-    return cast(str, state.get("sender") or "") or None
 
 
 def _merge_draft_recipients(
@@ -2227,94 +2204,14 @@ def _merge_draft_recipients(
     )
 
 
-def _gate_create_draft_send(
-    *,
-    seed_kind: str,
-    to: list[str] | None,
-    cc: list[str] | None,
-    bcc: list[str] | None,
-    subject: str | None,
-    body: str,
-    from_account: str | None,
-    attachment_paths: list[str] | None,
-    ctx: Context | None,
-) -> dict[str, Any] | None:
-    """The gate chain for a draft that is to be sent as it is created.
-
-    First refuses what the fresh send path cannot carry, so the user is
-    never asked to confirm a send that would then go out wrong. Then
-    assembles what ``_run_send_now_gates`` needs from the draft's
-    recipient groups — the flat recipient list, the summary the user
-    confirms, and whether recipient shape is the caller's to validate —
-    and returns the first gate's error, or None when every gate passed.
-    """
-    guard_err = _fresh_send_guard(
-        True, seed_kind,
-        from_account=from_account,
-        attachment_paths=attachment_paths,
-        existing_names=[],
-    )
-    if guard_err:
-        return guard_err
-    all_recipients = (to or []) + (cc or []) + (bcc or [])
-    summary = _build_draft_send_summary(seed_kind, to, cc, bcc, subject, body)
-    return _run_send_now_gates(
-        operation="create_draft",
-        ctx=ctx,
-        recipients=all_recipients,
-        rate_params={"subject": subject, "to": to},
-        summary=summary,
-        elicit_extra={"subject": subject, "to": to, "seed_kind": seed_kind},
-        account=from_account,
-        # Only validate recipient shape when caller supplied any —
-        # for reply with no overrides, recipients come from Mail.
-        validate_recipient_shape=(
-            to is not None or cc is not None or bcc is not None
-        ),
-        validate_args=(to or [], cc, bcc),
-    )
-
-
-def _gate_update_draft_send(
-    *,
-    seed_kind: str,
-    draft_id: str,
-    account: str | None,
-    to: list[str],
-    cc: list[str],
-    bcc: list[str],
-    subject: str | None,
-    body: str,
-    ctx: Context | None,
-) -> dict[str, Any] | None:
-    """The gate chain for a draft that is to be sent as it is updated.
-
-    The recipient groups are the merged ones — the draft's own state
-    with the caller's overrides — so their shape is not re-validated
-    here (#175 + #192); ``account`` is the one the draft sits in;
-    everything else is as for ``create_draft``. Returns the first
-    gate's error, or None when every gate passed.
-    """
-    summary = _build_draft_send_summary(seed_kind, to, cc, bcc, subject, body)
-    return _run_send_now_gates(
-        operation="update_draft",
-        ctx=ctx,
-        recipients=to + cc + bcc,
-        rate_params={"draft_id": draft_id, "subject": subject},
-        summary=summary,
-        elicit_extra={"draft_id": draft_id, "send_now": True},
-        account=account,
-    )
-
-
-def _gate_update_draft_accounts(
+def _gate_draft_update_accounts(
     draft_account: str | None, from_account: str | None
 ) -> dict[str, Any] | None:
-    """The test-mode account gate for an update: the draft's own account,
-    which the update deletes from and, absent an override, recreates in,
-    and the override when the caller gave one. A draft whose account
-    Mail could not name is passed as None and refused in test mode.
-    Returns the first gate's error, or None.
+    """The test-mode account gate for draft_update: the draft's own
+    account, which the update deletes from and, absent an override,
+    recreates in, and the override when the caller gave one. A draft
+    whose account Mail could not name is passed as None and refused in
+    test mode. Returns the first gate's error, or None.
     """
     touched = [draft_account]
     if from_account is not None:
@@ -2324,345 +2221,6 @@ def _gate_update_draft_accounts(
         if safety_err:
             return safety_err
     return None
-
-
-@_in_tool_threadpool
-@envelope
-def create_draft(
-    reply_to: str | None = None,
-    forward_of: str | None = None,
-    to: list[str] = [],  # noqa: B006 — coerced to None below
-    cc: list[str] = [],  # noqa: B006 — coerced to None below
-    bcc: list[str] = [],  # noqa: B006 — coerced to None below
-    subject: str | None = None,
-    body: str = "",
-    attachment_paths: list[str] = [],  # noqa: B006 — coerced to None below
-    reply_all: bool = False,
-    template_name: str | None = None,
-    template_vars: dict[str, str] | None = None,
-    from_account: str | None = None,
-    send_now: bool = False,
-    ctx: Context | None = None,
-) -> dict[str, Any]:
-    """Internal: create a draft (fresh, reply, or forward), optionally send.
-
-    NOT an MCP tool. The MCP surface is ``draft_create`` (no send) and
-    ``draft_send`` (send an existing draft). This function remains the
-    underlying create-and-maybe-send implementation, callable from
-    Python and from the wrappers.
-
-    Original behavior preserved below.
-
-    Mail.app's actual primitive is the draft — every outgoing message is
-    a draft until sent. This tool lets callers create one, optionally
-    seeded from an existing message (reply or forward), and either save
-    it for later or send it now.
-
-    Args:
-        reply_to: Id of a message to reply to. Accepts either Mail.app's
-            internal numeric id or an RFC 5322 Message-ID — pass the ``id``
-            field from any ``search_messages`` / ``get_messages`` row
-            verbatim. Mutually exclusive with ``forward_of``. When set,
-            ``to``/``cc`` recipients and ``subject`` are auto-derived from
-            the original (override by passing them explicitly).
-        forward_of: Id of a message to forward. Accepts the same id forms
-            as ``reply_to``. Mutually exclusive with ``reply_to``. ``to``
-            is required (recipient of the forward).
-        to/cc/bcc: Recipient lists. For reply/forward, ``None`` keeps the
-            auto-derived recipients; ``[]`` explicitly clears that group;
-            a populated list replaces.
-        subject: Subject. Required when both seeds are None. For
-            reply/forward, ``None`` keeps Mail's ``Re:``/``Fwd:`` prefix.
-        body: Body text. For reply/forward, a non-empty body goes above
-            what Mail wrote, which stays: the quoted original, or the
-            forwarded message with its header block and attachments. An
-            empty body leaves Mail's quote or forward as Mail made it.
-        attachment_paths: List of file paths to attach. Each must exist,
-            must not carry an executable extension, and must be under
-            25MB — the same checks as a send.
-        reply_all: For ``reply_to`` only — use ``reply to all``.
-        template_name: Optional template to render for ``subject`` and
-            ``body``. Caller-supplied ``subject``/``body`` override the
-            rendered output. ``template_vars`` override auto-fills.
-        template_vars: Variables to pass to the template renderer.
-            Requires ``template_name``.
-        from_account: Mail.app account name or UUID. ``None`` uses Mail's
-            default. Honoured on saved drafts and on reply/forward sends;
-            a fresh message with ``send_now=True`` goes through mailto:,
-            which cannot set it, and is refused
-            (``from_account_unsupported``) rather than sent from the
-            wrong account.
-        send_now: ``False`` (default) saves as draft. ``True`` sends
-            immediately and elicits user confirmation.
-
-    Returns:
-        ``{"success": True, "draft_id": "<id>", "sent_message_id": ""}``
-        when saved as draft. ``draft_id`` is empty when sent.
-    """
-    to_or_none: list[str] | None = to or None
-    cc_or_none: list[str] | None = cc or None
-    bcc_or_none: list[str] | None = bcc or None
-    attachment_paths_or_none: list[str] | None = attachment_paths or None
-    if reply_to and forward_of:
-        raise ValueError("reply_to and forward_of are mutually exclusive")
-    if template_vars and not template_name:
-        raise ValueError("template_vars requires template_name")
-
-    # A named sender is an account this call writes into (the draft
-    # lands in its Drafts, or the mail goes out under it); in test
-    # mode it must be the test account. The send gates below see the
-    # recipients separately.
-    if refused := check_test_mode_safety("create_draft", account=from_account):
-        return refused
-
-    seed_kind, seed_id = _resolve_create_draft_seed(reply_to, forward_of)
-    subject, body = _maybe_apply_template(
-        template_name, template_vars, seed_id, subject, body,
-    )
-    # Fresh-seed required-field validation (after template rendering
-    # so a template can supply subject/body).
-    if refused := _validate_fresh_seed_fields(seed_kind, to_or_none, subject):
-        return refused
-    if attachment_paths_or_none:
-        _validate_attachment_files(attachment_paths_or_none)
-    if send_now:
-        if refused := _gate_create_draft_send(
-            seed_kind=seed_kind, to=to_or_none, cc=cc_or_none,
-            bcc=bcc_or_none, subject=subject, body=body,
-            from_account=from_account,
-            attachment_paths=attachment_paths_or_none, ctx=ctx,
-        ):
-            return refused
-
-    attachment_path_objs = (
-        [Path(p) for p in attachment_paths_or_none]
-        if attachment_paths_or_none is not None
-        else None
-    )
-    result = mail.create_draft(
-        seed=seed_kind,
-        seed_id=seed_id,
-        to=to_or_none,
-        cc=cc_or_none,
-        bcc=bcc_or_none,
-        subject=subject,
-        body=body,
-        attachment_paths=attachment_path_objs,
-        reply_all=reply_all,
-        from_account=from_account,
-        send_now=send_now,
-    )
-    draft_id = result.get("draft_id", "")
-    _persist_draft_seed(draft_id, seed_kind, seed_id, reply_all, send_now)
-    operation_logger.log_operation(
-        "create_draft",
-        {
-            "seed_kind": seed_kind,
-            "seed_id": seed_id,
-            "send_now": send_now,
-            "draft_id": draft_id,
-            "to": to_or_none,
-            "cc": cc_or_none,
-            "bcc": bcc_or_none,
-            "subject": subject,
-            "from_account": from_account,
-        },
-        "success",
-    )
-    return {
-        "success": True,
-        "draft_id": draft_id,
-        "sent_message_id": result.get("sent_message_id", ""),
-        "details": {"seed_kind": seed_kind, "send_now": send_now},
-    }
-
-
-@_in_tool_threadpool
-@envelope
-def update_draft(
-    draft_id: str,
-    to: list[str] | None = None,
-    cc: list[str] | None = None,
-    bcc: list[str] | None = None,
-    subject: str | None = None,
-    body: str | None = None,
-    attachment_paths: list[str] | None = None,
-    template_name: str | None = None,
-    template_vars: dict[str, str] | None = None,
-    from_account: str | None = None,
-    send_now: bool = False,
-    ctx: Context | None = None,
-) -> dict[str, Any]:
-    """Update an existing draft. Implemented as recreate-then-delete.
-
-    **Returns a NEW draft_id** — Mail.app forbids mutating saved drafts,
-    so update is implemented by reading the draft's current state,
-    creating a new draft with the merged fields, and then removing the
-    old one. The old draft goes only after the new message exists (or
-    has been sent), so any failure leaves it in Drafts under the id the
-    caller already holds; if the removal itself fails after that, the
-    response is a success carrying a ``warning`` that names the old id.
-    Threading headers (for reply seeds) and forward anchor are preserved
-    via persisted seed metadata.
-
-    Field merge semantics: any non-None argument overrides the existing
-    value. ``None`` keeps the existing value. ``attachment_paths=None``
-    PRESERVES existing attachments (extracted via Mail's ``save``
-    command); ``[]`` explicitly clears them; a list replaces.
-    ``from_account=None`` keeps the draft in the account it was saved
-    from (the sender is read back from Mail), except on a fresh draft
-    sent immediately, whose mailto: dispatch path cannot set a sender.
-
-    For drafts created externally (not via ``create_draft``), seed
-    recovery falls back to scanning Mail.app for the In-Reply-To header
-    — this can be slow on large mailboxes (~30s+ per call). Forward
-    seeds without disk state are misclassified as fresh; pass an
-    explicit body if so.
-
-    Args:
-        draft_id: Mail.app id of the existing draft.
-        to/cc/bcc: Override recipient groups (None = keep, [] = clear,
-            list = replace).
-        subject: Override subject. None keeps existing.
-        body: Override body. None keeps existing. Non-None replaces
-            (including the empty string, which clears).
-        attachment_paths: Override attachments. None preserves existing
-            via temp-dir extraction; [] clears; list replaces. A
-            replacement list gets the same checks as a send (exists, no
-            executable extension, under 25MB) before the existing draft
-            is touched.
-        template_name / template_vars: Optional template render. User-
-            supplied subject/body override the rendered output.
-        from_account: Override sender. None keeps the draft's own sender.
-            Refused (``from_account_unsupported``) when ``send_now=True``
-            on a fresh draft, which sends through mailto: and cannot set
-            it; the draft is left as it was.
-        send_now: ``False`` (default) saves new draft. ``True`` sends
-            after eliciting confirmation.
-
-    Returns:
-        ``{"success": True, "draft_id": "<NEW>", "sent_message_id": ""}``.
-    """
-    if template_vars and not template_name:
-        raise ValueError("template_vars requires template_name")
-    state = mail.get_draft_state(draft_id)
-
-    # A draft id names a draft in any account; the state read says
-    # which, and the update must stay in the test account.
-    draft_account = cast(str, state.get("account") or "") or None
-    if refused := _gate_update_draft_accounts(draft_account, from_account):
-        return refused
-
-    store = _get_draft_state_store()
-    seed_kind, seed_id, reply_all = _resolve_draft_seed(draft_id, state, store)
-    if refused := _update_draft_preflight(
-        send_now, seed_kind,
-        from_account=from_account,
-        attachment_paths=attachment_paths,
-        existing_names=state.get("attachment_names", []) or [],
-    ):
-        return refused
-    final_subject, final_body = _resolve_update_subject_body(
-        subject, body, template_name, template_vars, seed_id, state,
-    )
-    final_to, final_cc, final_bcc = _merge_draft_recipients(to, cc, bcc, state)
-    final_from = _resolve_update_sender(from_account, state, seed_kind, send_now)
-
-    final_attachments, tempdir = _resolve_draft_attachments(
-        draft_id, attachment_paths, state.get("attachment_names", []) or []
-    )
-    try:
-        if send_now:
-            if refused := _gate_update_draft_send(
-                seed_kind=seed_kind, draft_id=draft_id, account=draft_account,
-                to=final_to, cc=final_cc, bcc=final_bcc,
-                subject=final_subject, body=final_body or "", ctx=ctx,
-            ):
-                return refused
-
-        # Recreate, then retire. The old draft is the only copy the caller
-        # holds an id for, so nothing is removed until the new message
-        # exists (or has gone out); a failure here leaves it in Drafts.
-        result = mail.create_draft(
-            seed=seed_kind,
-            seed_id=seed_id,
-            to=final_to,
-            cc=final_cc,
-            bcc=final_bcc,
-            subject=final_subject,
-            body=final_body or "",
-            attachment_paths=final_attachments,
-            reply_all=reply_all,
-            from_account=final_from,
-            send_now=send_now,
-        )
-    finally:
-        if tempdir is not None:
-            tempdir.cleanup()
-    new_draft_id = result.get("draft_id", "")
-    _persist_draft_seed(new_draft_id, seed_kind, seed_id, reply_all, send_now)
-    warning = _retire_old_draft(
-        draft_id, store, new_draft_id=new_draft_id, sent=send_now,
-    )
-    operation_logger.log_operation(
-        "update_draft",
-        {
-            "old_draft_id": draft_id,
-            "new_draft_id": new_draft_id,
-            "old_draft_removed": warning is None,
-            "send_now": send_now,
-            "to": final_to,
-            "cc": final_cc,
-            "bcc": final_bcc,
-            "subject": final_subject,
-            "from_account": final_from,
-        },
-        "success",
-    )
-    response: dict[str, Any] = {
-        "success": True,
-        "draft_id": new_draft_id,
-        "sent_message_id": result.get("sent_message_id", ""),
-        "details": {"seed_kind": seed_kind, "send_now": send_now},
-    }
-    if warning is not None:
-        response["warning"] = warning
-    return response
-
-
-@envelope
-def delete_draft(draft_id: str) -> dict[str, Any]:
-    """Internal: delete (move to Trash) an existing draft.
-
-    NOT an MCP tool. The MCP surface is ``draft_delete``.
-
-    Lifecycle endpoint for cancellation. Mail.app moves the message to
-    the Deleted Messages mailbox; recovery is technically possible but
-    Mail.app no longer treats trashed drafts as editable, so this is
-    effectively a one-way discard. No elicitation (recoverable from
-    Trash) and no rate limit (local operation).
-
-    Args:
-        draft_id: Mail.app id of the draft.
-
-    Returns:
-        ``{"success": True}`` on a clean delete; an error response if
-        no draft with that id exists.
-    """
-    # A draft id names a draft in any account; read which before
-    # acting, so test mode can keep the delete in the test account.
-    state = mail.get_draft_state(draft_id)
-    if refused := check_test_mode_safety(
-        "delete_draft", account=cast(str, state.get("account") or "") or None,
-    ):
-        return refused
-    mail.delete_draft(draft_id)
-    _get_draft_state_store().delete(draft_id)
-    operation_logger.log_operation(
-        "delete_draft", {"draft_id": draft_id, "account": state.get("account")},
-        "success",
-    )
-    return {"success": True, "draft_id": draft_id}
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -2698,11 +2256,17 @@ def delete_draft(draft_id: str) -> dict[str, Any]:
 # stale. The old draft is removed only after the new one exists (or the
 # send went out), so a failed draft_update or draft_send leaves it in
 # Drafts under the id you already hold.
+#
+# The operation names these tools give the rate limiter, the test-mode
+# gate and the audit log are create_draft, update_draft and delete_draft,
+# the names security.py's tables know them by; a send from a draft is
+# update_draft there, a send that must name the draft's account.
 # ──────────────────────────────────────────────────────────────────────────
 
 
 @mcp.tool()
-async def draft_create(
+@envelope
+def draft_create(
     reply_to: str | None = None,
     forward_of: str | None = None,
     to: list[str] = [],  # noqa: B006 — coerced to None below
@@ -2720,21 +2284,22 @@ async def draft_create(
 
     To actually send, call ``draft_send(draft_id)`` as a separate step
     after reviewing/editing the draft. The split is intentional —
-    sending requires its own explicit action and is the only path where
-    the outbound allowlist policy is enforced.
+    sending requires its own explicit action, and the outbound allowlist
+    policy is enforced there.
 
     Modes (driven by ``reply_to`` / ``forward_of``):
-      - Neither: fresh draft (``subject`` required).
+      - Neither: fresh draft (``to`` and ``subject`` required).
       - ``reply_to=<message_id>``: reply draft. Mail.app auto-derives
         recipients and subject prefix unless overridden.
       - ``forward_of=<message_id>``: forward draft. Recipients default
         to empty (user must specify); subject prefixed with ``Fwd:``.
 
     Args:
-        reply_to: Message id to reply to. Mutually exclusive with
-            ``forward_of``.
-        forward_of: Message id to forward. Mutually exclusive with
-            ``reply_to``.
+        reply_to: Message id to reply to: Mail's internal id or an RFC
+            5322 Message-ID, as any ``search_messages`` / ``get_messages``
+            row gives it. Mutually exclusive with ``forward_of``.
+        forward_of: Message id to forward, in the same forms. Mutually
+            exclusive with ``reply_to``.
         to/cc/bcc: Recipient lists. For reply/forward, empty list keeps
             Mail's auto-derived recipients; populated list replaces.
         subject: Subject line. Required for fresh drafts; optional for
@@ -2746,6 +2311,8 @@ async def draft_create(
             not carry an executable extension, and must be under 25MB.
         reply_all: For ``reply_to`` only — use Mail's reply-all logic.
         template_name / template_vars: Optional template render.
+            Caller-supplied ``subject``/``body`` override the rendered
+            output; ``template_vars`` override auto-fills.
         from_account: Mail.app account name or UUID. None uses Mail's
             default sender for the seed message. A saved draft keeps it.
 
@@ -2760,26 +2327,69 @@ async def draft_create(
         >>> draft_send(draft_id="ABCD")
         {"success": True, "sent_message_id": ""}
     """
-    return await create_draft(
-        reply_to=reply_to,
-        forward_of=forward_of,
-        to=to,
-        cc=cc,
-        bcc=bcc,
+    if reply_to and forward_of:
+        raise ValueError("reply_to and forward_of are mutually exclusive")
+    if template_vars and not template_name:
+        raise ValueError("template_vars requires template_name")
+    # A named sender is an account this call writes into: the draft lands
+    # in its Drafts, so in test mode it must be the test account.
+    if refused := check_test_mode_safety("create_draft", account=from_account):
+        return refused
+
+    seed_kind, seed_id = _resolve_draft_create_seed(reply_to, forward_of)
+    subject, body = _maybe_apply_template(
+        template_name, template_vars, seed_id, subject, body,
+    )
+    # After rendering, so a template can supply the subject.
+    _validate_fresh_seed_fields(seed_kind, to, subject)
+    if attachment_paths:
+        _validate_attachment_files(attachment_paths)
+
+    result = mail.create_draft(
+        seed=seed_kind,
+        seed_id=seed_id,
+        to=to or None,
+        cc=cc or None,
+        bcc=bcc or None,
         subject=subject,
         body=body,
-        attachment_paths=attachment_paths,
+        attachment_paths=[Path(p) for p in attachment_paths] or None,
         reply_all=reply_all,
-        template_name=template_name,
-        template_vars=template_vars,
         from_account=from_account,
-        send_now=False,
-        ctx=None,
     )
+    draft_id = result.get("draft_id", "")
+    _persist_draft_source(
+        draft_id,
+        _DraftSource(
+            seed_kind, seed_id, reply_all, body,
+            [Path(p).name for p in attachment_paths],
+        ),
+    )
+    operation_logger.log_operation(
+        "create_draft",
+        {
+            "seed_kind": seed_kind,
+            "seed_id": seed_id,
+            "draft_id": draft_id,
+            "to": to or None,
+            "cc": cc or None,
+            "bcc": bcc or None,
+            "subject": subject,
+            "from_account": from_account,
+        },
+        "success",
+    )
+    return {
+        "success": True,
+        "draft_id": draft_id,
+        "sent_message_id": result.get("sent_message_id", ""),
+        "details": {"seed_kind": seed_kind, "send_now": False},
+    }
 
 
 @mcp.tool()
-async def draft_update(
+@envelope
+def draft_update(
     draft_id: str,
     to: list[str] | None = None,
     cc: list[str] | None = None,
@@ -2800,17 +2410,24 @@ async def draft_update(
     IMPORTANT: Mail.app forbids mutating saved drafts, so this is
     implemented as recreate-then-delete. The returned ``draft_id`` is a
     NEW id — use it for any subsequent ``draft_update`` or ``draft_send``
-    call. The id you passed in is stale after this call returns.
+    call. The id you passed in is stale after this call returns. The old
+    draft is removed only after the new one exists, so a failure leaves
+    it in Drafts under the id you passed; a removal that fails after
+    that is reported as a ``warning`` beside the success.
 
     Args:
         draft_id: Existing draft to update.
         to/cc/bcc: Recipient overrides (None=keep, []=clear, list=replace).
         subject: Subject override. None=keep.
-        body: Body override. None=keep; empty string=clear.
+        body: Body override. None=keep; empty string=clear. On a reply or
+            forward the text kept is your own, never the original Mail
+            quotes below it.
         attachment_paths: Attachment override (None=keep, []=clear,
-            list=replace). A replacement list is checked like a send
-            (exists, no executable extension, under 25MB) before the
-            existing draft is touched.
+            list=replace). On a reply or forward, None keeps the files
+            you attached; a forward's own come with Mail's forward. A
+            replacement list is checked like a send (exists, no
+            executable extension, under 25MB) before the existing draft
+            is touched.
         template_name / template_vars: Optional template render.
         from_account: Sender override. None keeps the draft's own sender.
 
@@ -2822,43 +2439,118 @@ async def draft_update(
         >>> r["draft_id"]   # different from "ABCD"!
         'EFGH'
     """
-    return await update_draft(
-        draft_id=draft_id,
-        to=to,
-        cc=cc,
-        bcc=bcc,
-        subject=subject,
-        body=body,
-        attachment_paths=attachment_paths,
-        template_name=template_name,
-        template_vars=template_vars,
-        from_account=from_account,
-        send_now=False,
-        ctx=None,
+    if template_vars and not template_name:
+        raise ValueError("template_vars requires template_name")
+    state = mail.get_draft_state(draft_id)
+    # A draft id names a draft in any account; the state read says
+    # which, and the update must stay in the test account.
+    if refused := _gate_draft_update_accounts(_draft_account(state), from_account):
+        return refused
+
+    store = _get_draft_state_store()
+    source = _resolve_draft_source(draft_id, state, store)
+    # A replacement list is caller input, checked before anything is
+    # touched; None (carry over) and [] (clear) hand in no files.
+    if attachment_paths:
+        _validate_attachment_files(attachment_paths)
+    final_subject, final_body = _resolve_update_subject_body(
+        subject, body, template_name, template_vars, source.seed_id,
+        state.get("subject"), source.body,
     )
+    final_to, final_cc, final_bcc = _merge_draft_recipients(to, cc, bcc, state)
+    final_from = from_account if from_account is not None else _draft_sender(state)
+
+    result = _rebuild_draft(
+        draft_id, attachment_paths,
+        list(state.get("attachment_names") or []), source.attachment_names,
+        seed=source.seed_kind,
+        seed_id=source.seed_id,
+        reply_all=source.reply_all,
+        to=final_to,
+        cc=final_cc,
+        bcc=final_bcc,
+        subject=final_subject,
+        body=final_body,
+        from_account=final_from,
+    )
+    new_draft_id = result.get("draft_id", "")
+    _persist_draft_source(
+        new_draft_id,
+        dataclasses.replace(
+            source,
+            body=final_body,
+            attachment_names=(
+                source.attachment_names
+                if attachment_paths is None
+                else [Path(p).name for p in attachment_paths]
+            ),
+        ),
+    )
+    warning = _retire_old_draft(
+        draft_id, store, new_draft_id=new_draft_id, sent=False,
+    )
+    operation_logger.log_operation(
+        "update_draft",
+        {
+            "old_draft_id": draft_id,
+            "new_draft_id": new_draft_id,
+            "old_draft_removed": warning is None,
+            "to": final_to,
+            "cc": final_cc,
+            "bcc": final_bcc,
+            "subject": final_subject,
+            "from_account": final_from,
+        },
+        "success",
+    )
+    response: dict[str, Any] = {
+        "success": True,
+        "draft_id": new_draft_id,
+        "sent_message_id": result.get("sent_message_id", ""),
+        "details": {"seed_kind": source.seed_kind, "send_now": False},
+    }
+    if warning is not None:
+        response["warning"] = warning
+    return response
 
 
 @mcp.tool()
+@envelope
 def draft_delete(draft_id: str) -> dict[str, Any]:
     """Delete (move to Trash) an existing draft. No send, no recovery
-    expected — Mail.app moves the draft to Deleted Messages.
+    expected — Mail.app moves the draft to Deleted Messages and no longer
+    treats it as editable. No confirmation (recoverable from Trash) and
+    no rate limit (local operation).
 
     Args:
         draft_id: Existing draft to delete.
 
     Returns:
-        ``{"success": True}`` on a clean delete; error response if the
-        draft does not exist.
+        ``{"success": True, "draft_id": "<id>"}`` on a clean delete; an
+        error response if the draft does not exist.
     """
-    return delete_draft(draft_id)
+    # A draft id names a draft in any account; read which before
+    # acting, so test mode can keep the delete in the test account.
+    state = mail.get_draft_state(draft_id)
+    if refused := check_test_mode_safety("delete_draft", account=_draft_account(state)):
+        return refused
+    mail.delete_draft(draft_id)
+    _get_draft_state_store().delete(draft_id)
+    operation_logger.log_operation(
+        "delete_draft", {"draft_id": draft_id, "account": state.get("account")},
+        "success",
+    )
+    return {"success": True, "draft_id": draft_id}
 
 
+@_in_tool_threadpool
 @mcp.tool()
-async def draft_send(
+@envelope
+def draft_send(
     draft_id: str,
     ctx: Context | None = None,
 ) -> dict[str, Any]:
-    """Send an existing draft. THIS IS THE ONLY SEND TOOL.
+    """Send an existing draft. The one send from a draft.
 
     Hard policy gate: every recipient (to/cc/bcc) on the draft must
     match the outbound allowlist (see outbound_allowlist.py). If any
@@ -2867,14 +2559,15 @@ async def draft_send(
     open Mail.app and send/discard manually.
 
     Off-list recipients are detected BEFORE any destructive operation,
-    so a blocked ``draft_send`` is a pure no-op on Mail.app state.
+    so a blocked ``draft_send`` is a pure no-op on Mail.app state. The
+    draft is rebuilt and sent, then removed; on a reply or forward only
+    the caller's own text and attachments are handed back to Mail, as
+    ``draft_update`` keeps them.
 
     Args:
         draft_id: Id of the saved draft to send.
-        ctx: MCP elicitation context (optional). If provided and
-            recipients are allowlisted, the client may be asked to
-            confirm. Clients without elicitation support (e.g. Cowork)
-            can omit this — allowlisted sends proceed without prompting.
+        ctx: MCP context, supplied by the server; used to ask the user
+            to confirm a send the allowlist does not already cover.
 
     Returns:
         On success: ``{"success": True, "sent_message_id": "",
@@ -2889,58 +2582,88 @@ async def draft_send(
         >>> draft_send(draft_id="EFGH")
         {"success": True, "sent_message_id": "", "draft_id": ""}
     """
-    refusal = await _draft_send_refusal(draft_id)
-    if refusal:
-        return refusal
+    state = mail.get_draft_state(draft_id)
+    to, cc, bcc = (list(state.get(group) or []) for group in ("to", "cc", "bcc"))
+    recipients = to + cc + bcc
+    if not recipients:
+        raise ValueError(
+            "draft_send: draft has no recipients. Add recipients via "
+            "draft_update before sending."
+        )
+    subject: str | None = state.get("subject")
+    if refused := check_test_mode_safety(
+        "update_draft", account=_draft_account(state), recipients=recipients,
+    ):
+        return refused
+    if refused := check_rate_limit(
+        "update_draft", {"draft_id": draft_id, "subject": subject}
+    ):
+        return refused
+    if refused := _draft_send_outbound_refusal(draft_id, recipients):
+        return refused
 
-    # Recipients passed pre-validation. Hand off to the existing
-    # delete-recreate-send path with no field overrides.
-    return await update_draft(
-        draft_id=draft_id,
-        to=None,
-        cc=None,
-        bcc=None,
-        subject=None,
-        body=None,
-        attachment_paths=None,
-        template_name=None,
-        template_vars=None,
-        from_account=None,
+    store = _get_draft_state_store()
+    source = _resolve_draft_source(draft_id, state, store)
+    if refused := _fresh_send_guard(source.seed_kind, source.attachment_names):
+        return refused
+    if refused := _confirm_send(
+        ctx, "update_draft", recipients,
+        _build_draft_send_summary(source.seed_kind, to, cc, bcc, subject, source.body),
+        {"draft_id": draft_id, "send_now": True},
+    ):
+        return refused
+
+    result = _rebuild_draft(
+        draft_id, None,
+        list(state.get("attachment_names") or []), source.attachment_names,
+        seed=source.seed_kind,
+        seed_id=source.seed_id,
+        reply_all=source.reply_all,
+        to=to,
+        cc=cc,
+        bcc=bcc,
+        subject=subject,
+        body=source.body,
+        # A fresh draft goes out through mailto:, which cannot set one.
+        from_account=None if source.seed_kind == "new" else _draft_sender(state),
         send_now=True,
-        ctx=ctx,
     )
+    warning = _retire_old_draft(draft_id, store, new_draft_id="", sent=True)
+    operation_logger.log_operation(
+        "update_draft",
+        {
+            "old_draft_id": draft_id,
+            "old_draft_removed": warning is None,
+            "send_now": True,
+            "to": to,
+            "cc": cc,
+            "bcc": bcc,
+            "subject": subject,
+        },
+        "success",
+    )
+    response: dict[str, Any] = {
+        "success": True,
+        "draft_id": result.get("draft_id", ""),
+        "sent_message_id": result.get("sent_message_id", ""),
+        "details": {"seed_kind": source.seed_kind, "send_now": True},
+    }
+    if warning is not None:
+        response["warning"] = warning
+    return response
 
 
-@_in_tool_threadpool
-def _draft_send_refusal(draft_id: str) -> dict[str, Any] | None:
-    """Why ``draft_send`` must not send this draft, or None.
-
-    Reads the draft's recipients and checks the policy before Mail is
+def _draft_send_outbound_refusal(
+    draft_id: str, recipients: list[str]
+) -> dict[str, Any] | None:
+    """The outbound allowlist gate for ``draft_send``: why these
+    recipients may not be sent to, or None. Checked before Mail is
     touched at all, so an off-list draft gets the typed error from the
     one obvious tool. The connector re-checks on the send itself; that
     is the backstop, not the gate.
     """
     try:
-        state = mail.get_draft_state(draft_id)
-    except Exception as e:
-        return error_response("draft_send", e)
-
-    all_r = (
-        list(state.get("to") or [])
-        + list(state.get("cc") or [])
-        + list(state.get("bcc") or [])
-    )
-    if not all_r:
-        return {
-            "success": False,
-            "error": (
-                "draft_send: draft has no recipients. Add recipients via "
-                "draft_update before sending."
-            ),
-            "error_type": "validation_error",
-        }
-    try:
-        bad = disallowed_recipients(all_r)
+        bad = disallowed_recipients(recipients)
     except OutboundAllowlistUnavailableError as e:
         # FAIL CLOSED, draft intact — the policy itself is unreadable.
         logger.error("draft_send blocked — allowlist unavailable: %s", e)
@@ -2966,7 +2689,6 @@ def _draft_send_refusal(draft_id: str) -> dict[str, Any] | None:
             ),
             "error_type": "outbound_disallowed",
         }
-
     return None
 
 
@@ -3157,18 +2879,20 @@ def email_send_html(
         attachment_paths=attachment_paths, all_recipients=all_recipients,
     ):
         return refused
+    # The account the send goes out under, as far as the caller names it.
+    if refused := check_test_mode_safety(
+        "email_send_html", account=from_account, recipients=all_recipients,
+    ):
+        return refused
+    if refused := check_rate_limit("email_send_html", {"subject": subject, "to": to}):
+        return refused
     summary = _build_draft_send_summary(
         "reply" if reply_to is not None else "new",
         to, cc_list or None, bcc_list or None, subject, body,
     )
-    if refused := _run_send_now_gates(
-        operation="email_send_html",
-        ctx=ctx,
-        recipients=all_recipients,
-        rate_params={"subject": subject, "to": to},
-        summary=summary,
-        elicit_extra={"subject": subject, "to": to},
-        account=from_account,
+    if refused := _confirm_send(
+        ctx, "email_send_html", all_recipients, summary,
+        {"subject": subject, "to": to},
     ):
         return refused
 

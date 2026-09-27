@@ -224,3 +224,70 @@ class TestDraftStateStore:
         # The on-disk JSON shouldn't have reply_all for forward seeds.
         data = json.loads((tmp_path / "160991.json").read_text())
         assert "reply_all" not in data
+
+
+class TestTheRecordKeepsTheCallersOwnText:
+    """A reply or forward is rebuilt from the text its caller wrote, not
+    from what Mail reads back, which already carries the quoted original
+    and would be quoted again. The record keeps that text."""
+
+    def test_the_body_round_trips(self, tmp_path):
+        from apple_mail_mcp.drafts import DraftStateStore, SeedRecord
+
+        store = DraftStateStore(root=tmp_path)
+        store.set_seed(
+            "160991", SeedRecord(seed_kind="forward", seed_id="999", body="note")
+        )
+        seed = store.get_seed("160991")
+        assert seed is not None
+        assert seed.body == "note"
+
+    def test_an_empty_body_is_recorded_as_empty(self, tmp_path):
+        from apple_mail_mcp.drafts import DraftStateStore, SeedRecord
+
+        store = DraftStateStore(root=tmp_path)
+        store.set_seed(
+            "160991", SeedRecord(seed_kind="reply", seed_id="999", body="")
+        )
+        seed = store.get_seed("160991")
+        assert seed is not None
+        assert seed.body == ""
+
+    def test_a_record_written_without_a_body_has_none(self, tmp_path):
+        """A record from before the text was kept says nothing about it,
+        which is not the same as the caller having written nothing."""
+        from apple_mail_mcp.drafts import DraftStateStore
+
+        store = DraftStateStore(root=tmp_path)
+        (tmp_path / "160991.json").write_text(
+            '{"seed_kind": "forward", "seed_id": "999"}'
+        )
+        seed = store.get_seed("160991")
+        assert seed is not None
+        assert seed.body is None
+
+    def test_the_callers_attachment_names_round_trip(self, tmp_path):
+        from apple_mail_mcp.drafts import DraftStateStore, SeedRecord
+
+        store = DraftStateStore(root=tmp_path)
+        store.set_seed(
+            "160991",
+            SeedRecord(
+                seed_kind="forward", seed_id="999", body="",
+                attachment_names=("mine.pdf",),
+            ),
+        )
+        seed = store.get_seed("160991")
+        assert seed is not None
+        assert seed.attachment_names == ("mine.pdf",)
+
+    def test_a_record_written_without_names_has_none(self, tmp_path):
+        from apple_mail_mcp.drafts import DraftStateStore
+
+        store = DraftStateStore(root=tmp_path)
+        (tmp_path / "160991.json").write_text(
+            '{"seed_kind": "forward", "seed_id": "999", "body": "note"}'
+        )
+        seed = store.get_seed("160991")
+        assert seed is not None
+        assert seed.attachment_names is None

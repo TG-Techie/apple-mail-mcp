@@ -366,13 +366,6 @@ def test_a_saved_forward_note_sits_above_the_forwarded_message(
         assert sorted(state["attachment_names"]) == sorted(seed.attachment_names)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "draft_send recreates from the read-back content; fixed by the "
-        "draft-layer rework in server.py"
-    ),
-)
 def test_forward_without_note_via_tool_lifecycle_carries_original_and_attachments(
     loop: Loopback, tmp_path: Path
 ) -> None:
@@ -405,9 +398,7 @@ def test_forward_without_note_via_tool_lifecycle_carries_original_and_attachment
         trash.windows(forward_subject)
         trash.drafts(forward_subject)
         loop.prepare(trash, forward_subject)
-        created = asyncio.run(
-            server.draft_create(forward_of=seed.mail_id, to=[loop.address])
-        )
+        created = server.draft_create(forward_of=seed.mail_id, to=[loop.address])
         assert created["success"] is True, created
         result = asyncio.run(server.draft_send(draft_id=created["draft_id"]))
         assert result["success"] is True, result

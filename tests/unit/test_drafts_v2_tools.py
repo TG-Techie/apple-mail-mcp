@@ -37,8 +37,7 @@ def isolated_drafts(
 
 
 class TestDraftCreate:
-    @pytest.mark.asyncio
-    async def test_returns_draft_id_does_not_send(
+    def test_returns_draft_id_does_not_send(
         self,
         isolated_drafts: None,
         mock_mail: MagicMock,
@@ -48,17 +47,16 @@ class TestDraftCreate:
         mock_mail.create_draft.return_value = {
             "draft_id": "ABCD", "sent_message_id": ""
         }
-        result = await draft_create(
+        result = draft_create(
             to=["alice@example.com"], subject="hi", body="body"
         )
         assert result["success"] is True
         assert result["draft_id"] == "ABCD"
-        # Critical: send_now=False was passed to the underlying impl.
+        # Critical: saving a draft never names a send to the connector.
         kwargs = mock_mail.create_draft.call_args.kwargs
-        assert kwargs["send_now"] is False
+        assert "send_now" not in kwargs
 
-    @pytest.mark.asyncio
-    async def test_offlist_recipients_allowed_on_draft(
+    def test_offlist_recipients_allowed_on_draft(
         self,
         isolated_drafts: None,
         mock_mail: MagicMock,
@@ -76,12 +74,12 @@ class TestDraftCreate:
             "draft_id": "X1", "sent_message_id": ""
         }
         # @other.com is NOT allowlisted; this should still save.
-        result = await draft_create(
+        result = draft_create(
             to=["random@other.com"], subject="hi", body="x"
         )
         assert result["success"] is True
         kwargs = mock_mail.create_draft.call_args.kwargs
-        assert kwargs["send_now"] is False
+        assert "send_now" not in kwargs
 
 
 class TestDraftCreateAttachmentsAreCheckedLikeASend:
@@ -90,13 +88,12 @@ class TestDraftCreateAttachmentsAreCheckedLikeASend:
     the connector is reached. Before this the draft path only checked
     existence, and only inside the connector."""
 
-    @pytest.mark.asyncio
-    async def test_missing_file_fails_before_connector(
+    def test_missing_file_fails_before_connector(
         self, isolated_drafts: None, mock_mail: MagicMock
     ) -> None:
         from apple_mail_mcp.server import draft_create
 
-        result = await draft_create(
+        result = draft_create(
             to=["alice@example.com"], subject="x", body="b",
             attachment_paths=["/nonexistent/nope.pdf"],
         )
@@ -104,15 +101,14 @@ class TestDraftCreateAttachmentsAreCheckedLikeASend:
         assert result["error_type"] == "file_not_found"
         mock_mail.create_draft.assert_not_called()
 
-    @pytest.mark.asyncio
-    async def test_blocked_extension_fails_before_connector(
+    def test_blocked_extension_fails_before_connector(
         self, isolated_drafts: None, mock_mail: MagicMock, tmp_path: Any
     ) -> None:
         from apple_mail_mcp.server import draft_create
 
         f = tmp_path / "installer.exe"
         f.write_bytes(b"MZ")
-        result = await draft_create(
+        result = draft_create(
             to=["alice@example.com"], subject="x", body="b",
             attachment_paths=[str(f)],
         )
@@ -121,8 +117,7 @@ class TestDraftCreateAttachmentsAreCheckedLikeASend:
         assert "installer.exe" in result["error"]
         mock_mail.create_draft.assert_not_called()
 
-    @pytest.mark.asyncio
-    async def test_oversize_fails_before_connector(
+    def test_oversize_fails_before_connector(
         self, isolated_drafts: None, mock_mail: MagicMock, tmp_path: Any,
         monkeypatch: Any,
     ) -> None:
@@ -142,7 +137,7 @@ class TestDraftCreateAttachmentsAreCheckedLikeASend:
             return st
 
         monkeypatch.setattr(type(f), "stat", fake_stat)
-        result = await draft_create(
+        result = draft_create(
             to=["alice@example.com"], subject="x", body="b",
             attachment_paths=[str(f)],
         )
@@ -151,8 +146,7 @@ class TestDraftCreateAttachmentsAreCheckedLikeASend:
         assert "25" in result["error"]
         mock_mail.create_draft.assert_not_called()
 
-    @pytest.mark.asyncio
-    async def test_an_ordinary_file_still_reaches_the_connector(
+    def test_an_ordinary_file_still_reaches_the_connector(
         self, isolated_drafts: None, mock_mail: MagicMock, tmp_path: Any
     ) -> None:
         from pathlib import Path
@@ -164,7 +158,7 @@ class TestDraftCreateAttachmentsAreCheckedLikeASend:
         mock_mail.create_draft.return_value = {
             "draft_id": "ABCD", "sent_message_id": ""
         }
-        result = await draft_create(
+        result = draft_create(
             to=["alice@example.com"], subject="x", body="b",
             attachment_paths=[str(f)],
         )
@@ -187,8 +181,7 @@ class TestDraftUpdateAttachmentsAreCheckedLikeASend:
         "in_reply_to": "", "references": "", "attachment_names": [],
     }
 
-    @pytest.mark.asyncio
-    async def test_blocked_extension_is_refused_and_the_draft_is_untouched(
+    def test_blocked_extension_is_refused_and_the_draft_is_untouched(
         self, isolated_drafts: None, mock_mail: MagicMock, tmp_path: Any
     ) -> None:
         from apple_mail_mcp.server import draft_update
@@ -196,21 +189,20 @@ class TestDraftUpdateAttachmentsAreCheckedLikeASend:
         mock_mail.get_draft_state.return_value = dict(self._STATE)
         f = tmp_path / "payload.sh"
         f.write_text("#!/bin/sh\n")
-        result = await draft_update(draft_id="OLD", attachment_paths=[str(f)])
+        result = draft_update(draft_id="OLD", attachment_paths=[str(f)])
         assert result["success"] is False
         assert result["error_type"] == "validation_error"
         assert "payload.sh" in result["error"]
         mock_mail.delete_draft.assert_not_called()
         mock_mail.create_draft.assert_not_called()
 
-    @pytest.mark.asyncio
-    async def test_missing_file_is_refused_and_the_draft_is_untouched(
+    def test_missing_file_is_refused_and_the_draft_is_untouched(
         self, isolated_drafts: None, mock_mail: MagicMock
     ) -> None:
         from apple_mail_mcp.server import draft_update
 
         mock_mail.get_draft_state.return_value = dict(self._STATE)
-        result = await draft_update(
+        result = draft_update(
             draft_id="OLD", attachment_paths=["/nonexistent/nope.pdf"]
         )
         assert result["success"] is False
@@ -218,8 +210,7 @@ class TestDraftUpdateAttachmentsAreCheckedLikeASend:
         mock_mail.delete_draft.assert_not_called()
         mock_mail.create_draft.assert_not_called()
 
-    @pytest.mark.asyncio
-    async def test_clearing_attachments_needs_no_files(
+    def test_clearing_attachments_needs_no_files(
         self, isolated_drafts: None, mock_mail: MagicMock
     ) -> None:
         from apple_mail_mcp.server import draft_update
@@ -228,12 +219,11 @@ class TestDraftUpdateAttachmentsAreCheckedLikeASend:
         mock_mail.create_draft.return_value = {
             "draft_id": "NEW", "sent_message_id": ""
         }
-        result = await draft_update(draft_id="OLD", attachment_paths=[])
+        result = draft_update(draft_id="OLD", attachment_paths=[])
         assert result["success"] is True
         assert mock_mail.create_draft.call_args.kwargs["attachment_paths"] == []
 
-    @pytest.mark.asyncio
-    async def test_carried_over_attachments_are_not_rechecked(
+    def test_carried_over_attachments_are_not_rechecked(
         self, isolated_drafts: None, mock_mail: MagicMock, tmp_path: Any
     ) -> None:
         from pathlib import Path
@@ -248,7 +238,7 @@ class TestDraftUpdateAttachmentsAreCheckedLikeASend:
         mock_mail.create_draft.return_value = {
             "draft_id": "NEW", "sent_message_id": ""
         }
-        result = await draft_update(draft_id="OLD", body="revised")
+        result = draft_update(draft_id="OLD", body="revised")
         assert result["success"] is True
         assert mock_mail.create_draft.call_args.kwargs["attachment_paths"] == extracted
 
@@ -256,12 +246,14 @@ class TestDraftUpdateAttachmentsAreCheckedLikeASend:
 class TestAFreshSendCannotChooseTheSender:
     """A fresh message sent immediately goes out through Mail's mailto:
     handler, which composes from Mail's default account and offers no way
-    to pick another. Until now from_account was accepted on those paths
-    and silently ignored: the mail went out from the wrong account and
-    the call reported success. Now the call is refused before anything
-    is composed, deleted, or put in front of the user to confirm. Replies
-    set the sender on the outgoing message and keep honouring it; a
-    saved draft keeps its sender for a human to send from Mail.app."""
+    to pick another, and carries no attachments. Until now from_account
+    was accepted on those paths and silently ignored: the mail went out
+    from the wrong account and the call reported success. Now
+    email_send_html refuses it before anything is composed, and
+    draft_send refuses a fresh draft with attachments before anything is
+    deleted or put in front of the user to confirm. Replies set the
+    sender on the outgoing message and keep honouring it; a saved draft
+    keeps its sender for a human to send from Mail.app."""
 
     _FRESH_STATE = {
         "draft_id": "OLD",
@@ -302,45 +294,32 @@ class TestAFreshSendCannotChooseTheSender:
         assert mock_mail._send_html_email.call_args.kwargs["from_account"] == "Work"
 
     @pytest.mark.asyncio
-    async def test_draft_create_send_now_fresh_is_refused_before_the_prompt(
-        self, isolated_drafts: None, mock_mail: MagicMock
+    async def test_draft_send_fresh_with_attachments_is_refused_before_the_prompt(
+        self,
+        isolated_drafts: None,
+        mock_mail: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        from apple_mail_mcp.server import create_draft
+        """The other limit of the mailto: path. Before this the user
+        confirmed the send and the connector then refused it."""
+        from apple_mail_mcp import server as server_mod
+        from apple_mail_mcp.server import draft_send
 
+        # Without the allowlist bypass the send would be put to the user.
+        monkeypatch.setattr(server_mod, "all_recipients_allowed", lambda r: False)
+        state = dict(self._FRESH_STATE)
+        state["attachment_names"] = ["report.pdf"]
+        mock_mail.get_draft_state.return_value = state
         ctx = MagicMock()
         ctx.elicit = AsyncMock()
-        result = await create_draft(
-            to=["alice@example.com"], subject="x", body="b",
-            from_account="Work", send_now=True, ctx=ctx,
-        )
-        assert result["success"] is False
-        assert result["error_type"] == "from_account_unsupported"
-        ctx.elicit.assert_not_called()
-        mock_mail.create_draft.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_draft_create_send_now_fresh_with_attachments_is_refused_before_the_prompt(
-        self, isolated_drafts: None, mock_mail: MagicMock, tmp_path: Any
-    ) -> None:
-        """Same guard, other limit of the mailto: path. Before this the
-        user confirmed the send and the connector then refused it."""
-        from apple_mail_mcp.server import create_draft
-
-        f = tmp_path / "report.pdf"
-        f.write_bytes(b"%PDF-1.4 fake")
-        ctx = MagicMock()
-        ctx.elicit = AsyncMock()
-        result = await create_draft(
-            to=["alice@example.com"], subject="x", body="b",
-            attachment_paths=[str(f)], send_now=True, ctx=ctx,
-        )
+        result = await draft_send(draft_id="OLD", ctx=ctx)
         assert result["success"] is False
         assert result["error_type"] == "attachments_unsupported"
         ctx.elicit.assert_not_called()
         mock_mail.create_draft.assert_not_called()
+        mock_mail.delete_draft.assert_not_called()
 
-    @pytest.mark.asyncio
-    async def test_draft_create_saved_keeps_the_sender(
+    def test_draft_create_saved_keeps_the_sender(
         self, isolated_drafts: None, mock_mail: MagicMock
     ) -> None:
         from apple_mail_mcp.server import draft_create
@@ -348,33 +327,14 @@ class TestAFreshSendCannotChooseTheSender:
         mock_mail.create_draft.return_value = {
             "draft_id": "ABCD", "sent_message_id": ""
         }
-        result = await draft_create(
+        result = draft_create(
             to=["alice@example.com"], subject="x", body="b",
             from_account="Work",
         )
         assert result["success"] is True
         assert mock_mail.create_draft.call_args.kwargs["from_account"] == "Work"
 
-    @pytest.mark.asyncio
-    async def test_draft_update_send_now_fresh_is_refused_and_the_draft_is_untouched(
-        self, isolated_drafts: None, mock_mail: MagicMock
-    ) -> None:
-        from apple_mail_mcp.server import update_draft
-
-        mock_mail.get_draft_state.return_value = dict(self._FRESH_STATE)
-        ctx = MagicMock()
-        ctx.elicit = AsyncMock()
-        result = await update_draft(
-            draft_id="OLD", from_account="Work", send_now=True, ctx=ctx,
-        )
-        assert result["success"] is False
-        assert result["error_type"] == "from_account_unsupported"
-        ctx.elicit.assert_not_called()
-        mock_mail.delete_draft.assert_not_called()
-        mock_mail.create_draft.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_draft_update_saved_keeps_the_sender(
+    def test_draft_update_saved_keeps_the_sender(
         self, isolated_drafts: None, mock_mail: MagicMock
     ) -> None:
         from apple_mail_mcp.server import draft_update
@@ -383,13 +343,13 @@ class TestAFreshSendCannotChooseTheSender:
         mock_mail.create_draft.return_value = {
             "draft_id": "NEW", "sent_message_id": ""
         }
-        result = await draft_update(draft_id="OLD", from_account="Work")
+        result = draft_update(draft_id="OLD", from_account="Work")
         assert result["success"] is True
         assert mock_mail.create_draft.call_args.kwargs["from_account"] == "Work"
 
 
 class TestDraftUpdateKeepsTheDraftInItsAccount:
-    """update_draft is delete-and-recreate. Before this the recreated draft
+    """draft_update is delete-and-recreate. Before this the recreated draft
     was built with the caller's from_account only, so a draft saved from
     account X and then updated without naming X silently moved to Mail's
     default account. Now the draft's own sender, read back from Mail, is
@@ -403,32 +363,29 @@ class TestDraftUpdateKeepsTheDraftInItsAccount:
         "sender": "Agent <agent@icloud.com>",
     }
 
-    @pytest.mark.asyncio
-    async def test_carries_the_existing_sender_over(
+    def test_carries_the_existing_sender_over(
         self, isolated_drafts: None, mock_mail: MagicMock
     ) -> None:
         from apple_mail_mcp.server import draft_update
 
         mock_mail.get_draft_state.return_value = dict(self._STATE)
         mock_mail.create_draft.return_value = {"draft_id": "NEW", "sent_message_id": ""}
-        result = await draft_update(draft_id="OLD", body="revised")
+        result = draft_update(draft_id="OLD", body="revised")
         assert result["success"] is True
         kwargs = mock_mail.create_draft.call_args.kwargs
         assert kwargs["from_account"] == "Agent <agent@icloud.com>"
 
-    @pytest.mark.asyncio
-    async def test_an_explicit_override_wins(
+    def test_an_explicit_override_wins(
         self, isolated_drafts: None, mock_mail: MagicMock
     ) -> None:
         from apple_mail_mcp.server import draft_update
 
         mock_mail.get_draft_state.return_value = dict(self._STATE)
         mock_mail.create_draft.return_value = {"draft_id": "NEW", "sent_message_id": ""}
-        await draft_update(draft_id="OLD", from_account="Work")
+        draft_update(draft_id="OLD", from_account="Work")
         assert mock_mail.create_draft.call_args.kwargs["from_account"] == "Work"
 
-    @pytest.mark.asyncio
-    async def test_a_draft_with_no_sender_recorded_is_left_to_mail(
+    def test_a_draft_with_no_sender_recorded_is_left_to_mail(
         self, isolated_drafts: None, mock_mail: MagicMock
     ) -> None:
         from apple_mail_mcp.server import draft_update
@@ -437,7 +394,7 @@ class TestDraftUpdateKeepsTheDraftInItsAccount:
         state["sender"] = ""
         mock_mail.get_draft_state.return_value = state
         mock_mail.create_draft.return_value = {"draft_id": "NEW", "sent_message_id": ""}
-        await draft_update(draft_id="OLD", body="revised")
+        draft_update(draft_id="OLD", body="revised")
         assert mock_mail.create_draft.call_args.kwargs["from_account"] is None
 
     @pytest.mark.asyncio
@@ -447,10 +404,10 @@ class TestDraftUpdateKeepsTheDraftInItsAccount:
         """Reply sends go through the AppleScript compose path, which sets
         the sender; the carried-over sender reaches it."""
         from apple_mail_mcp.drafts import SeedRecord
-        from apple_mail_mcp.server import _get_draft_state_store, update_draft
+        from apple_mail_mcp.server import _get_draft_state_store, draft_send
 
         _get_draft_state_store().set_seed(
-            "OLD", SeedRecord(seed_kind="reply", seed_id="msg-1")
+            "OLD", SeedRecord(seed_kind="reply", seed_id="msg-1", body="x")
         )
         state = dict(self._STATE)
         state["in_reply_to"] = "<orig@example.com>"
@@ -458,7 +415,7 @@ class TestDraftUpdateKeepsTheDraftInItsAccount:
         mock_mail.create_draft.return_value = {"draft_id": "", "sent_message_id": ""}
         ctx = MagicMock()
         ctx.elicit = AsyncMock()
-        result = await update_draft(draft_id="OLD", send_now=True, ctx=ctx)
+        result = await draft_send(draft_id="OLD", ctx=ctx)
         assert result["success"] is True, result
         assert mock_mail.create_draft.call_args.kwargs["from_account"] == (
             "Agent <agent@icloud.com>"
@@ -472,20 +429,19 @@ class TestDraftUpdateKeepsTheDraftInItsAccount:
         sender to set. The carried-over sender is not passed there — the
         connector would refuse it — and whether that draft's sender matches
         what mailto: will use is not knowable here (DESIGN-QUEUE)."""
-        from apple_mail_mcp.server import update_draft
+        from apple_mail_mcp.server import draft_send
 
         mock_mail.get_draft_state.return_value = dict(self._STATE)
         mock_mail.create_draft.return_value = {"draft_id": "", "sent_message_id": ""}
         ctx = MagicMock()
         ctx.elicit = AsyncMock()
-        result = await update_draft(draft_id="OLD", send_now=True, ctx=ctx)
+        result = await draft_send(draft_id="OLD", ctx=ctx)
         assert result["success"] is True, result
         assert mock_mail.create_draft.call_args.kwargs["from_account"] is None
 
 
 class TestDraftUpdate:
-    @pytest.mark.asyncio
-    async def test_returns_new_draft_id(
+    def test_returns_new_draft_id(
         self,
         isolated_drafts: None,
         mock_mail: MagicMock,
@@ -501,12 +457,12 @@ class TestDraftUpdate:
         mock_mail.create_draft.return_value = {
             "draft_id": "NEW", "sent_message_id": ""
         }
-        result = await draft_update(draft_id="OLD", body="revised")
+        result = draft_update(draft_id="OLD", body="revised")
         assert result["success"] is True
         assert result["draft_id"] == "NEW"
         assert result["draft_id"] != "OLD"
         kwargs = mock_mail.create_draft.call_args.kwargs
-        assert kwargs["send_now"] is False
+        assert "send_now" not in kwargs
 
 
 class TestDraftDelete:
@@ -582,8 +538,8 @@ class TestDraftSend:
         mock_mail: MagicMock,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """All recipients on-list → send proceeds (delete-recreate-send
-        via update_draft path)."""
+        """All recipients on-list → send proceeds (recreate-send, then
+        the old draft is removed)."""
         monkeypatch.delenv(
             "APPLE_MAIL_MCP_SEND_ELICITATION_ALLOWLIST", raising=False
         )
@@ -688,6 +644,299 @@ class TestDraftSend:
         mock_mail.extract_draft_attachments.assert_not_called()
 
 
+class TestAReplyOrForwardIsRebuiltFromTheCallersOwnText:
+    """draft_update and draft_send rebuild a draft through the connector,
+    which puts the body it is given above the original it quotes itself.
+    What Mail reads back from a saved reply or forward already carries
+    that quote, so handing it back sent the original twice: measured on
+    a forward created without a body and then sent, which delivered the
+    original's text unquoted at the top, a copy of Mail's forward block,
+    and the quoted original below. The body handed back is the caller's
+    own text, kept in the draft's record; only a draft with no record
+    (created outside this server) falls back to the read-back content."""
+
+    _READ_BACK = (
+        "note\n\n---------- Forwarded message ----------\n"
+        "From: someone@example.com\n\nthe original text"
+    )
+
+    def _state(self, **overrides: Any) -> dict[str, Any]:
+        state: dict[str, Any] = {
+            "to": ["alice@example.com"], "cc": [], "bcc": [],
+            "subject": "Fwd: hi", "body": self._READ_BACK,
+            "in_reply_to": "", "references": "", "attachment_names": [],
+            "account": None, "sender": "",
+        }
+        state.update(overrides)
+        return state
+
+    def _create_forward(self, mock_mail: MagicMock, **kwargs: Any) -> str:
+        from apple_mail_mcp.server import draft_create
+
+        mock_mail.create_draft.return_value = {"draft_id": "D1", "sent_message_id": ""}
+        created = draft_create(forward_of="msg-1", to=["alice@example.com"], **kwargs)
+        assert created["success"] is True, created
+        return str(created["draft_id"])
+
+    async def test_a_forward_created_with_a_note_sends_the_note(
+        self, isolated_drafts: None, mock_mail: MagicMock
+    ) -> None:
+        from apple_mail_mcp.server import draft_send
+
+        draft_id = self._create_forward(mock_mail, body="note")
+        mock_mail.get_draft_state.return_value = self._state()
+        mock_mail.create_draft.return_value = {"draft_id": "", "sent_message_id": ""}
+        result = await draft_send(draft_id=draft_id)
+        assert result["success"] is True, result
+        kwargs = mock_mail.create_draft.call_args.kwargs
+        assert kwargs["seed"] == "forward"
+        assert kwargs["seed_id"] == "msg-1"
+        assert kwargs["send_now"] is True
+        assert kwargs["body"] == "note"
+
+    async def test_a_forward_created_without_a_body_sends_none(
+        self, isolated_drafts: None, mock_mail: MagicMock
+    ) -> None:
+        from apple_mail_mcp.server import draft_send
+
+        draft_id = self._create_forward(mock_mail)
+        mock_mail.get_draft_state.return_value = self._state(body="the original text")
+        mock_mail.create_draft.return_value = {"draft_id": "", "sent_message_id": ""}
+        result = await draft_send(draft_id=draft_id)
+        assert result["success"] is True, result
+        assert mock_mail.create_draft.call_args.kwargs["body"] == ""
+
+    async def test_an_update_that_leaves_the_body_keeps_the_callers_text(
+        self, isolated_drafts: None, mock_mail: MagicMock
+    ) -> None:
+        from apple_mail_mcp.server import draft_send, draft_update
+
+        draft_id = self._create_forward(mock_mail, body="note")
+        mock_mail.get_draft_state.return_value = self._state()
+        mock_mail.create_draft.return_value = {"draft_id": "D2", "sent_message_id": ""}
+        updated = draft_update(draft_id=draft_id, subject="Fwd: renamed")
+        assert updated["success"] is True, updated
+        assert mock_mail.create_draft.call_args.kwargs["body"] == "note"
+
+        # The record moved to the new id with the text, so a send from it
+        # still hands back only the caller's text.
+        mock_mail.create_draft.return_value = {"draft_id": "", "sent_message_id": ""}
+        sent = await draft_send(draft_id=updated["draft_id"])
+        assert sent["success"] is True, sent
+        assert mock_mail.create_draft.call_args.kwargs["body"] == "note"
+
+    def test_an_update_with_a_new_body_records_it(
+        self, isolated_drafts: None, mock_mail: MagicMock
+    ) -> None:
+        from apple_mail_mcp.server import _get_draft_state_store, draft_update
+
+        draft_id = self._create_forward(mock_mail, body="note")
+        mock_mail.get_draft_state.return_value = self._state()
+        mock_mail.create_draft.return_value = {"draft_id": "D2", "sent_message_id": ""}
+        draft_update(draft_id=draft_id, body="revised note")
+        assert mock_mail.create_draft.call_args.kwargs["body"] == "revised note"
+        seed = _get_draft_state_store().get_seed("D2")
+        assert seed is not None
+        assert seed.body == "revised note"
+
+    async def test_a_draft_with_no_record_falls_back_to_what_mail_reads_back(
+        self, isolated_drafts: None, mock_mail: MagicMock
+    ) -> None:
+        """Created outside this server: the reply is found by its
+        In-Reply-To header, and the only body there is is the read-back."""
+        from apple_mail_mcp.server import draft_send
+
+        mock_mail.get_draft_state.return_value = self._state(
+            subject="Re: hi", in_reply_to="<orig@example.com>",
+        )
+        mock_mail.find_message_by_message_id.return_value = "msg-9"
+        mock_mail.create_draft.return_value = {"draft_id": "", "sent_message_id": ""}
+        result = await draft_send(draft_id="EXT1")
+        assert result["success"] is True, result
+        kwargs = mock_mail.create_draft.call_args.kwargs
+        assert kwargs["seed"] == "reply"
+        assert kwargs["seed_id"] == "msg-9"
+        assert kwargs["body"] == self._READ_BACK
+
+    async def test_a_record_that_predates_the_text_falls_back_too(
+        self, isolated_drafts: None, mock_mail: MagicMock
+    ) -> None:
+        from apple_mail_mcp.drafts import SeedRecord
+        from apple_mail_mcp.server import _get_draft_state_store, draft_send
+
+        _get_draft_state_store().set_seed(
+            "OLD1", SeedRecord(seed_kind="forward", seed_id="msg-1")
+        )
+        mock_mail.get_draft_state.return_value = self._state()
+        mock_mail.create_draft.return_value = {"draft_id": "", "sent_message_id": ""}
+        result = await draft_send(draft_id="OLD1")
+        assert result["success"] is True, result
+        assert mock_mail.create_draft.call_args.kwargs["body"] == self._READ_BACK
+
+    async def test_a_fresh_draft_is_sent_with_what_mail_reads_back(
+        self, isolated_drafts: None, mock_mail: MagicMock
+    ) -> None:
+        """A fresh draft quotes nothing, so its read-back content is its
+        whole body."""
+        from apple_mail_mcp.server import draft_send
+
+        mock_mail.get_draft_state.return_value = self._state(
+            subject="hi", body="the whole body",
+        )
+        mock_mail.create_draft.return_value = {"draft_id": "", "sent_message_id": ""}
+        result = await draft_send(draft_id="F1")
+        assert result["success"] is True, result
+        kwargs = mock_mail.create_draft.call_args.kwargs
+        assert kwargs["seed"] == "new"
+        assert kwargs["body"] == "the whole body"
+
+
+class TestAReplyOrForwardCarriesOnlyTheCallersAttachments:
+    """Mail's forward verb carries the original's attachments itself, so a
+    rebuild of a forward that re-attached everything Mail reads back would
+    add them a second time. The record keeps the names of the files the
+    caller attached, and a rebuild of a reply or forward re-attaches
+    exactly those. A fresh draft carries nothing of Mail's, so all its
+    attachments are the caller's."""
+
+    def _state(self, **overrides: Any) -> dict[str, Any]:
+        state: dict[str, Any] = {
+            "to": ["alice@example.com"], "cc": [], "bcc": [],
+            "subject": "Fwd: hi", "body": "note\n\nforwarded",
+            "in_reply_to": "", "references": "",
+            "attachment_names": ["original.pdf", "mine.pdf"],
+            "account": None, "sender": "",
+        }
+        state.update(overrides)
+        return state
+
+    @staticmethod
+    def _extract_as_mail_does(
+        draft_id: str, names: list[str], dest: Any
+    ) -> list[Any]:
+        """The connector saves by position into ``<dest>/<i>/<name>``."""
+        out = []
+        for i, name in enumerate(names):
+            (dest / str(i)).mkdir(parents=True, exist_ok=True)
+            path = dest / str(i) / name
+            path.write_bytes(b"x")
+            out.append(path)
+        return out
+
+    def _create_forward(
+        self, mock_mail: MagicMock, attachment_paths: list[str]
+    ) -> str:
+        from apple_mail_mcp.server import draft_create
+
+        mock_mail.create_draft.return_value = {"draft_id": "D1", "sent_message_id": ""}
+        created = draft_create(
+            forward_of="msg-1", to=["alice@example.com"], body="note",
+            attachment_paths=attachment_paths,
+        )
+        assert created["success"] is True, created
+        return str(created["draft_id"])
+
+    async def test_a_send_re_attaches_only_what_the_caller_added(
+        self, isolated_drafts: None, mock_mail: MagicMock, tmp_path: Any
+    ) -> None:
+        from apple_mail_mcp.server import draft_send
+
+        mine = tmp_path / "mine.pdf"
+        mine.write_bytes(b"%PDF")
+        draft_id = self._create_forward(mock_mail, [str(mine)])
+        mock_mail.get_draft_state.return_value = self._state()
+        mock_mail.extract_draft_attachments.side_effect = self._extract_as_mail_does
+        mock_mail.create_draft.return_value = {"draft_id": "", "sent_message_id": ""}
+
+        result = await draft_send(draft_id=draft_id)
+        assert result["success"] is True, result
+        # Saved by position, so every attachment is read out; only the
+        # caller's goes back.
+        assert mock_mail.extract_draft_attachments.call_args.args[1] == [
+            "original.pdf", "mine.pdf",
+        ]
+        sent_paths = mock_mail.create_draft.call_args.kwargs["attachment_paths"]
+        assert [p.name for p in sent_paths] == ["mine.pdf"]
+
+    async def test_a_forward_the_caller_attached_nothing_to_re_attaches_nothing(
+        self, isolated_drafts: None, mock_mail: MagicMock
+    ) -> None:
+        from apple_mail_mcp.server import draft_send
+
+        draft_id = self._create_forward(mock_mail, [])
+        mock_mail.get_draft_state.return_value = self._state(
+            attachment_names=["original.pdf"],
+        )
+        mock_mail.create_draft.return_value = {"draft_id": "", "sent_message_id": ""}
+
+        result = await draft_send(draft_id=draft_id)
+        assert result["success"] is True, result
+        mock_mail.extract_draft_attachments.assert_not_called()
+        assert mock_mail.create_draft.call_args.kwargs["attachment_paths"] is None
+
+    def test_an_update_that_leaves_attachments_carries_only_the_callers(
+        self, isolated_drafts: None, mock_mail: MagicMock, tmp_path: Any
+    ) -> None:
+        from apple_mail_mcp.server import _get_draft_state_store, draft_update
+
+        mine = tmp_path / "mine.pdf"
+        mine.write_bytes(b"%PDF")
+        draft_id = self._create_forward(mock_mail, [str(mine)])
+        mock_mail.get_draft_state.return_value = self._state()
+        mock_mail.extract_draft_attachments.side_effect = self._extract_as_mail_does
+        mock_mail.create_draft.return_value = {"draft_id": "D2", "sent_message_id": ""}
+
+        updated = draft_update(draft_id=draft_id, body="revised")
+        assert updated["success"] is True, updated
+        sent_paths = mock_mail.create_draft.call_args.kwargs["attachment_paths"]
+        assert [p.name for p in sent_paths] == ["mine.pdf"]
+        seed = _get_draft_state_store().get_seed("D2")
+        assert seed is not None
+        assert seed.attachment_names == ("mine.pdf",)
+
+    def test_an_update_that_replaces_attachments_records_the_new_ones(
+        self, isolated_drafts: None, mock_mail: MagicMock, tmp_path: Any
+    ) -> None:
+        from apple_mail_mcp.server import _get_draft_state_store, draft_update
+
+        draft_id = self._create_forward(mock_mail, [])
+        other = tmp_path / "other.pdf"
+        other.write_bytes(b"%PDF")
+        mock_mail.get_draft_state.return_value = self._state(
+            attachment_names=["original.pdf"],
+        )
+        mock_mail.create_draft.return_value = {"draft_id": "D2", "sent_message_id": ""}
+
+        draft_update(draft_id=draft_id, attachment_paths=[str(other)])
+        mock_mail.extract_draft_attachments.assert_not_called()
+        seed = _get_draft_state_store().get_seed("D2")
+        assert seed is not None
+        assert seed.attachment_names == ("other.pdf",)
+
+    async def test_an_attachment_that_cannot_be_carried_over_refuses_the_send(
+        self, isolated_drafts: None, mock_mail: MagicMock, tmp_path: Any
+    ) -> None:
+        """Mail no longer lists a file the caller attached under the name
+        it was recorded with, or saving it out failed: sending without it
+        would drop it quietly, so nothing is sent and the draft stays."""
+        from apple_mail_mcp.server import draft_send
+
+        mine = tmp_path / "mine.pdf"
+        mine.write_bytes(b"%PDF")
+        draft_id = self._create_forward(mock_mail, [str(mine)])
+        mock_mail.get_draft_state.return_value = self._state(
+            attachment_names=["original.pdf", "renamed.pdf"],
+        )
+        mock_mail.extract_draft_attachments.side_effect = self._extract_as_mail_does
+
+        result = await draft_send(draft_id=draft_id)
+        assert result["success"] is False
+        assert result["error_type"] == "draft_error"
+        assert "mine.pdf" in result["error"]
+        mock_mail.create_draft.assert_called_once()  # the draft_create above
+        mock_mail.delete_draft.assert_not_called()
+
+
 class TestAFailureLeavesTheDraftWhereItWas:
     """draft_update and draft_send are delete-and-recreate. Before this the
     old draft was deleted first, so a failure in the recreate or the send
@@ -731,8 +980,7 @@ class TestAFailureLeavesTheDraftWhereItWas:
         mock_mail.delete_draft.assert_not_called()
         assert _get_draft_state_store().get_seed("ABCD") is not None
 
-    @pytest.mark.asyncio
-    async def test_an_update_that_fails_leaves_the_draft_in_drafts(
+    def test_an_update_that_fails_leaves_the_draft_in_drafts(
         self, isolated_drafts: None, mock_mail: MagicMock
     ) -> None:
         from apple_mail_mcp.exceptions import MailMessageNotFoundError
@@ -742,20 +990,19 @@ class TestAFailureLeavesTheDraftWhereItWas:
         mock_mail.create_draft.side_effect = MailMessageNotFoundError(
             "no message with id 'msg-1'"
         )
-        result = await draft_update(draft_id="ABCD", body="revised")
+        result = draft_update(draft_id="ABCD", body="revised")
         assert result["success"] is False
         assert result["error_type"] == "message_not_found"
         mock_mail.delete_draft.assert_not_called()
 
-    @pytest.mark.asyncio
-    async def test_the_old_draft_goes_only_after_the_new_one_exists(
+    def test_the_old_draft_goes_only_after_the_new_one_exists(
         self, isolated_drafts: None, mock_mail: MagicMock
     ) -> None:
         from apple_mail_mcp.server import draft_update
 
         mock_mail.get_draft_state.return_value = dict(self._STATE)
         mock_mail.create_draft.return_value = {"draft_id": "EFGH", "sent_message_id": ""}
-        result = await draft_update(draft_id="ABCD", body="revised")
+        result = draft_update(draft_id="ABCD", body="revised")
         assert result["success"] is True
         assert result["draft_id"] == "EFGH"
         names = [c[0] for c in mock_mail.mock_calls]
@@ -779,8 +1026,7 @@ class TestAFailureLeavesTheDraftWhereItWas:
         assert "Drafts" in result["warning"]
         assert "Mail busy" in result["warning"]
 
-    @pytest.mark.asyncio
-    async def test_an_old_draft_already_gone_is_reported_not_failed(
+    def test_an_old_draft_already_gone_is_reported_not_failed(
         self, isolated_drafts: None, mock_mail: MagicMock
     ) -> None:
         from apple_mail_mcp.exceptions import MailDraftNotFoundError
@@ -789,7 +1035,7 @@ class TestAFailureLeavesTheDraftWhereItWas:
         mock_mail.get_draft_state.return_value = dict(self._STATE)
         mock_mail.create_draft.return_value = {"draft_id": "EFGH", "sent_message_id": ""}
         mock_mail.delete_draft.side_effect = MailDraftNotFoundError("gone")
-        result = await draft_update(draft_id="ABCD", body="revised")
+        result = draft_update(draft_id="ABCD", body="revised")
         assert result["success"] is True
         assert result["draft_id"] == "EFGH"
         assert "ABCD" in result["warning"]
@@ -1148,13 +1394,12 @@ class TestANamedSenderIsConfinedInTestMode:
         monkeypatch.setenv("MAIL_TEST_MODE", "true")
         monkeypatch.setenv("MAIL_TEST_ACCOUNT", "TestAccount")
 
-    @pytest.mark.asyncio
-    async def test_draft_create_from_another_account_is_refused(
+    def test_draft_create_from_another_account_is_refused(
         self, isolated_drafts: None, mock_mail: MagicMock, test_mode: None,
     ) -> None:
         from apple_mail_mcp.server import draft_create
 
-        result = await draft_create(
+        result = draft_create(
             to=["alice@example.com"], subject="s", body="b",
             from_account="Other",
         )
@@ -1162,8 +1407,7 @@ class TestANamedSenderIsConfinedInTestMode:
         assert result["error_type"] == "safety_violation"
         mock_mail.create_draft.assert_not_called()
 
-    @pytest.mark.asyncio
-    async def test_draft_create_from_the_test_account_proceeds(
+    def test_draft_create_from_the_test_account_proceeds(
         self, isolated_drafts: None, mock_mail: MagicMock, test_mode: None,
     ) -> None:
         from apple_mail_mcp.server import draft_create
@@ -1171,27 +1415,25 @@ class TestANamedSenderIsConfinedInTestMode:
         mock_mail.create_draft.return_value = {
             "draft_id": "NEW", "sent_message_id": "",
         }
-        result = await draft_create(
+        result = draft_create(
             to=["alice@example.com"], subject="s", body="b",
             from_account="TestAccount",
         )
         assert result["success"] is True
 
-    @pytest.mark.asyncio
-    async def test_draft_update_to_another_account_is_refused(
+    def test_draft_update_to_another_account_is_refused(
         self, isolated_drafts: None, mock_mail: MagicMock, test_mode: None,
     ) -> None:
         from apple_mail_mcp.server import draft_update
 
         mock_mail.get_draft_state.return_value = dict(self._STATE)
-        result = await draft_update(draft_id="OLD", from_account="Other")
+        result = draft_update(draft_id="OLD", from_account="Other")
         assert result["success"] is False
         assert result["error_type"] == "safety_violation"
         mock_mail.create_draft.assert_not_called()
         mock_mail.delete_draft.assert_not_called()
 
-    @pytest.mark.asyncio
-    async def test_draft_update_carrying_its_sender_over_is_not_a_reach(
+    def test_draft_update_carrying_its_sender_over_is_not_a_reach(
         self, isolated_drafts: None, mock_mail: MagicMock, test_mode: None,
     ) -> None:
         """The sender read back from Mail is an address, not an account
@@ -1202,7 +1444,7 @@ class TestANamedSenderIsConfinedInTestMode:
         mock_mail.create_draft.return_value = {
             "draft_id": "NEW", "sent_message_id": "",
         }
-        result = await draft_update(draft_id="OLD", body="revised")
+        result = draft_update(draft_id="OLD", body="revised")
         assert result["success"] is True
 
     @pytest.mark.asyncio
@@ -1301,14 +1543,13 @@ class TestADraftIdReachesEveryAccountInTestMode:
         mock_mail.get_draft_state.return_value = self._state("")
         assert draft_delete(draft_id="OLD")["success"] is True
 
-    @pytest.mark.asyncio
-    async def test_update_of_a_draft_in_another_account_is_refused(
+    def test_update_of_a_draft_in_another_account_is_refused(
         self, isolated_drafts: None, mock_mail: MagicMock, test_mode: None,
     ) -> None:
         from apple_mail_mcp.server import draft_update
 
         mock_mail.get_draft_state.return_value = self._state("Work")
-        result = await draft_update(draft_id="OLD", body="revised")
+        result = draft_update(draft_id="OLD", body="revised")
         assert result["success"] is False
         assert result["error_type"] == "safety_violation"
         mock_mail.create_draft.assert_not_called()
