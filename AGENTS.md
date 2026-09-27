@@ -107,7 +107,7 @@ quoted original and a forward's own attachments.
 ## Performance Constraints
 
 - Each `osascript` subprocess call: 100-300ms overhead minimum
-- Search: ~1-5s for typical mailboxes (uses `whose` clauses)
+- Search, AppleScript path: about 1s for a 50-row page, 0.3s for a subject filter that matches nothing (the test account's INBOX, 2026-09-27). No `whose` clauses: it reads each property for many messages in one event, a filter's property for the whole mailbox and each row property once per run of matched positions (see `_search_messages_applescript`), so its filter cost grows with the mailbox and its row cost with the rows
 - Send: ~1-2s
 - Read: <1s per message
 - Bulk operations capped at 100 items

@@ -35,7 +35,7 @@ Search for messages matching specified criteria.
 **Notes:**
 - Returns metadata-only rows (id, rfc_message_id, subject, sender, to, cc, bcc, date_received, read_status, flagged; see "Row fields" below). For full bodies, pipe the result ids into `get_messages([ids])`.
 - Malformed `date_from` / `date_to` raise `error_type: validation_error`. Only ISO 8601 YYYY-MM-DD is accepted; relative dates like "7 days ago" are not supported.
-- `has_attachment` is filtered after the initial server-side match because Mail.app rejects attachment predicates inside its `whose` clause.
+- On the AppleScript path, `has_attachment` (like `body_contains` and `text_contains`) is asked one message at a time, and only of messages the other filters kept; those are read for the whole mailbox at once.
 - `source=[ids]` (folded-in `get_selected_messages` and the `thread_of` use case) scopes the search to a specific id list. Filter parameters (`sender_contains`, `read_status`, etc.) compose with `source` — the resolved messages are post-filtered. The literal token `"SELECTED"` may appear in the list and is server-resolved to Mail.app's current UI selection (zero-or-more ids); mixed lists like `["SELECTED", "12345"]` are valid. Returns `account: null` and `mailbox: null` in the response. Missing ids drop out silently (partial-results convention).
 - For thread retrieval, call `get_thread(message_id)` to expand an anchor into thread member ids; pipe those ids into `source=[ids]` for filtered metadata.
 - Omitting both `account` and `source` returns `error_type: validation_error`.
@@ -49,7 +49,7 @@ When the call commits to the AppleScript path **and** a body/text filter is set,
 
 **Warnings field:**
 
-`search_messages` responses may include an optional `warnings: list[str]` field. The field is **omitted** when there are no warnings (don't pollute the cheap-call default case). It fires for AppleScript-path body/text search, surfacing the cost before the slow path runs, and on the AppleScript path for each row whose `to`, `cc` or `bcc` Mail could not read (see "Row fields"). Example:
+`search_messages` responses may include an optional `warnings: list[str]` field. The field is **omitted** when there are no warnings (don't pollute the cheap-call default case). It fires for AppleScript-path body/text search, surfacing the cost before the slow path runs, and on the AppleScript path for each row whose `to`, `cc` or `bcc` Mail could not read (see "Row fields"). The AppleScript path also warns when a property could not be read for many messages at once and was read one message at a time instead (`subject could not be read in bulk ...`), and when the mailbox changed while it was being read, so the search was done again one message at a time; the rows are complete either way, only slower. Example:
 
 ```json
 {
