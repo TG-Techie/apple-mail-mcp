@@ -4893,12 +4893,15 @@ class TestAttachmentPropertyGuards:
         assert "save failed" in warnings[0]
 
 
-class TestFreshComposition:
-    """The one composition behind every fresh message sent at once
-    (``_send_fresh``), and the paste placements it and the reply paths
-    use. Each pin is a measurement: the loopback read-back of 2026-09-27
-    (docs/research/icloud-draft-resync.md, Observation 10), or the
-    paste-focus failure of 2026-09-05 (docs/research/paste-focus-failed.md).
+class TestComposition:
+    """The one composition behind every draft the connector saves and
+    every message it sends but the HTML reply (``_compose``): the window
+    it opens (``_build_open_compose_script``), and the paste placements
+    it and the HTML reply use. Each pin is a measurement: the loopback
+    read-back of 2026-09-27 (docs/research/icloud-draft-resync.md,
+    Observation 10), the re-save spike of the same day
+    (docs/research/draft-resave-spike.md), or the paste-focus failure of
+    2026-09-05 (docs/research/paste-focus-failed.md).
     """
 
     @pytest.fixture
@@ -4906,11 +4909,24 @@ class TestFreshComposition:
         return AppleMailConnector(timeout=30)
 
     def _compose(
-        self, connector: AppleMailConnector, sender: str | None = None
+        self,
+        connector: AppleMailConnector,
+        sender: str | None = None,
+        *,
+        seed: str = "new",
+        to: list[str] | None = None,
+        snapshot_drafts: bool = False,
     ) -> str:
-        return connector._build_fresh_compose_script(
-            to=["a@example.com"], cc=["c@example.com"], bcc=["b@example.com"],
-            subject='Say "hi"', sender=sender,
+        return connector._build_open_compose_script(
+            seed=seed,
+            seed_id=None if seed == "new" else "160989",
+            reply_all=False,
+            to=["a@example.com"] if to is None else to,
+            cc=["c@example.com"],
+            bcc=["b@example.com"],
+            subject='Say "hi"',
+            sender=sender,
+            snapshot_drafts=snapshot_drafts,
         )
 
     def test_the_window_is_visible_and_its_body_seeded(
@@ -4922,24 +4938,43 @@ class TestFreshComposition:
         assert "make new outgoing message" in script
         assert 'visible:true, content:" "' in script
 
+    @pytest.mark.parametrize("seed", ["reply", "forward"])
+    def test_a_reply_or_forward_is_mails_own_window(
+        self, connector: AppleMailConnector, seed: str
+    ) -> None:
+        """Mail's verb, opening its window: without one, every edit of
+        what Mail wrote replaced it (measured 2026-09-26), and a draft
+        saved without one was re-saved under a new id
+        (draft-resave-spike.md)."""
+        script = self._compose(connector, seed=seed)
+        assert 'whose id is "160989"' in script
+        assert f"{seed} origMsg opening window true" in script
+        assert "make new outgoing message" not in script
+        assert "opening window false" not in script
+
     def test_recipients_and_subject_go_through_the_model_escaped(
         self, connector: AppleMailConnector
     ) -> None:
-        script = self._compose(connector)
-        for kind, addr in (("to", "a@example.com"), ("cc", "c@example.com"),
+        script = self._compose(connector, to=['a"b\x00@example.com'])
+        for kind, addr in (("to", 'a\\"b@example.com'), ("cc", "c@example.com"),
                            ("bcc", "b@example.com")):
+            assert f"delete (every {kind} recipient of theMessage)" in script
+            assert f'repeat with addr in {{"{addr}"}}' in script
             assert (
-                f"make new {kind} recipient at end of {kind} recipients "
-                f'with properties {{address:"{addr}"}}'
+                f"make new {kind} recipient at end of {kind} recipients of "
+                "theMessage with properties {address:addr}"
             ) in script
+        assert "\x00" not in script
         assert 'subject:"Say \\"hi\\""' in script
 
+    @pytest.mark.parametrize("seed", ["new", "reply", "forward"])
     def test_no_file_is_attached_through_the_dictionary(
-        self, connector: AppleMailConnector
+        self, connector: AppleMailConnector, seed: str
     ) -> None:
         """``make new attachment`` after the body was pasted sent Mail's
-        empty cite blockquote again; files are pasted instead."""
-        assert "make new attachment" not in self._compose(connector)
+        empty cite blockquote again, and on a reply whose body was never
+        touched it unquoted the original; files are pasted instead."""
+        assert "make new attachment" not in self._compose(connector, seed=seed)
 
     def test_a_named_sender_is_set_last(
         self, connector: AppleMailConnector
@@ -4975,6 +5010,32 @@ class TestFreshComposition:
         assert "afterCount > beforeCount" in script
         assert "COMPOSE_WINDOW_NOT_UNIQUE" in script
         assert "|window|:newName" in script
+
+    def test_what_mail_will_send_is_read_back_from_the_model(
+        self, connector: AppleMailConnector
+    ) -> None:
+        """The subject and recipients the window holds, after every
+        override: a send is gated on them, and a save finds its draft by
+        that subject."""
+        script = self._compose(connector)
+        assert "|subject|:(subject of theMessage as text)" in script
+        for group in ("to", "cc", "bcc"):
+            assert f"address of {group} recipients of theMessage" in script
+            assert f"|{group}|:" in script
+
+    def test_a_save_snapshots_drafts_before_the_window_opens(
+        self, connector: AppleMailConnector
+    ) -> None:
+        """The saved draft is the Drafts entry that was not there before."""
+        saving = self._compose(connector, snapshot_drafts=True)
+        snapshot_at = saving.index(
+            "set beforeIds to (id of every message of drafts mailbox)"
+        )
+        assert snapshot_at < saving.index("make new outgoing message")
+        assert "|before_ids|:beforeIds" in saving
+        sending = self._compose(connector, snapshot_drafts=False)
+        assert "id of every message of drafts mailbox" not in sending
+        assert "set beforeIds to {}" in sending
 
     def test_the_fresh_body_paste_replaces_everything(
         self, connector: AppleMailConnector
@@ -5539,54 +5600,134 @@ class TestCreateDraft:
     # Fresh seed (`seed='new'`)
     # ------------------------------------------------------------------
 
-    @patch.object(AppleMailConnector, "_run_applescript")
-    def test_new_save_returns_draft_id(
-        self, mock_run: MagicMock, connector: AppleMailConnector
-    ) -> None:
-        mock_run.return_value = "161055"
-        result = connector.create_draft(
-            seed="new",
-            to=["a@example.com"],
-            subject="hi",
-            body="hello",
+    def _save(
+        self,
+        connector: AppleMailConnector,
+        *,
+        seed: str = "new",
+        body: str = "hello",
+        outcomes: list[str] | None = None,
+        **kwargs: Any,
+    ) -> tuple[list[str], dict[str, str]]:
+        """Save a draft through create_draft against a well-behaved Mail
+        (or ``outcomes``), returning every script run and the result."""
+        if seed == "new":
+            kwargs.setdefault("to", ["a@example.com"])
+            kwargs.setdefault("subject", "hi")
+        else:
+            kwargs.setdefault("seed_id", "160989")
+        files = kwargs.get("attachment_paths") or []
+        captured = _scripted(
+            connector,
+            outcomes or _compose_outcomes(
+                body, window="hi", seed=seed, plain=True, send=False,
+                draft_id="161055", file_names=[Path(f).name for f in files],
+            ),
         )
+        result = connector.create_draft(seed=seed, body=body, **kwargs)
+        return captured, result
+
+    def test_new_save_returns_draft_id(
+        self, connector: AppleMailConnector
+    ) -> None:
+        _, result = self._save(connector)
         assert result == {"draft_id": "161055", "sent_message_id": ""}
 
-    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_a_fresh_draft_is_composed_in_a_window_and_saved_from_it(
+        self, connector: AppleMailConnector
+    ) -> None:
+        """A draft saved through the dictionary (``set content``, then
+        ``save``) was re-saved by Mail under a new id when it named a
+        sender (draft-resave-spike.md), held its body inside Mail's
+        ``<blockquote type="cite">`` (icloud-draft-resync.md,
+        Observation 10), and left a hidden outgoing message behind. A
+        fresh draft is composed as a fresh send is, then closed with
+        Save: open, paste over the seed, read back, close, find the id."""
+        scripts, _ = self._save(
+            connector, to=["a@example.com", "b@example.com"],
+            cc=["c@example.com"], body="line1\nline2",
+        )
+        assert len(scripts) == 5
+        open_s, paste_s, readback_s, close_s, find_s = scripts
+        assert 'visible:true, content:" "' in open_s
+        assert 'subject:"hi"' in open_s
+        assert '{"a@example.com", "b@example.com"}' in open_s
+        assert '{"c@example.com"}' in open_s
+        assert "set beforeIds to (id of every message of drafts mailbox)" in open_s
+        assert "public.utf8-plain-text" in paste_s
+        assert "line1\nline2" in paste_s
+        assert 'keystroke "a" using command down' in paste_s
+        assert "AXWebArea" in readback_s
+        assert "AXCloseButton" in close_s
+        assert 'click button "Save" of first sheet' in close_s
+        assert 'messages of drafts mailbox whose subject is "hi"' in find_s
+        assert "{5, 6}" in find_s
+
+    @pytest.mark.parametrize(
+        ("seed", "body"),
+        [("new", "x"), ("new", ""), ("reply", "x"), ("reply", ""),
+         ("forward", "x"), ("forward", "")],
+    )
+    def test_no_draft_is_saved_through_the_dictionary(
+        self, connector: AppleMailConnector, seed: str, body: str
+    ) -> None:
+        """Every seed, with a body or without, is saved from a window
+        closed with Save: never Mail's ``save`` verb, never ``content``,
+        never a message made without a window."""
+        scripts, result = self._save(connector, seed=seed, body=body)
+        assert result["draft_id"] == "161055"
+        joined = "\n".join(scripts)
+        assert "save theMessage" not in joined
+        assert "set content" not in joined
+        assert "visible:false" not in joined
+        assert "opening window false" not in joined
+        assert "AXCloseButton" in scripts[-2]
+
+    def test_an_empty_fresh_body_still_replaces_the_seed(
+        self, connector: AppleMailConnector
+    ) -> None:
+        """The one-space seed sits inside Mail's cite blockquote; left in
+        place it would be saved and sent quoted. An empty body is an
+        empty paste over everything, which arrived empty and unquoted
+        (icloud-draft-resync.md, Observation 10)."""
+        scripts, _ = self._save(connector, body="")
+        assert 'keystroke "a" using command down' in scripts[1]
+        assert "key code 51" in scripts[1]
+
     def test_a_save_whose_draft_never_appears_is_an_error(
-        self, mock_run: MagicMock, connector: AppleMailConnector
+        self, connector: AppleMailConnector
     ) -> None:
         """The new draft's id is found by diffing Drafts before and after
         the save, and the draft takes a moment to appear (measured: none
         of three lookups saw it at 0.5 s, all did by 1.5 s). The script
-        now polls for it with a bound; if it still has not appeared, that
-        is reported, not returned as success with an empty id that every
+        polls for it with a bound; if it still has not appeared, that is
+        reported, not returned as success with an empty id that every
         later call rejects."""
         from apple_mail_mcp.exceptions import MailDraftNotSettledError
 
-        mock_run.return_value = ""
-        with pytest.raises(MailDraftNotSettledError, match="did not appear"):
-            connector.create_draft(
-                seed="new", to=["a@example.com"], subject="hi", body="hello",
-            )
-
-    @patch.object(AppleMailConnector, "_run_applescript")
-    def test_the_save_script_polls_for_the_new_draft(
-        self, mock_run: MagicMock, connector: AppleMailConnector
-    ) -> None:
-        mock_run.return_value = "161055"
-        connector.create_draft(
-            seed="new", to=["a@example.com"], subject="hi", body="hello",
+        outcomes = _compose_outcomes(
+            "hello", window="hi", plain=True, send=False, draft_id="",
         )
-        script = mock_run.call_args[0][0]
-        assert "delay 0.5\n" not in script, "a fixed delay is a guess"
-        assert "repeat with attempt from 1 to" in script
-        assert "id of every message of drafts mailbox" in script
+        with pytest.raises(MailDraftNotSettledError, match="did not appear"):
+            self._save(connector, outcomes=outcomes)
+
+    def test_the_save_polls_for_the_new_draft(
+        self, connector: AppleMailConnector
+    ) -> None:
+        scripts, _ = self._save(connector)
+        find_s = scripts[-1]
+        assert "delay 0.5\n" not in find_s, "a fixed delay is a guess"
+        assert "repeat with attempt from 1 to" in find_s
+        assert "messages of drafts mailbox whose subject is" in find_s
+
+    def test_a_save_sends_nothing(self, connector: AppleMailConnector) -> None:
+        scripts, _ = self._save(connector)
+        assert all("click sendBtn" not in s for s in scripts)
 
     def test_new_send_returns_empty_ids(
         self, connector: AppleMailConnector
     ) -> None:
-        _scripted(connector, _fresh_outcomes("hello", window="hi", plain=True))
+        _scripted(connector, _compose_outcomes("hello", window="hi", plain=True))
         result = connector.create_draft(
             seed="new",
             to=["a@example.com"],
@@ -5595,34 +5736,6 @@ class TestCreateDraft:
             send_now=True,
         )
         assert result == {"draft_id": "", "sent_message_id": ""}
-
-    @patch.object(AppleMailConnector, "_run_applescript")
-    def test_new_script_shape(
-        self, mock_run: MagicMock, connector: AppleMailConnector
-    ) -> None:
-        mock_run.return_value = "1"
-        connector.create_draft(
-            seed="new",
-            to=["a@example.com", "b@example.com"],
-            cc=["c@example.com"],
-            subject="hi",
-            body="hello",
-        )
-        script = mock_run.call_args[0][0]
-        # Fresh seed uses make-new-outgoing-message with subject + content
-        # baked into properties.
-        assert 'make new outgoing message with properties' in script
-        assert '{subject:"hi"' in script or 'subject:"hi"' in script
-        assert "save theMessage" in script
-        assert "send" not in script.replace("send_now", "").replace(
-            "sender", ""
-        )
-        # Recipient blocks present.
-        assert 'a@example.com' in script
-        assert 'b@example.com' in script
-        assert 'c@example.com' in script
-        # Pre-save snapshot for id-bridging diff present.
-        assert "set beforeIds to" in script
 
     def test_new_send_composes_a_window_and_pastes_the_body_as_plain_text(
         self, connector: AppleMailConnector
@@ -5634,7 +5747,7 @@ class TestCreateDraft:
         iOS Mail draws as a purple bar), and there is no mailto: URL (it
         can neither name a sender nor carry a file)."""
         captured = _scripted(
-            connector, _fresh_outcomes("line1\nline2", window="hi", plain=True)
+            connector, _compose_outcomes("line1\nline2", window="hi", plain=True)
         )
         connector.create_draft(
             seed="new",
@@ -5659,10 +5772,11 @@ class TestCreateDraft:
         self, connector: AppleMailConnector
     ) -> None:
         """Every later step addresses the window the compose script
-        reported, not a name guessed from the subject."""
-        captured = _scripted(
-            connector, _fresh_outcomes("x", window="the new one", plain=True)
-        )
+        reported, not a name guessed from the subject, and the send looks
+        for the subject Mail holds."""
+        outcomes = _compose_outcomes("x", window="the new one", plain=True)
+        outcomes[0] = _compose_meta("the new one", subject="hi")
+        captured = _scripted(connector, outcomes)
         connector.create_draft(
             seed="new", to=["a@example.com"], subject="hi", body="x",
             send_now=True,
@@ -5703,7 +5817,7 @@ class TestCreateDraft:
         """from_account on a fresh send is honoured: the resolved sender is
         set on the composed message. Before this the mailto: path could
         not set one and refused."""
-        captured = _scripted(connector, _fresh_outcomes("x", window="hi", plain=True))
+        captured = _scripted(connector, _compose_outcomes("x", window="hi", plain=True))
         with patch.object(
             connector, "_resolve_account_to_sender",
             return_value="Alice Smith <me@example.com>",
@@ -5750,7 +5864,10 @@ class TestCreateDraft:
         f2 = tmp_path / "data.csv"
         f2.write_text("a,b,c")
         captured = _scripted(
-            connector, _fresh_outcomes("x", window="hi", plain=True, n_files=2)
+            connector,
+            _compose_outcomes(
+                "x", window="hi", plain=True, file_names=[f1.name, f2.name]
+            ),
         )
         result = connector.create_draft(
             seed="new",
@@ -5769,7 +5886,7 @@ class TestCreateDraft:
         assert str(f2.resolve()) in files_s
         assert f1.name in verify_s and f2.name in verify_s
         assert "click sendBtn" in send_s
-        assert "mail attachments" in count_s
+        assert "name of every mail attachment" in count_s
 
     def test_new_send_missing_attachment_composes_nothing(
         self, connector: AppleMailConnector, tmp_path: Path
@@ -5798,95 +5915,78 @@ class TestCreateDraft:
         ):
             assert not hasattr(AppleMailConnector, name), name
 
-    @patch.object(AppleMailConnector, "_run_applescript")
-    def test_new_with_from_account_sets_display_name_sender(
-        self, mock_run: MagicMock, connector: AppleMailConnector
-    ) -> None:
-        """#158: when the resolver returns a Display Name <email> string,
-        the AppleScript embeds it verbatim (escaped) on the sender line."""
-        mock_run.return_value = "1"
-        with patch.object(
-            connector, "_resolve_account_to_sender",
-            return_value="Alice Smith <me@x.com>",
+    def test_one_composition_is_left(self) -> None:
+        """The dictionary save and the split between a fresh send, a note
+        above a seed and everything else were deleted, not kept beside
+        the one composition."""
+        for name in (
+            "_send_fresh",
+            "_build_fresh_compose_script",
+            "_compose_note_above_seed",
+            "_open_seeded_compose",
+            "_build_attachment_block",
+            "_check_sent_attachment_count",
         ):
-            connector.create_draft(
-                seed="new",
-                to=["a@example.com"],
-                subject="hi",
-                body="x",
-                from_account="Gmail",
-            )
-        script = mock_run.call_args[0][0]
-        assert (
-            'set sender of theMessage to "Alice Smith <me@x.com>"' in script
-        )
+            assert not hasattr(AppleMailConnector, name), name
 
-    @patch.object(AppleMailConnector, "_run_applescript")
-    def test_new_with_from_account_bare_email_passthrough(
-        self, mock_run: MagicMock, connector: AppleMailConnector
+    @pytest.mark.parametrize(
+        ("resolved", "in_script"),
+        [
+            # #158: a Display Name <email> sender is embedded verbatim.
+            ("Alice Smith <me@x.com>", "Alice Smith <me@x.com>"),
+            # #158: an account with no display name gives the bare form.
+            ("me@x.com", "me@x.com"),
+            # #173: sanitize_input before escaping strips a null byte.
+            ("Alice\x00Smith <me@x.com>", "AliceSmith <me@x.com>"),
+        ],
+    )
+    def test_a_saved_draft_names_its_sender(
+        self, connector: AppleMailConnector, resolved: str, in_script: str
     ) -> None:
-        """#158: when the resolver returns a bare email (no display name
-        configured), the AppleScript embeds the bare form."""
-        mock_run.return_value = "1"
         with patch.object(
-            connector, "_resolve_account_to_sender", return_value="me@x.com"
+            connector, "_resolve_account_to_sender", return_value=resolved
         ):
-            connector.create_draft(
-                seed="new",
-                to=["a@example.com"],
-                subject="hi",
-                body="x",
-                from_account="Gmail",
-            )
-        script = mock_run.call_args[0][0]
-        assert 'set sender of theMessage to "me@x.com"' in script
+            scripts, _ = self._save(connector, from_account="Gmail")
+        assert "\x00" not in scripts[0]
+        assert f'set sender of theMessage to "{in_script}"' in scripts[0]
 
-    @patch.object(AppleMailConnector, "_run_applescript")
-    def test_new_with_from_account_sanitizes_sender_null_bytes(
-        self, mock_run: MagicMock, connector: AppleMailConnector
+    def test_a_saved_draft_from_an_unknown_account_composes_nothing(
+        self, connector: AppleMailConnector
     ) -> None:
-        """#173: sender string is run through sanitize_input before
-        escape_applescript_string, so embedded null bytes (which would
-        otherwise truncate or confuse the AppleScript at runtime) are
-        stripped per the SECURITY_CHECKLIST two-step convention."""
-        mock_run.return_value = "1"
-        with patch.object(
-            connector, "_resolve_account_to_sender",
-            return_value="Alice\x00Smith <me@x.com>",
-        ):
-            connector.create_draft(
-                seed="new",
-                to=["a@example.com"],
-                subject="hi",
-                body="x",
-                from_account="Gmail",
-            )
-        script = mock_run.call_args[0][0]
-        assert "\x00" not in script
-        assert (
-            'set sender of theMessage to "AliceSmith <me@x.com>"' in script
-        )
+        accounts = [{
+            "id": "U-1", "name": "Home", "email_addresses": ["me@example.com"],
+            "full_name": None,
+        }]
+        captured = _scripted(connector, ["unused"])
+        with patch.object(connector, "list_accounts", return_value=accounts):
+            with pytest.raises(MailAccountNotFoundError):
+                connector.create_draft(
+                    seed="new", to=["a@example.com"], subject="hi", body="x",
+                    from_account="Work",
+                )
+        assert captured == []
 
-    @patch.object(AppleMailConnector, "_run_applescript")
-    def test_new_with_attachments_includes_paths(
-        self, mock_run: MagicMock, connector: AppleMailConnector, tmp_path: Any
+    def test_a_saved_drafts_files_are_pasted_after_the_body(
+        self, connector: AppleMailConnector, tmp_path: Path
     ) -> None:
+        """As on a fresh send: pasted as file URLs, then seen in the
+        window, then saved with it. ``make new attachment`` after the
+        paste would bring the cite blockquote back."""
         f1 = tmp_path / "report.pdf"
         f1.write_bytes(b"%PDF-fake")
         f2 = tmp_path / "data.csv"
         f2.write_text("a,b,c")
-        mock_run.return_value = "1"
-        connector.create_draft(
-            seed="new",
-            to=["a@example.com"],
-            subject="hi",
-            body="x",
-            attachment_paths=[f1, f2],
-        )
-        script = mock_run.call_args[0][0]
-        assert str(f1.resolve()) in script
-        assert str(f2.resolve()) in script
-        assert "make new attachment" in script
+        scripts, result = self._save(connector, attachment_paths=[f1, f2])
+        assert result["draft_id"] == "161055"
+        assert len(scripts) == 7
+        _, paste_s, _, files_s, verify_s, close_s, _ = scripts
+        assert 'keystroke "a" using command down' in paste_s
+        assert "writeObjects:fileURLs" in files_s
+        assert str(f1.resolve()) in files_s and str(f2.resolve()) in files_s
+        assert "key code 125 using command down" in files_s
+        assert f1.name in verify_s and f2.name in verify_s
+        assert "AXCloseButton" in close_s
+        assert all("make new attachment" not in s for s in scripts)
 
     def test_new_attachment_missing_raises(
         self, connector: AppleMailConnector, tmp_path: Any
@@ -5900,113 +6000,82 @@ class TestCreateDraft:
                 attachment_paths=[tmp_path / "does-not-exist.pdf"],
             )
 
-    @patch.object(AppleMailConnector, "_run_applescript")
     def test_recipient_none_means_no_block(
-        self, mock_run: MagicMock, connector: AppleMailConnector
+        self, connector: AppleMailConnector
     ) -> None:
         """For reply/forward, cc=None should not emit a delete-and-replace
         block (preserves Mail's auto-derived recipients)."""
-        mock_run.return_value = "1"
-        connector.create_draft(
-            seed="reply",
-            seed_id="160989",
-            body="",
-        )
-        script = mock_run.call_args[0][0]
+        scripts, _ = self._save(connector, seed="reply", body="")
+        open_s = scripts[0]
         # cc/bcc not specified → no clear-and-add block for them.
-        assert "delete (every cc recipient" not in script
-        assert "delete (every bcc recipient" not in script
+        assert "delete (every cc recipient" not in open_s
+        assert "delete (every bcc recipient" not in open_s
         # to also not specified → no clear for to either.
-        assert "delete (every to recipient" not in script
+        assert "delete (every to recipient" not in open_s
 
-    @patch.object(AppleMailConnector, "_run_applescript")
     def test_recipient_empty_list_clears(
-        self, mock_run: MagicMock, connector: AppleMailConnector
+        self, connector: AppleMailConnector
     ) -> None:
         """cc=[] explicitly clears auto-derived cc recipients."""
-        mock_run.return_value = "1"
-        connector.create_draft(
-            seed="reply",
-            seed_id="160989",
-            cc=[],
-            body="",
-        )
-        script = mock_run.call_args[0][0]
-        assert "delete (every cc recipient" in script
+        scripts, _ = self._save(connector, seed="reply", body="", cc=[])
+        assert "delete (every cc recipient of theMessage)" in scripts[0]
 
     # ------------------------------------------------------------------
-    # Reply seed
+    # Reply and forward seeds
     # ------------------------------------------------------------------
 
-    @patch.object(AppleMailConnector, "_run_applescript")
-    def test_reply_uses_reply_primitive(
-        self, mock_run: MagicMock, connector: AppleMailConnector
+    @pytest.mark.parametrize(
+        ("seed", "reply_all", "verb"),
+        [("reply", False, "reply"), ("reply", True, "reply to all"),
+         ("forward", False, "forward")],
+    )
+    def test_a_seeded_draft_opens_mails_own_window(
+        self, connector: AppleMailConnector, seed: str, reply_all: bool,
+        verb: str,
     ) -> None:
-        mock_run.return_value = "1"
-        connector.create_draft(
-            seed="reply",
-            seed_id="160989",
-            body="",
+        scripts, _ = self._save(
+            connector, seed=seed, body="", reply_all=reply_all,
         )
-        script = mock_run.call_args[0][0]
-        assert "reply origMsg opening window false" in script
-        assert "reply to all" not in script
+        assert f"set theMessage to {verb} origMsg opening window true" in scripts[0]
+        if not reply_all:
+            assert "reply to all" not in scripts[0]
 
-    @patch.object(AppleMailConnector, "_run_applescript")
-    def test_reply_all_uses_reply_to_all(
-        self, mock_run: MagicMock, connector: AppleMailConnector
+    @pytest.mark.parametrize("seed", ["reply", "forward"])
+    def test_an_empty_body_leaves_what_mail_wrote_untouched(
+        self, connector: AppleMailConnector, seed: str
     ) -> None:
-        mock_run.return_value = "1"
-        connector.create_draft(
-            seed="reply",
-            seed_id="160989",
-            reply_all=True,
-            body="",
-        )
-        script = mock_run.call_args[0][0]
-        assert "reply to all origMsg opening window false" in script
+        """No note: nothing is pasted, and Mail's quote or forwarded
+        message is saved as Mail made it. Open, close with Save, find."""
+        scripts, _ = self._save(connector, seed=seed, body="")
+        assert len(scripts) == 3
+        assert all('keystroke "v"' not in s for s in scripts)
+        assert all("set content" not in s for s in scripts)
 
-    @patch.object(AppleMailConnector, "_run_applescript")
-    def test_reply_no_body_no_content_override(
-        self, mock_run: MagicMock, connector: AppleMailConnector
-    ) -> None:
-        """An empty body should NOT override Mail's auto-quoted reply."""
-        mock_run.return_value = "1"
-        connector.create_draft(seed="reply", seed_id="160989", body="")
-        script = mock_run.call_args[0][0]
-        assert "set content of theMessage" not in script
-
-    @patch.object(AppleMailConnector, "_run_applescript")
     def test_reply_subject_override(
-        self, mock_run: MagicMock, connector: AppleMailConnector
+        self, connector: AppleMailConnector
     ) -> None:
-        mock_run.return_value = "1"
-        connector.create_draft(
-            seed="reply",
-            seed_id="160989",
-            subject="custom subject",
-            body="",
+        scripts, _ = self._save(
+            connector, seed="reply", body="", subject="custom subject",
         )
-        script = mock_run.call_args[0][0]
-        assert 'set subject of theMessage to "custom subject"' in script
+        assert 'set subject of theMessage to "custom subject"' in scripts[0]
 
-    # ------------------------------------------------------------------
-    # Forward seed
-    # ------------------------------------------------------------------
-
-    @patch.object(AppleMailConnector, "_run_applescript")
-    def test_forward_uses_forward_primitive(
-        self, mock_run: MagicMock, connector: AppleMailConnector
+    @pytest.mark.parametrize("seed", ["reply", "forward"])
+    def test_an_empty_bodied_seed_is_sent_through_the_verified_send(
+        self, connector: AppleMailConnector, seed: str
     ) -> None:
-        mock_run.return_value = "1"
-        connector.create_draft(
-            seed="forward",
-            seed_id="160989",
-            to=["x@example.com"],
-            body="",
+        """Mail's dictionary ``send`` confirmed nothing. Every send is the
+        window's Send button, read back: open, gate, click and verify."""
+        captured = _scripted(
+            connector, _compose_outcomes("", window="Re: hi", seed=seed)
         )
-        script = mock_run.call_args[0][0]
-        assert "forward origMsg opening window false" in script
+        result = connector.create_draft(
+            seed=seed, seed_id="160989", to=["a@example.com"], body="",
+            send_now=True,
+        )
+        assert result == {"draft_id": "", "sent_message_id": ""}
+        assert len(captured) == 2
+        assert "click sendBtn" in captured[1]
+        assert all("tell theMessage to send" not in s for s in captured)
 
     # ------------------------------------------------------------------
     # A note on a reply or forward goes above what Mail wrote
@@ -6107,6 +6176,44 @@ class TestCreateDraft:
         assert 'whose subject is "Fwd: Probe"' in scripts[4]
         assert all("enabled of sendBtn" not in s for s in scripts)
 
+    @pytest.mark.parametrize("send_now", [False, True])
+    @pytest.mark.parametrize("body", ["", _NOTE])
+    def test_a_seeds_files_are_pasted_after_what_mail_wrote(
+        self, connector: AppleMailConnector, tmp_path: Path, send_now: bool,
+        body: str,
+    ) -> None:
+        """A caller's file on a reply or forward is pasted at the end,
+        after the note (if any) and after Mail's quote or forwarded
+        message. Attached through the dictionary on a window whose body
+        was untouched, it unquoted the original and dropped a forward's
+        own files (measured 2026-09-27)."""
+        f = tmp_path / "caller.txt"
+        f.write_text("mine")
+        outcomes = _compose_outcomes(
+            body, window="Fwd: Probe", seed="forward", plain=True,
+            file_names=["caller.txt"], send=send_now,
+        )
+        if send_now:
+            # The forward's Sent copy carries the original's files too.
+            outcomes[-1] = json.dumps(["theirs.pdf", "caller.txt"])
+        captured = _scripted(connector, outcomes)
+        result = connector.create_draft(
+            seed="forward", seed_id="160989", to=["a@example.com"],
+            body=body, attachment_paths=[f], send_now=send_now,
+        )
+        assert result["draft_id"] == ("" if send_now else "7")
+        assert all("make new attachment" not in s for s in captured)
+        files_at = 3 if body else 1
+        assert "writeObjects:fileURLs" in captured[files_at]
+        assert "key code 125 using command down" in captured[files_at]
+        if body:
+            assert "key code 126 using command down" in captured[1]
+        if send_now:
+            assert "click sendBtn" in captured[files_at + 2]
+            assert "name of every mail attachment" in captured[-1]
+        else:
+            assert "AXCloseButton" in captured[files_at + 2]
+
     def test_an_off_list_recipient_read_back_discards_the_window(
         self, connector: AppleMailConnector
     ) -> None:
@@ -6192,11 +6299,13 @@ class TestCreateDraft:
     def test_the_new_window_is_found_even_when_its_name_is_already_open(
         self, connector: AppleMailConnector
     ) -> None:
-        """A draft saved through the dictionary leaves a window of the
-        same name open (docs/research/icloud-draft-resync.md, Obs. 5), so
-        a name-set diff saw no new window. Names are counted instead, and
-        a new window whose name is not unique is refused before anything
-        is pasted or sent: every later step addresses it by name."""
+        """A window of the same name can already be open: a draft saved
+        through the dictionary, as this connector's once were, left one
+        behind (docs/research/icloud-draft-resync.md, Obs. 5), and a
+        name-set diff then saw no new window. Names are counted instead,
+        and a new window whose name is not unique is refused before
+        anything is pasted or sent: every later step addresses it by
+        name."""
         scripts, _ = self._run_seeded(
             connector, seed="forward", send_now=True, to=["a@example.com"],
         )
@@ -6255,72 +6364,39 @@ class TestCreateDraft:
     # RFC 5322 Message-ID seed_id support (#205)
     # ------------------------------------------------------------------
 
+    @pytest.mark.parametrize("seed", ["reply", "forward"])
     @patch.object(AppleMailConnector, "find_message_by_message_id")
-    @patch.object(AppleMailConnector, "_run_applescript")
-    def test_reply_resolves_rfc_message_id_seed(
+    def test_an_rfc_message_id_seed_is_resolved(
         self,
-        mock_run: MagicMock,
         mock_resolve: MagicMock,
         connector: AppleMailConnector,
+        seed: str,
     ) -> None:
         """Read tools (#148) emit RFC ids on the IMAP path. create_draft
         must resolve them to Mail's internal id before building the
         `whose id is` AppleScript clause. (#205)
         """
         mock_resolve.return_value = "160989"
-        mock_run.return_value = "1"
-        connector.create_draft(
-            seed="reply",
-            seed_id="abc-123@example.com",  # RFC form (contains '@')
-            body="",
+        scripts, _ = self._save(
+            connector, seed=seed, body="", seed_id="abc-123@example.com",
         )
         mock_resolve.assert_called_once_with("abc-123@example.com")
-        script = mock_run.call_args[0][0]
         # AppleScript looks up by Mail's internal id, not the RFC id.
-        assert 'whose id is "160989"' in script
-        assert "abc-123@example.com" not in script
+        assert 'whose id is "160989"' in scripts[0]
+        assert all("abc-123@example.com" not in s for s in scripts)
 
     @patch.object(AppleMailConnector, "find_message_by_message_id")
-    @patch.object(AppleMailConnector, "_run_applescript")
-    def test_forward_resolves_rfc_message_id_seed(
-        self,
-        mock_run: MagicMock,
-        mock_resolve: MagicMock,
-        connector: AppleMailConnector,
-    ) -> None:
-        """Same RFC-id resolution applies to the forward branch. (#205)"""
-        mock_resolve.return_value = "160989"
-        mock_run.return_value = "1"
-        connector.create_draft(
-            seed="forward",
-            seed_id="abc-123@example.com",
-            to=["x@example.com"],
-            body="",
-        )
-        mock_resolve.assert_called_once_with("abc-123@example.com")
-        script = mock_run.call_args[0][0]
-        assert 'whose id is "160989"' in script
-
-    @patch.object(AppleMailConnector, "find_message_by_message_id")
-    @patch.object(AppleMailConnector, "_run_applescript")
     def test_internal_numeric_seed_id_skips_resolver(
         self,
-        mock_run: MagicMock,
         mock_resolve: MagicMock,
         connector: AppleMailConnector,
     ) -> None:
         """Existing callers passing Mail's internal numeric id (no '@')
         must keep working without a resolver round-trip. (#205)
         """
-        mock_run.return_value = "1"
-        connector.create_draft(
-            seed="reply",
-            seed_id="160989",  # internal id form, no '@'
-            body="",
-        )
+        scripts, _ = self._save(connector, seed="reply", body="")
         mock_resolve.assert_not_called()
-        script = mock_run.call_args[0][0]
-        assert 'whose id is "160989"' in script
+        assert 'whose id is "160989"' in scripts[0]
 
     @patch.object(AppleMailConnector, "find_message_by_message_id")
     @patch.object(AppleMailConnector, "_run_applescript")
@@ -6912,20 +6988,53 @@ class TestDeleteMailbox:
         mock_imap_cls.assert_not_called()
 
 
-def _fresh_outcomes(
-    body: str, *, window: str, plain: bool = False, n_files: int = 0
+def _compose_meta(
+    window: str,
+    *,
+    subject: str | None = None,
+    to: list[str] | None = None,
+    before_ids: list[int] | None = None,
+) -> str:
+    """What the composition's first script reports: the window it opened,
+    the subject and recipients Mail holds, and the Drafts ids before."""
+    return json.dumps({
+        "window": window,
+        "subject": window if subject is None else subject,
+        "to": ["a@example.com"] if to is None else to,
+        "cc": [],
+        "bcc": [],
+        "before_ids": [5, 6] if before_ids is None else before_ids,
+    })
+
+
+def _compose_outcomes(
+    body: str,
+    *,
+    window: str,
+    seed: str = "new",
+    plain: bool = False,
+    file_names: list[str] | None = None,
+    send: bool = True,
+    draft_id: str = "7",
 ) -> list[str]:
-    """What a well-behaved Mail answers to a fresh send, script by script:
-    compose, paste, read-back, then (with files) the file paste and the
-    AX verify, the verified send, and (with files) the Sent copy's
-    attachment count."""
-    snippet, _ = AppleMailConnector._paste_probe_strings(body, plain=plain)
-    outcomes = [json.dumps({"window": window}), "PASTED_UNVERIFIED", f"pad {snippet} pad"]
-    if n_files:
+    """What a well-behaved Mail answers to the composition, script by
+    script: open the window; paste the body and read it back (always on a
+    fresh message, on a reply or forward only when there is a body); with
+    files, the file paste and the AX verify; then the verified send and,
+    with files, the Sent copy's attachment names, or the close with Save
+    and the new draft's id."""
+    outcomes = [_compose_meta(window)]
+    if seed == "new" or body:
+        snippet, _ = AppleMailConnector._paste_probe_strings(body, plain=plain)
+        outcomes += ["PASTED_UNVERIFIED", f"pad {snippet} pad"]
+    if file_names:
         outcomes += ["PASTED_UNVERIFIED", "ATTACHMENTS_VERIFIED"]
-    outcomes.append("SENT")
-    if n_files:
-        outcomes.append(str(n_files))
+    if send:
+        outcomes.append("SENT")
+        if file_names:
+            outcomes.append(json.dumps(file_names))
+    else:
+        outcomes += ["SALVAGED", draft_id]
     return outcomes
 
 
@@ -6950,7 +7059,7 @@ def _run_html_flow(
 ) -> list[str]:
     """Drive the fresh HTML flow with a well-behaved mock and return the
     captured scripts: [compose, paste, read-back, verified-send]."""
-    captured = _scripted(connector, _fresh_outcomes(body, window=subject))
+    captured = _scripted(connector, _compose_outcomes(body, window=subject))
     result = connector._send_html_email(
         to=["test@example.com"],
         cc=None,
@@ -6966,10 +7075,10 @@ def _run_html_flow(
 class TestSendHtmlEmail:
     """Tests for AppleMailConnector._send_html_email (fresh mode).
 
-    A fresh HTML send is the shared fresh composition (``_send_fresh``):
-    FOUR osascript invocations — compose a visible window → verified
-    paste → read-back (fresh process — same-process AX reads are stale
-    after a WebKit re-render) → verified send.
+    A fresh HTML send is the one composition (``_compose``): FOUR
+    osascript invocations — compose a visible window → verified paste →
+    read-back (fresh process — same-process AX reads are stale after a
+    WebKit re-render) → verified send.
     """
 
     @pytest.fixture
@@ -7000,7 +7109,7 @@ class TestSendHtmlEmail:
         self, connector: AppleMailConnector
     ) -> None:
         """NO_BODY_AREA from the paste step → MailAppleScriptError."""
-        _scripted(connector, [json.dumps({"window": "Hi"}), "NO_BODY_AREA:x"])
+        _scripted(connector, [_compose_meta("Hi"), "NO_BODY_AREA:x"])
         with pytest.raises(MailAppleScriptError, match="NO_BODY_AREA"):
             connector._send_html_email(
                 to=["test@example.com"],
@@ -7038,7 +7147,7 @@ class TestSendHtmlEmail:
         """A fresh HTML send sets the named account as the sender of the
         window it composes; before this it was refused, since the mailto:
         window it used could not take one."""
-        captured = _scripted(connector, _fresh_outcomes("<p>x</p>", window="Hi"))
+        captured = _scripted(connector, _compose_outcomes("<p>x</p>", window="Hi"))
         with patch.object(
             connector, "_resolve_account_to_sender",
             return_value="Alice Smith <me@example.com>",
@@ -7060,7 +7169,7 @@ class TestSendHtmlEmail:
         """Regression: the fresh path once accepted cc/bcc, allowlist-
         validated them, then silently dropped them — the mail went out
         WITHOUT them. They are recipients of the composed message."""
-        captured = _scripted(connector, _fresh_outcomes("<p>x</p>", window="Hi"))
+        captured = _scripted(connector, _compose_outcomes("<p>x</p>", window="Hi"))
         connector._send_html_email(
             to=["test@example.com"],
             cc=["cc1@example.com"],
@@ -7070,14 +7179,12 @@ class TestSendHtmlEmail:
             from_account=None,
         )
         compose_s = captured[0]
-        assert (
-            'make new cc recipient at end of cc recipients with properties '
-            '{address:"cc1@example.com"}'
-        ) in compose_s
-        assert (
-            'make new bcc recipient at end of bcc recipients with properties '
-            '{address:"bcc1@example.com"}'
-        ) in compose_s
+        for kind, addr in (("cc", "cc1@example.com"), ("bcc", "bcc1@example.com")):
+            assert f'repeat with addr in {{"{addr}"}}' in compose_s
+            assert (
+                f"make new {kind} recipient at end of {kind} recipients of "
+                "theMessage with properties {address:addr}"
+            ) in compose_s
 
     def test_html_send_escapes_subject(
         self, connector: AppleMailConnector
@@ -7139,7 +7246,7 @@ class TestSendHtmlWithAttachments:
     Flow is SEVEN osascript invocations: compose → paste → read-back →
     file paste → AX attachment verify (the send is NOT attempted unless
     every file is visible in the compose window) → verified send →
-    sent-copy attachment count.
+    the Sent copy's attachment names.
     """
 
     @pytest.fixture
@@ -7160,7 +7267,9 @@ class TestSendHtmlWithAttachments:
             f.write_text(f"content {i}")
             files.append(f)
         body = "<p>with attachment probe</p>"
-        outcomes = _fresh_outcomes(body, window="Attached", n_files=n_files)
+        outcomes = _compose_outcomes(
+            body, window="Attached", file_names=[f.name for f in files]
+        )
         for idx, val in (outcomes_override or {}).items():
             outcomes[idx] = val
         captured = _scripted(connector, outcomes)
@@ -7204,8 +7313,9 @@ class TestSendHtmlWithAttachments:
         # AX verify names the file.
         assert files[0].name in verify_s
         assert "click sendBtn" in send_s
-        # Post-send: sent-copy attachment count read-back.
-        assert "mail attachments" in count_s
+        # Post-send: the Sent copy's attachments, read back by name.
+        assert "name of every mail attachment" in count_s
+        assert 'sent mailbox whose subject is "Attached"' in count_s
 
     def test_missing_file_raises_before_applescript(
         self, connector: AppleMailConnector, tmp_path: Path
@@ -7239,19 +7349,33 @@ class TestSendHtmlWithAttachments:
         assert "AXCloseButton" in scripts[5]
         assert all("click sendBtn" not in s for s in scripts)
 
-    def test_sent_copy_attachment_count_mismatch_raises(
+    def test_a_file_missing_from_the_sent_copy_raises(
         self, connector: AppleMailConnector, tmp_path: Path
     ) -> None:
-        """Dispatch succeeded but the sent copy carries the wrong number
-        of attachments → loud error naming the discrepancy (the mail DID
-        go out; the error must say so)."""
+        """Dispatch succeeded but the Sent copy lacks a file that was
+        attached → loud error naming it (the mail DID go out; the error
+        must say so)."""
         scripts, _, result, err = self._drive(
-            connector, tmp_path, outcomes_override={6: "0"},
+            connector, tmp_path, n_files=2,
+            outcomes_override={6: json.dumps(["att1.txt"])},
         )
         assert result is None
         assert isinstance(err, MailAppleScriptError)
         assert "WAS sent" in str(err)
+        assert "att0.txt" in str(err)
         assert len(scripts) == 7
+
+    def test_the_sent_copy_may_carry_more_than_was_pasted(
+        self, connector: AppleMailConnector, tmp_path: Path
+    ) -> None:
+        """A forward's Sent copy carries the original's files as well as
+        the caller's: every file pasted must be there, not only those."""
+        _, _, result, err = self._drive(
+            connector, tmp_path,
+            outcomes_override={6: json.dumps(["theirs.pdf", "att0.txt"])},
+        )
+        assert err is None
+        assert result == {"draft_id": "", "sent_message_id": ""}
 
     def test_ax_verify_accepts_a_file_shown_as_an_image(self) -> None:
         """A compose window shows a PNG inline, as an AXImage described
@@ -7317,10 +7441,10 @@ def _overlong_forward_note_sent(c: AppleMailConnector) -> None:
 
 class TestAnOverlongBodyIsRefusedNotCut:
     """``sanitize_input`` cuts at SANITIZE_MAX_LENGTH without a word, and
-    every body a caller hands the connector passed through it: a paste
-    (fresh send, HTML reply, a note above a reply or forward) or a saved
-    fresh draft's ``set content``. A longer body is refused, on every
-    path, with one message, before anything is composed or looked up."""
+    every body a caller hands the connector passes through it on its way
+    to a paste (a fresh draft or send, an HTML reply, a note above a reply
+    or forward). A longer body is refused, on every path, with one
+    message, before anything is composed or looked up."""
 
     @pytest.fixture
     def connector(self) -> AppleMailConnector:
@@ -7354,13 +7478,18 @@ class TestAnOverlongBodyIsRefusedNotCut:
     def test_a_body_at_the_limit_is_carried_whole(
         self, connector: AppleMailConnector
     ) -> None:
-        captured = _scripted(connector, ["4242"])
         body = "y" * SANITIZE_MAX_LENGTH
+        captured = _scripted(
+            connector,
+            _compose_outcomes(
+                body, window="s", plain=True, send=False, draft_id="4242",
+            ),
+        )
         result = connector.create_draft(
             seed="new", to=["a@example.com"], subject="s", body=body,
         )
         assert result["draft_id"] == "4242"
-        assert f'set content of theMessage to "{body}"' in captured[0]
+        assert f'set theBody to "{body}"' in captured[1]
 
 
 class TestVerifiedSendPrimitives:
@@ -7386,7 +7515,7 @@ class TestVerifiedSendPrimitives:
         """Captured scripts for a fresh plain send through create_draft:
         [compose, paste, read-back, verified-send]."""
         captured = _scripted(
-            connector, _fresh_outcomes("x", window="Probe", plain=True)
+            connector, _compose_outcomes("x", window="Probe", plain=True)
         )
         connector.create_draft(
             seed="new",
@@ -7470,7 +7599,7 @@ class TestVerifiedSendPrimitives:
             captured.append(script)
             n = len(captured)
             if n == 1:
-                return json.dumps({"window": "Probe"})
+                return _compose_meta("Probe", to=["test@example.com"])
             if n in (2, 4):  # paste attempts
                 return "PASTED_UNVERIFIED"
             return "<p>Hi there probe</p>"  # read-back sees RAW source
@@ -7528,7 +7657,7 @@ class TestVerifiedSendPrimitives:
     def test_plain_fresh_sentinels_raise_with_detail(
         self, connector: AppleMailConnector, sentinel: str
     ) -> None:
-        outcomes = _fresh_outcomes("x", window="Probe", plain=True)
+        outcomes = _compose_outcomes("x", window="Probe", plain=True)
         _scripted(connector, outcomes[:-1] + [sentinel])
         with pytest.raises(MailAppleScriptError) as exc:
             connector.create_draft(
@@ -7550,7 +7679,7 @@ class TestVerifiedSendPrimitives:
     ) -> None:
         """Verified-send sentinels from the send script surface as errors."""
         body = "<p>Hi there probe</p>"
-        outcomes = _fresh_outcomes(body, window="Probe")
+        outcomes = _compose_outcomes(body, window="Probe")
         _scripted(connector, outcomes[:-1] + [sentinel])
         with pytest.raises(MailAppleScriptError) as exc:
             connector._send_html_email(
@@ -7625,7 +7754,7 @@ class TestVerifiedSendPrimitives:
             "SALVAGED (Mail's send-error sheet: Cannot send message using "
             "the server smtp.example.com. | )"
         )
-        outcomes = _fresh_outcomes("<p>Hi there probe</p>", window="Probe")
+        outcomes = _compose_outcomes("<p>Hi there probe</p>", window="Probe")
         _scripted(connector, outcomes[:-1] + ["POSTCONDITION_TIMEOUT:x", sheet])
         with pytest.raises(MailAppleScriptError) as exc:
             connector._send_html_email(

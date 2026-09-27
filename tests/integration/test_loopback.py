@@ -48,8 +48,11 @@ from .mail_readback import (
     compose_window_count,
     header,
     html_part,
+    outgoing_message_count,
+    plain_part,
     sent_copy,
     wait_for_arrival,
+    watch_draft_ids,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -531,7 +534,9 @@ def test_forward_without_note_via_tool_lifecycle_carries_original_and_attachment
     top and once inside a cite blockquote, with Mail's forward formatting
     gone. After it, the recreate carries that text as a note, which opens
     a compose window named like the one the dictionary save left open,
-    and draft_send refuses with COMPOSE_WINDOW_NOT_UNIQUE."""
+    and draft_send refuses with COMPOSE_WINDOW_NOT_UNIQUE. No draft is
+    saved through the dictionary any more (2026-09-27), so no window is
+    left behind to collide with."""
     from apple_mail_mcp.tools.drafts import draft_create, draft_send
 
     hexid = _hex()
@@ -631,3 +636,132 @@ def test_a_fresh_draft_with_files_is_sent_with_them(
             f.name: f.read_bytes() for f in files
         }
         assert_not_quoted(arrival.source)
+
+
+def test_a_draft_saved_with_a_sender_keeps_its_id_and_goes_out_unquoted(
+    loop: Loopback, tmp_path: Path
+) -> None:
+    """``draft_create`` naming the test account as sender, with two files,
+    then ``draft_send``. Saved through the dictionary, such a draft was
+    re-saved by Mail under a new id 0.2–28 s later
+    (docs/research/draft-resave-spike.md), so the id handed back could be
+    stale before the next call, and its body sat inside Mail's cite
+    blockquote. Saved from its compose window, the id holds for 45 s,
+    read every 2 s, and the send carries the sender, the body unquoted
+    and both files. The Sent copy is checked before the delivered one,
+    so a delivery miss still shows what Mail sent."""
+    from apple_mail_mcp.tools.drafts import draft_create, draft_send
+
+    hexid = _hex()
+    subject = f"{PREFIX}draft-sender-{hexid}"
+    body = f"saved with a sender marker-{hexid}\nsecond line 2 > 1"
+    files = _two_files(tmp_path, hexid)
+    with MailTrash(loop.connector, loop.account) as trash:
+        trash.windows(subject)
+        trash.drafts(subject)
+        loop.prepare(trash, subject)
+        created = draft_create(
+            to=[loop.address], subject=subject, body=body,
+            attachment_paths=[str(f) for f in files],
+            from_account=loop.account,
+        )
+        assert created["success"] is True, created
+        draft_id = created["draft_id"]
+        assert compose_window_count(loop.connector, subject) == 0, (
+            "the save left its compose window open"
+        )
+        assert outgoing_message_count(loop.connector, subject) == 0
+        seen = watch_draft_ids(loop.connector, subject, seconds=45.0, every=2.0)
+        changed = [(t, ids) for t, ids in seen if ids != [draft_id]]
+        assert not changed, f"draft {draft_id} did not hold: {changed}"
+
+        result = asyncio.run(draft_send(draft_id=draft_id))
+        assert result["success"] is True, result
+        assert "warning" not in result, result
+        sent = sent_copy(loop.connector, subject)
+        assert sorted(sent.attachment_names) == ["first.txt", "second.txt"]
+        assert_not_quoted(sent.source)
+        sent, arrival = loop.receive(trash, subject)
+
+        loop.assert_delivered(arrival, sent, subject)
+        loop.assert_from_named_sender(arrival)
+        for line in body.splitlines():
+            assert line in arrival.content
+        assert_not_quoted(arrival.source)
+        assert sorted(arrival.attachment_names) == ["first.txt", "second.txt"]
+        assert _attachment_bytes(arrival.source) == {
+            f.name: f.read_bytes() for f in files
+        }
+
+
+def test_a_reply_draft_with_a_note_and_a_file_goes_out_with_both(
+    loop: Loopback, tmp_path: Path
+) -> None:
+    """``draft_create(reply_to=..., body=<note>, attachment_paths=[file])``,
+    saved, then ``draft_send``: the note above the quoted original, which
+    stays quoted, and the file, in the draft as saved and on the wire.
+    Attached through the dictionary, the file cost a reply its quote
+    (docs/research/icloud-draft-resync.md, Observation 11).
+
+    The reply answers the seed's Sent copy, as Observation 11's runs
+    did, so nothing waits on the seed's delivery, which is not what this
+    tests: in two runs on 2026-09-27 the seed never arrived, each
+    returned with iCloud's "550 5.7.1 [HM108] Message rejected due to
+    local policy". The reply's Sent copy is checked before its delivered
+    one, so a delivery miss still shows what Mail sent."""
+    from apple_mail_mcp.tools.drafts import draft_create, draft_send
+
+    hexid = _hex()
+    seed_subject = f"{PREFIX}draft-reply-file-seed-{hexid}"
+    reply_subject = f"Re: {seed_subject}"
+    note = f"reply-note-{hexid}"
+    attached = _two_files(tmp_path, hexid)[0]
+    with MailTrash(loop.connector, loop.account) as trash:
+        loop.prepare(trash, seed_subject)
+        assert loop.connector._send_html_email(
+            to=[loop.address], cc=None, bcc=None, subject=seed_subject,
+            body=f"<p>reply with a file seed <b>seed-marker-{hexid}</b></p>",
+            from_account=None,
+        ) == SENT
+        seed_sent = sent_copy(loop.connector, seed_subject)
+
+        trash.windows(reply_subject)
+        trash.drafts(reply_subject)
+        loop.prepare(trash, reply_subject)
+        created = draft_create(
+            reply_to=seed_sent.mail_id, to=[loop.address], body=note,
+            attachment_paths=[str(attached)],
+        )
+        assert created["success"] is True, created
+        assert compose_window_count(loop.connector, reply_subject) == 0, (
+            "the save left its compose window open"
+        )
+        state = loop.connector.get_draft_state(created["draft_id"])
+        assert state["attachment_names"] == [attached.name]
+        saved_note_at = state["body"].find(note)
+        saved_quote_at = state["body"].find(f"seed-marker-{hexid}")
+        assert 0 <= saved_note_at < saved_quote_at, "the saved note is not above the quote"
+
+        result = asyncio.run(draft_send(draft_id=created["draft_id"]))
+        assert result["success"] is True, result
+        reply_sent = sent_copy(loop.connector, reply_subject)
+        assert reply_sent.attachment_names == (attached.name,)
+        sent_text = plain_part(reply_sent.source)
+        sent_note_at = sent_text.find(note)
+        sent_quote_at = sent_text.find(f"seed-marker-{hexid}")
+        assert 0 <= sent_note_at < sent_quote_at, "the sent note is not above the quote"
+        assert any(
+            line.startswith(">") and f"seed-marker-{hexid}" in line
+            for line in sent_text.splitlines()
+        ), "the original went out unquoted"
+        assert 'type="cite"' in html_part(reply_sent.source)
+        reply_sent, reply = loop.receive(trash, reply_subject)
+
+        loop.assert_delivered(reply, reply_sent, reply_subject)
+        in_reply_to = bare_message_id(header(reply.headers, "In-Reply-To") or "")
+        assert in_reply_to == seed_sent.rfc_message_id
+        note_at = reply.content.find(note)
+        quoted_at = reply.content.find(f"seed-marker-{hexid}")
+        assert 0 <= note_at < quoted_at, "the note is not above the quote"
+        assert reply.attachment_names == (attached.name,)
+        assert _attachment_bytes(reply.source) == {attached.name: attached.read_bytes()}

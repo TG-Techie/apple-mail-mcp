@@ -278,6 +278,35 @@ macOS permission prompt appeared.
 - 18 hidden outgoing messages with spike subjects remain. That is the
   dictionary path's known leak, one per save, and it is not fixed here.
 
+## Observation 11: `v4-update` once every draft is saved from a window (2026-09-27 03:39–03:42 EDT)
+
+Two more `v4-update` runs, on the branch that made `create_draft` save
+every draft from a compose window closed with Save. Both the `v1-named`
+create and the rebuild inside `draft_update` went that way. Same harness
+and command as above. No integration pytest was running before or after
+either poll, and ids are left out here.
+
+```
+03:39:13  create ret=10.1s; update ret=22.0s, success, no warning
+          the returned id: the only draft of the subject, unchanged from t=22.1 to t=66.2
+03:40:56  create ret=10.1s; update ret=22.1s, success, no warning
+          the returned id: the only draft of the subject, unchanged from t=22.2 to t=66.3
+```
+
+In both runs, read after the poll and before the harness's own
+cleanup:
+
+- The draft read back `test:named` in the test account.
+- `trash mailbox` held one copy of the subject: the draft the update
+  retired.
+- `count of (outgoing messages whose subject is <S>)` was 0, and the
+  total was 66 before, after the poll and after cleanup.
+- Mail's `windows whose name is <S>` counted 1 and System Events' 0, as
+  after the window-path runs in Observation 8. No sheet was open.
+
+Against Observation 6, where the id each run returned was gone within
+23 s and the first run left a second copy.
+
 ## Derivations (mine)
 
 1. **Which paths keep the id, within 45 s of the return, on this
@@ -351,6 +380,13 @@ macOS permission prompt appeared.
    retires had its own pending re-save (Observation 6, first run). This
    is the Observation 9 finding of `icloud-draft-resync.md`, seen now
    through the tool, and it is user-visible: a duplicate draft.
+   With both saves made from a window, two runs of two left no copy
+   (Observation 11). The copy came from the retired draft's own
+   pending re-save, and a draft saved from a window had none pending in
+   any run here. So it can still come only from a draft saved the old
+   way, by an earlier version of this server or by another client, and
+   retired within its re-save window. Two runs do not rule it out for
+   the window path.
 6. Mail's own window list is not a sign of an open compose session. A
    hidden window named for the draft showed up after window-path runs
    too, whose outgoing message was gone, and System Events never listed

@@ -13,12 +13,21 @@ Run with: MAIL_TEST_MODE=true MAIL_TEST_ACCOUNT=<test account name> pytest --run
 """
 
 import datetime as _dt
+import uuid
 from pathlib import Path
 
 import pytest
 from _pytest.monkeypatch import MonkeyPatch
 
 from apple_mail_mcp.mail_connector import AppleMailConnector
+
+from .mail_readback import (
+    assert_not_quoted,
+    compose_window_count,
+    draft_source,
+    outgoing_message_count,
+    trash_drafts,
+)
 
 # Skip all integration tests by default
 # Run with: pytest --run-integration
@@ -460,6 +469,92 @@ class TestDraftsLifecycleIntegration:
         finally:
             connector.delete_draft(draft_id)
 
+    def test_a_fresh_draft_holds_what_it_was_saved_with(
+        self,
+        connector: AppleMailConnector,
+        test_account: str,
+        tmp_path: Path,
+    ) -> None:
+        """Every draft is saved from a compose window closed with Save
+        (``_compose``). The re-save spike read back only such a draft's
+        id, Message-ID, sender and account
+        (docs/research/draft-resave-spike.md); this reads back what it
+        holds. Nothing in it is quoted: a body set through ``content``
+        sat inside Mail's cite blockquote, so a human sending the draft
+        from Mail.app sent it quoted. And the save left neither an
+        outgoing message nor a window of its subject behind, where each
+        dictionary save left an outgoing message."""
+        subject = f"ZZZ-AMM-INTEG-HELD-{uuid.uuid4().hex[:8]}"
+        held = tmp_path / "held.txt"
+        held.write_text("held file\n")
+        try:
+            result = connector.create_draft(
+                seed="new",
+                to=["test1@example.com"],
+                cc=["test2@example.com"],
+                subject=subject,
+                body="first line held\nsecond line 2 > 1",
+                attachment_paths=[held],
+                from_account=test_account,
+            )
+            state = connector.get_draft_state(result["draft_id"])
+            assert state["sender"] == connector._resolve_account_to_sender(
+                test_account
+            )
+            assert state["to"] == ["test1@example.com"]
+            assert state["cc"] == ["test2@example.com"]
+            assert state["bcc"] == []
+            assert state["subject"] == subject
+            assert "first line held" in state["body"]
+            assert "second line 2 > 1" in state["body"]
+            assert state["attachment_names"] == ["held.txt"]
+            assert_not_quoted(draft_source(connector, subject))
+            assert outgoing_message_count(connector, subject) == 0
+            assert compose_window_count(connector, subject) == 0
+        finally:
+            trash_drafts(connector, subject)
+
+    def test_a_reply_draft_holds_its_note_its_file_and_the_quote(
+        self,
+        connector: AppleMailConnector,
+        anchor_message_id: str,
+        test_account: str,
+        tmp_path: Path,
+    ) -> None:
+        """A reply saved with a note, a file and the test account as
+        sender: the note above Mail's quote, which stays, and the file.
+        Attached through the dictionary, a file cost a reply its quote
+        (docs/research/icloud-draft-resync.md, Observation 11). Deleted
+        by id: its subject is the anchor's, which a real draft may share."""
+        note = f"ZZZ-AMM-INTEG-REPLY-NOTE-{uuid.uuid4().hex[:8]}"
+        attached = tmp_path / "reply-file.txt"
+        attached.write_text("reply file\n")
+        result = connector.create_draft(
+            seed="reply",
+            seed_id=anchor_message_id,
+            to=["test1@example.com"],
+            body=note,
+            attachment_paths=[attached],
+            from_account=test_account,
+        )
+        draft_id = result["draft_id"]
+        try:
+            state = connector.get_draft_state(draft_id)
+            assert state["in_reply_to"], "reply must have In-Reply-To"
+            assert state["subject"].startswith("Re:")
+            assert state["to"] == ["test1@example.com"]
+            assert state["sender"] == connector._resolve_account_to_sender(
+                test_account
+            )
+            note_at = state["body"].find(note)
+            wrote_at = state["body"].find("wrote:")
+            assert 0 <= note_at < wrote_at, "the note is not above the quote"
+            assert "reply-file.txt" in state["attachment_names"]
+            assert outgoing_message_count(connector, state["subject"]) == 0
+            assert compose_window_count(connector, state["subject"]) == 0
+        finally:
+            connector.delete_draft(draft_id)
+
     def test_reply_save_preserves_threading_headers(
         self,
         connector: AppleMailConnector,
@@ -576,12 +671,15 @@ class TestDraftsLifecycleIntegration:
         MAIL_TEST_ACCOUNT set to an account that is not Mail's default
         sender for this to prove anything beyond the read-back.
 
-        A draft saved with a sender that is not Mail's default is re-saved
-        by Mail under a new id some 10-20 s later (measured on both test
-        accounts, docs/research/icloud-draft-resync.md); this test runs
-        inside that window and one class run on the iCloud account failed
-        with the error text not captured. Passes 3/3 alone on iCloud and
-        8/8 for the class on both accounts otherwise."""
+        A draft saved through the dictionary with a named sender was
+        re-saved by Mail under a new id some 10-20 s later (measured on
+        both test accounts, docs/research/icloud-draft-resync.md); this
+        test ran inside that window, and one class run on the iCloud
+        account failed with the error text not captured. Every draft has
+        been saved from a compose window since 2026-09-27, which kept
+        its id (docs/research/draft-resave-spike.md, Observations 5 and
+        11), and three class runs on the iCloud account that day passed
+        this test and every other draft test."""
         from apple_mail_mcp import server
         from apple_mail_mcp.exceptions import MailDraftNotFoundError
         from apple_mail_mcp.tools.drafts import draft_create, draft_update

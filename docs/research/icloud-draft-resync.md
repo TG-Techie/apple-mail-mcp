@@ -281,6 +281,45 @@ and files. One full run of `test_verified_send.py` and
 Which messages miss changes from run to run, and a miss can be the
 first send of a test. Why is not established.
 
+## Observation 11 — a caller's file on a reply or forward whose body is untouched (2026-09-27, 03:09–03:22 EDT)
+
+A seed went out first: a fresh HTML send (`_send_html_email`) to the
+loopback carrying two .txt files, `seedone.txt` and `seedtwo.txt`. Its
+Sent copy was the seed for six replies and forwards, one run each.
+Every run opened Mail's reply or forward in a visible compose window
+with the loopback as its only To, through the connector's own window
+path (the one a note above a seed used). Then one file,
+`caller.txt`, was added without touching the body, the recipients read
+back passed the allowlist, and the verified send reported `SENT`. The
+Sent copy's source was read after each run, and that Sent copy was
+moved to Trash before the next. The harness was a scratch script and
+was not committed; the loopback tests added with this observation
+cover the same ground.
+
+| run | how the file went in | the Sent copy's files | Mail's part in the Sent copy |
+|---|---|---|---|
+| reply | `make new attachment … at after last paragraph` | caller.txt | gone: the original's text unquoted at the top, no "On … wrote:", then an empty `blockquote type="cite"` in `Apple-Mail-URLShareWrapperClass`; no `>` line in the plain part |
+| reply | pasted as a file URL at the end (cmd+down) | caller.txt | the "On … wrote:" quote in its cite blockquote, with `> ` lines in the plain part; the file after the blockquote |
+| reply | pasted at the top (cmd+up) | caller.txt | as above; the file before the blockquote |
+| forward | `make new attachment` | caller.txt only | gone as for the reply: no "Begin forwarded message:", the original unquoted, an empty cite blockquote, and neither of the original's files |
+| forward | pasted at the end | seedtwo.txt, seedone.txt, caller.txt | "Begin forwarded message:" with its header lines and both files; the caller's file after the forwarded message |
+| forward | pasted at the top | seedone.txt, caller.txt, seedtwo.txt | as above; the caller's file before the forwarded message |
+
+The attachment check before Send (`_build_attachment_ax_verify_script`)
+returned `ATTACHMENTS_VERIFIED` on all six, the two damaged ones
+included.
+
+None of the six delivered copies arrived in the test account's INBOX
+within 120 s each, and the seed's did not within 30 s after the last
+run. Each Sent copy had the loopback as To. So everything in the table
+is what Mail sent, read from Sent; nothing here was read from a
+delivered copy.
+
+`count of outgoing messages` was 66 at 03:06 before the seed and 66 at
+03:22 after the last run. After cleanup, the Sent mailbox, the test
+account's INBOX and System Events' windows of Mail held nothing whose
+subject carried the run's prefix.
+
 ## Derivations, mine
 
 - On an iCloud account, the id `draft_create` returns is transient. In
@@ -326,8 +365,21 @@ first send of a test. Why is not established.
 - (Observation 10) Setting the body with a separate `set content`, as
   opposed to in the creation properties, was once recorded as avoiding
   a stray leading newline and the purple bar. Row (b) had both. Saved
-  fresh drafts are still built that way, so a human sending one from
-  Mail.app sends it quoted.
+  fresh drafts were still built that way when this was written, so a
+  human sending one from Mail.app sent it quoted.
+- (Observation 11) A dictionary `make new attachment` on a reply or
+  forward replaces what Mail wrote even when it is the only edit, just
+  as `set content` and `make new paragraph` did on a reply or forward
+  opened without a window (measured 2026-09-26). It fits the same
+  reading as Observation 10's, the dictionary re-rendering its own
+  content model, which for Mail's reply or forward holds the original
+  unquoted. **Not established**; the table is.
+- (Observation 11) Until this observation, a reply or forward with a
+  note and a caller's file was composed exactly so: the file attached
+  through the dictionary with the headers, before the note was pasted,
+  on a body not yet touched. So such drafts and sends lost Mail's
+  quote or forwarded message, and a forward its own files. Derived from
+  the table; no run of that path with a file was read back.
 - (Observation 10) A sender set on a composed message is honoured,
   visible window or not. With no sender, both routes sent from the
   bare address; a named sender sends "Full Name <address>" when the
@@ -359,12 +411,17 @@ first send of a test. Why is not established.
   period (Observation 9's spread is why it is a quiet period and not
   a fixed wait).
 - Every fresh message sent at once now goes the last row of
-  Observation 10's way (`_send_fresh`): seeded visible window, sender
-  set last when named, cmd+a and delete, the body pasted and read back,
-  files pasted after it and seen in the AX tree, the verified send. The
-  mailto: route (`_send_new_via_eml`, and the HTML fresh send's
-  mailto: window) is gone. The loopback tests assert nothing arrives
-  quoted.
+  Observation 10's way: seeded visible window, sender set last when
+  named, cmd+a and delete, the body pasted and read back, files pasted
+  after it and seen in the AX tree, the verified send. The mailto:
+  route (`_send_new_via_eml`, and the HTML fresh send's mailto: window)
+  is gone. The loopback tests assert nothing arrives quoted.
+- Every saved draft, and every send of a reply or forward, now goes the
+  same way (`_compose`, with the commit that added Observation 11): the
+  dictionary save (`set content`, then `save`) is gone, a draft is its
+  compose window closed with Save, and on every seed the caller's files
+  are pasted at the end, never attached through the dictionary. The
+  re-save it ends is `draft-resave-spike.md`'s.
 
 ## Not tried
 

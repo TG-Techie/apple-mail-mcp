@@ -27,14 +27,19 @@ from apple_mail_mcp.utils import escape_applescript_string
 # misses (see ``_test_drafts_swept``).
 TEST_DRAFT_SUBJECT_PREFIX = "ZZZ-AMM-INTEG-"
 
-# A draft saved with a named sender is re-saved by Mail under a new id
-# after the test has deleted the original: 1–5 s after creation on the
-# Gmail test account, 12–31 s on the iCloud one across the day's
-# measurements (2026-09-11, docs/research/icloud-draft-resync.md,
-# Observations 3, 4 and 8). Nothing readable says whether a re-save is
-# still pending, so the end-of-session sweep keeps sweeping until the
-# Drafts have stayed clear for _RESAVE_QUIET_S, and gives up at
-# _RESAVE_MAX_S. Both are bounds with margin, not signals.
+# A draft saved through Mail's scripting dictionary with a named sender
+# was re-saved by Mail under a new id after the test had deleted the
+# original: 1–5 s after creation on the Gmail test account, 12–31 s on
+# the iCloud one across the day's measurements (2026-09-11,
+# docs/research/icloud-draft-resync.md, Observations 3, 4 and 8). The
+# connector has saved every draft from a compose window since
+# 2026-09-27, which kept its id (docs/research/draft-resave-spike.md),
+# so its own drafts should no longer do this; the sweep still catches
+# what a failed test leaves, and a copy from anything saved the old
+# way. Nothing readable says whether a re-save is still pending, so the
+# end-of-session sweep keeps sweeping until the Drafts have stayed
+# clear for _RESAVE_QUIET_S, and gives up at _RESAVE_MAX_S. Both are
+# bounds with margin, not signals.
 _RESAVE_POLL_S = 5
 _RESAVE_QUIET_S = 35
 _RESAVE_MAX_S = 150
@@ -126,12 +131,14 @@ def _test_drafts_swept(request: pytest.FixtureRequest) -> Iterator[None]:
     """Leave the test account's Drafts as the run found them.
 
     Each draft test deletes the draft it created, by the id it was
-    given. A draft saved with a named sender is re-saved by Mail under
-    a new id shortly after, so that delete removes the original and the
-    copy stays; one class run left six. The sweep runs before the first
-    integration test, for what an earlier run left, and after the last,
-    repeating until the re-saved copies have stopped appearing — that
-    tail is skipped when no draft test was collected.
+    given. A draft saved through the dictionary with a named sender was
+    re-saved by Mail under a new id shortly after, so that delete
+    removed the original and the copy stayed; one class run left six
+    (see the comment on _RESAVE_POLL_S for why that should no longer
+    happen). The sweep runs before the first integration test, for what
+    an earlier run left, and after the last, repeating until nothing
+    new has appeared for a quiet period — that tail is skipped when no
+    draft test was collected.
     """
     if not request.config.getoption("--run-integration"):
         yield

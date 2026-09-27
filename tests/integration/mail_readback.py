@@ -24,7 +24,7 @@ from typing import Any, cast
 
 import pytest
 
-from apple_mail_mcp.exceptions import MailDraftNotFoundError
+from apple_mail_mcp.exceptions import MailAppleScriptError, MailDraftNotFoundError
 from apple_mail_mcp.mail_connector import AppleMailConnector, _wrap_as_json_script
 from apple_mail_mcp.utils import escape_applescript_string, parse_applescript_json
 
@@ -328,25 +328,82 @@ def trash_arrival(connector: AppleMailConnector, account: str, arrival: Arrival)
     _await_gone(connector, ref, f"The INBOX copy of {arrival.rfc_message_id!r}")
 
 
-def trash_drafts(connector: AppleMailConnector, subject: str) -> None:
-    """Move every draft with ``subject`` to Trash, by id through the
-    connector's ``delete_draft``. By subject, not by the id a test was
-    given: an iCloud draft can be re-saved under a new id, and deleting
-    the old id then leaves the copy (docs/research/icloud-draft-resync.md,
-    which also records a delete over a walk of drafts removing nothing).
-    """
-    ref = f"messages of drafts mailbox whose subject is {_quoted(subject)}"
+def _drafts_ref(subject: str) -> str:
+    return f"messages of drafts mailbox whose subject is {_quoted(subject)}"
+
+
+def draft_ids(connector: AppleMailConnector, subject: str) -> list[str]:
+    """The Mail ids of every draft with ``subject``, in any account."""
     out = connector._run_applescript(
-        f'tell application "Mail" to set idList to id of ({ref})\n'
+        f'tell application "Mail" to set idList to id of ({_drafts_ref(subject)})\n'
         "set AppleScript's text item delimiters to \" \"\n"
         "return idList as text"
     )
-    for draft_id in out.split():
+    return out.split()
+
+
+def watch_draft_ids(
+    connector: AppleMailConnector,
+    subject: str,
+    seconds: float = 45.0,
+    every: float = 2.0,
+) -> list[tuple[float, list[str]]]:
+    """The ids of the drafts with ``subject``, read every ``every`` s
+    until ``seconds`` have passed, as (elapsed s, ids) per read. A read
+    that errors is recorded as its error text in place of the ids: a
+    draft replaced while the read walked the list raised there
+    (docs/research/draft-resave-spike.md, Observation 4). One read
+    proves nothing: a draft saved through the dictionary with a named
+    sender changed id 0.2–28 s after the save."""
+    started = time.monotonic()
+    seen: list[tuple[float, list[str]]] = []
+    while True:
+        elapsed = time.monotonic() - started
+        try:
+            ids = draft_ids(connector, subject)
+        except MailAppleScriptError as error:
+            ids = [f"error: {error}"]
+        seen.append((round(elapsed, 1), ids))
+        if elapsed >= seconds:
+            return seen
+        time.sleep(every)
+
+
+def draft_source(connector: AppleMailConnector, subject: str) -> str:
+    """The raw source of the first draft with ``subject``."""
+    return connector._run_applescript(
+        'tell application "Mail" to return source of first message of '
+        f"drafts mailbox whose subject is {_quoted(subject)}"
+    )
+
+
+def outgoing_message_count(connector: AppleMailConnector, subject: str) -> int:
+    """How many of Mail's outgoing messages carry ``subject``. A draft
+    saved through the dictionary left its outgoing message alive, one
+    per save, and a compose window closed with Save left none
+    (docs/research/draft-resave-spike.md, Observation 8)."""
+    out = connector._run_applescript(
+        'tell application "Mail" to return (count of (outgoing messages '
+        f"whose subject is {_quoted(subject)})) as text"
+    )
+    return int(out.strip())
+
+
+def trash_drafts(connector: AppleMailConnector, subject: str) -> None:
+    """Move every draft with ``subject`` to Trash, by id through the
+    connector's ``delete_draft``. By subject, not by the id a test was
+    given, so a copy of any origin goes too: a draft saved through the
+    dictionary with a named sender was re-saved under a new id, and
+    deleting the old id then left the copy
+    (docs/research/icloud-draft-resync.md, which also records a delete
+    over a walk of drafts removing nothing).
+    """
+    for draft_id in draft_ids(connector, subject):
         try:
             connector.delete_draft(draft_id)
         except MailDraftNotFoundError:
             pass  # already retired by the send, which is the ordinary case
-    _await_gone(connector, ref, f"A draft of {subject!r}")
+    _await_gone(connector, _drafts_ref(subject), f"A draft of {subject!r}")
 
 
 def compose_window_count(connector: AppleMailConnector, name: str) -> int:

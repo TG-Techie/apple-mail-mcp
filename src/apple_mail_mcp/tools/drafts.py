@@ -187,6 +187,17 @@ def _retire_old_draft(
     outcome the caller asked for holds, and the old id stays usable
     until they deal with it. Returns the text to surface as a warning,
     or None when the old draft is gone as intended.
+
+    A draft saved through Mail's scripting dictionary with a named
+    sender left its compose session open and was re-saved from it
+    seconds later, so retiring it early left a copy in Drafts
+    (docs/research/draft-resave-spike.md, Observation 6). The
+    connector saves every draft from a window closed with Save, which
+    leaves no session behind, and two updates of a named-sender draft
+    saved that way left no copy (the same note, Observation 11). The
+    copy can still come from a draft saved the old way, by this server
+    before 2026-09-27 or by another client, retired within its re-save
+    window.
     """
     try:
         server.mail.delete_draft(draft_id)

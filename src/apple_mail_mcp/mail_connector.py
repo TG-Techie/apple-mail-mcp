@@ -9,7 +9,9 @@ import re
 import subprocess
 import time
 import warnings
+from collections import Counter
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import date as _date
 from datetime import timedelta as _timedelta
 from email.utils import parseaddr
@@ -89,10 +91,11 @@ _SLOW_SEARCH_THRESHOLD_SEC = 5.0
 # outgoing message`. Such a window with an EMPTY body had a WebArea that
 # refused keyboard focus by every route tried (observed 2026-09-05; not
 # reproduced since, see docs/research/paste-focus-failed.md, so it
-# stays). The seed does not reach the sent message: the fresh-send
-# composition selects the whole body and deletes it before pasting
-# (``_PASTE_CARET_KEYS["replace"]``), because Mail keeps anything set
-# through ``content`` inside a <blockquote type="cite">.
+# stays). The seed reaches neither a sent message nor a saved draft: the
+# composition selects the whole body of a fresh message and deletes it
+# before pasting (``_PASTE_CARET_KEYS["replace"]``), empty body or not,
+# because Mail keeps anything set through ``content`` inside a
+# <blockquote type="cite">.
 _BODY_SEED = " "
 
 # Where a clipboard paste lands in a compose window's body, as the keys
@@ -104,8 +107,8 @@ _BODY_SEED = " "
 #             the seed inside Mail's URLShare wrapper; pasting above it
 #             instead sent an empty <blockquote type="cite">, which iOS
 #             Mail draws as a purple quoted-reply bar.
-#   end     - cmd+down: after everything, where the fresh-send
-#             composition pastes its attachments once the body is in.
+#   end     - cmd+down: after everything, where the composition pastes
+#             files once the body is in.
 _PastePlacement = Literal["above", "replace", "end"]
 _PASTE_CARET_KEYS: dict[_PastePlacement, str] = {
     "above": "key code 126 using command down\n            delay 0.2",
@@ -119,17 +122,60 @@ _PASTE_CARET_KEYS: dict[_PastePlacement, str] = {
 
 def _refuse_overlong_body(body: str) -> None:
     """Refuse a caller's message body longer than ``sanitize_input``
-    carries. Every body reaches Mail through it, pasted or set through
-    ``content``, and it cuts at SANITIZE_MAX_LENGTH without a word, so a
-    longer body would go out or be saved shortened. Called where a body
-    enters the connector (``create_draft``, ``_send_html_email``), before
-    anything is looked up or composed."""
+    carries. Every body reaches Mail's pasteboard through it, and it cuts
+    at SANITIZE_MAX_LENGTH without a word, so a longer body would go out
+    or be saved shortened. Called where a body enters the connector
+    (``create_draft``, ``_send_html_email``), before anything is looked
+    up or composed."""
     if len(body) > SANITIZE_MAX_LENGTH:
         raise ValueError(
             f"body is {len(body)} characters; a message body carries at "
             f"most {SANITIZE_MAX_LENGTH}. Nothing was composed, saved or "
             "sent."
         )
+
+
+def _existing_files(attachment_paths: list[Path] | None) -> list[Path]:
+    """The files a caller asked to attach, each checked to exist before
+    anything is composed; ``FileNotFoundError`` names the first that
+    does not."""
+    files = [Path(p) for p in attachment_paths or []]
+    for f in files:
+        if not f.is_file():
+            raise FileNotFoundError(f"attachment not found: {f}")
+    return files
+
+
+@dataclass(frozen=True)
+class _ComposeWindow:
+    """An open compose window, as the composition's opening script
+    reports it: the window's name, the subject and recipients Mail holds
+    for its message after every override, and the Drafts ids that
+    existed before it opened (empty unless a save was asked for)."""
+
+    name: str
+    subject: str
+    to: list[str]
+    cc: list[str]
+    bcc: list[str]
+    before_ids: list[int]
+
+
+def _compose_window_from_report(report: dict[str, Any]) -> _ComposeWindow:
+    """The opening script's ``resultData`` as a ``_ComposeWindow``; Mail's
+    ``missing value`` groups arrive as empty lists."""
+    groups = {
+        group: [str(a) for a in report.get(group) or []]
+        for group in ("to", "cc", "bcc")
+    }
+    return _ComposeWindow(
+        name=str(report["window"]),
+        subject=str(report["subject"]),
+        to=groups["to"],
+        cc=groups["cc"],
+        bcc=groups["bcc"],
+        before_ids=[int(i) for i in report.get("before_ids") or []],
+    )
 
 
 # MCP-tool field name → Mail.app AppleScript `rule type` enum identifier.
@@ -3828,10 +3874,12 @@ class AppleMailConnector:
         mailboxes are typically small. The aggregate covers every
         account's drafts mailbox whatever the locale names it. A draft
         that vanishes between the listing and the walk reaching it (Mail
-        re-saves a draft with a named sender under a new id 8–31 s after
-        it is saved, docs/research/icloud-draft-resync.md) is skipped
-        rather than failing the walk: it is not the draft asked for, and
-        if it was, not-found is the truth.
+        re-saved a draft saved through its scripting dictionary with a
+        named sender under a new id 8–31 s after the save,
+        docs/research/icloud-draft-resync.md; this connector no longer
+        saves that way, but another client may, and a draft can be
+        deleted mid-walk) is skipped rather than failing the walk: it is
+        not the draft asked for, and if it was, not-found is the truth.
 
         Returns:
             ``{
@@ -3991,66 +4039,34 @@ class AppleMailConnector:
                 raise ValueError("'subject' is required when seed='new'")
 
     @staticmethod
-    def _build_attachment_block(
-        attachment_paths: list[Path] | None,
-    ) -> str:
-        """AppleScript fragment that attaches files to ``theMessage``.
-        Returns ``""`` when ``attachment_paths`` is None or empty.
-        Raises ``FileNotFoundError`` on the first non-existent path. (#193)
-        """
-        if not attachment_paths:
-            return ""
-        for p in attachment_paths:
-            if not Path(p).is_file():
-                raise FileNotFoundError(f"attachment not found: {p}")
-        paths_safe = ", ".join(
-            f'"{escape_applescript_string(str(Path(p).resolve()))}"'
-            for p in attachment_paths
-        )
-        return f"""
-            repeat with apath in {{{paths_safe}}}
-                tell theMessage to make new attachment with properties {{file name:(POSIX file apath)}} at after last paragraph
-            end repeat
-        """
-
-    @staticmethod
     def _build_creation_block(
         seed: str,
         seed_id_safe: str | None,
         reply_all: bool,
         subject_safe: str | None,
-        open_window: bool = False,
     ) -> str:
-        """Per-seed AppleScript fragment that produces ``theMessage``.
+        """Per-seed AppleScript fragment that produces ``theMessage`` in a
+        visible compose window, which is where every message the
+        connector composes is written (``_compose``).
 
-        ``open_window`` opens a reply or forward in a visible compose
-        window, the only way to add text above what Mail wrote: its
-        content is not readable before send, and any edit to it through
-        the dictionary replaces the quote or forwarded message and drops
-        a forward's attachments (measured 2026-09-26, see
-        ``_compose_note_above_seed``).
+        A fresh message is ``make new outgoing message`` with
+        ``visible:true``, its subject, and the one-space body seed
+        (``_BODY_SEED``), which the composition pastes over.
 
-        The reply/forward branches share the cross-account ``whose id
-        is "{seed_id_safe}"`` lookup pattern, differing only in the
-        Mail.app verb (``reply`` / ``reply to all`` / ``forward``).
-        ``seed_id_safe`` is expected to be Mail's internal id —
-        callers route RFC 5322 ids through
-        ``_maybe_resolve_rfc_seed_id`` first (#205). (#193)
-
-        The ``"new"`` seed serves saved drafts only; a fresh message
-        sent at once is composed by ``_send_fresh``. Its body is set by
-        the caller's separate ``set content of theMessage``, which was
-        once thought to keep Mail from quoting it. Measured 2026-09-27
-        through the loopback read-back, it does not: a body set that way
-        and sent arrived with a leading newline, inside Mail's URLShare
-        wrapper and a ``<blockquote type="cite">``, and quoted with "> "
-        in the plain part (docs/research/icloud-draft-resync.md,
-        Observation 10).
+        A reply or forward is Mail's own verb (``reply`` / ``reply to
+        all`` / ``forward``) with ``opening window true``, after the
+        cross-account ``whose id is "{seed_id_safe}"`` lookup.
+        ``seed_id_safe`` is expected to be Mail's internal id — callers
+        route RFC 5322 ids through ``_maybe_resolve_rfc_seed_id`` first
+        (#205). Opened without a window, what Mail wrote is not readable
+        before send, and any edit of it through the dictionary replaced
+        the quote or forwarded message and dropped a forward's
+        attachments (measured 2026-09-26, see ``_compose``).
         """
         if seed == "new":
             return (
                 f'set theMessage to make new outgoing message with properties '
-                f'{{subject:"{subject_safe}", visible:false}}'
+                f'{{subject:"{subject_safe}", visible:true, content:"{_BODY_SEED}"}}'
             )
         if seed == "reply":
             verb = "reply to all" if reply_all else "reply"
@@ -4070,7 +4086,7 @@ class AppleMailConnector:
                 if origMsg is not missing value then exit repeat
             end repeat
             if origMsg is missing value then error "SEED_NOT_FOUND"
-            set theMessage to {verb} origMsg opening window {"true" if open_window else "false"}
+            set theMessage to {verb} origMsg opening window true
         """
 
     @staticmethod
@@ -4191,9 +4207,10 @@ class AppleMailConnector:
         a reply or forward verb, or by ``make new outgoing message``),
         by comparing Mail's window names before and after, counting each
         name. A name already open does not hide a new window of the same
-        name: a draft saved through the dictionary leaves its window
-        behind (docs/research/icloud-draft-resync.md, Observation 5), and
-        a plain set difference then saw no new window at all (2026-09-26).
+        name: a draft saved through the dictionary, as this connector's
+        once were, leaves its window behind
+        (docs/research/icloud-draft-resync.md, Observation 5), and a
+        plain set difference then saw no new window at all (2026-09-26).
 
         Needs ``beforeNames`` (System Events' ``name of windows`` of Mail)
         set before the window is opened; sets ``newName``. Errors NO_COMPOSE_WINDOW
@@ -4854,9 +4871,10 @@ end tell
         reply_to: str | None = None,
     ) -> dict[str, str]:
         """Send an HTML email at once; no draft is saved first. A fresh
-        message goes through ``_send_fresh``, a reply into a thread
-        through ``_send_html_reply``. Either way the HTML reaches the
-        compose window by clipboard paste, never through ``content``.
+        message goes through the one composition (``_compose``), a reply
+        into a thread through ``_send_html_reply``. Either way the HTML
+        reaches the compose window by clipboard paste, never through
+        ``content``.
 
         Args:
             to: List of recipient email addresses.
@@ -4882,7 +4900,7 @@ end tell
                 outbound allowlist.
             MailAppleScriptError: a mechanical read-back failed. Nothing
                 was sent, except when the error says the message WAS sent
-                and its Sent copy has the wrong number of attachments.
+                and its Sent copy lacks a file it was sent with.
         """
         _refuse_overlong_body(body)
         if attachment_paths and reply_to is not None:
@@ -4904,166 +4922,43 @@ end tell
                 from_account=from_account,
                 reply_to=reply_to,
             )
-        return self._send_fresh(
+        return self._compose(
+            seed="new",
+            seed_id=None,
+            reply_all=False,
             to=to,
             cc=cc,
             bcc=bcc,
             subject=subject,
             body=body,
             plain=False,
-            from_account=from_account,
             attachment_paths=attachment_paths,
+            from_account=from_account,
+            send_now=True,
         )
 
-    def _send_fresh(
-        self,
-        *,
-        to: list[str],
-        cc: list[str] | None,
-        bcc: list[str] | None,
-        subject: str,
-        body: str,
-        plain: bool,
-        from_account: str | None,
-        attachment_paths: list[Path] | None,
-    ) -> dict[str, str]:
-        """Send a fresh message at once: the one composition behind
-        ``create_draft(seed="new", send_now=True)`` (``plain``) and a
-        fresh ``_send_html_email`` (HTML).
-
-          1. Compose a visible window with ``make new outgoing message``:
-             the recipients, the one-space body seed (``_BODY_SEED``),
-             and, when ``from_account`` names an account, that account
-             as sender, set last. The window is found by comparing
-             Mail's window names before and after, never guessed from
-             the subject.
-          2. Paste the body over everything the window holds (select
-             all, delete, paste) and read it back from a fresh process.
-          3. Paste the attachments, if any, after the body, and wait for
-             each in the window's AX tree.
-          4. The verified send, then the Sent copy's attachment count.
-
-        Why this shape, measured through the loopback read-back on
-        2026-09-27 (docs/research/icloud-draft-resync.md, Observation
-        10): a body set through ``content`` arrives inside Mail's
-        ``<blockquote type="cite">``; a body pasted above the seed
-        leaves an empty one below it; files attached through the
-        dictionary after the paste bring it back. This composition
-        arrives with the named sender, the text as written, the files
-        intact, and nothing quoted. It replaced the mailto: URL handler,
-        which composes from Mail's default account and cannot carry
-        attachments.
-
-        Checked before anything is composed: every recipient passes the
-        outbound allowlist (``MailOutboundDisallowedError``), here as
-        well as at every caller, since the connector is the hard block
-        on a path by which mail leaves; every attachment exists
-        (``FileNotFoundError``); and ``from_account`` names an account
-        (``MailAccountNotFoundError``). The body's length was refused
-        where it entered the connector (``_refuse_overlong_body``). A
-        later failure salvages the window to Drafts and raises
-        ``MailAppleScriptError``, which says so when the message was in
-        fact sent.
-        """
-        assert_recipients_allowed_for_send(to, cc, bcc, seed="new")
-        files = [Path(p) for p in attachment_paths or []]
-        for f in files:
-            if not f.is_file():
-                raise FileNotFoundError(f"attachment not found: {f}")
-        sender = (
-            self._resolve_account_to_sender(from_account)
-            if from_account is not None
-            else None
-        )
-        raw = self._run_applescript(
-            _wrap_as_json_script(
-                self._build_fresh_compose_script(
-                    to=to, cc=cc, bcc=bcc, subject=subject, sender=sender,
-                ),
-                timeout=self.timeout,
-            )
-        )
-        window = str(cast(dict[str, Any], parse_applescript_json(raw))["window"])
-        self._paste_verified(
-            window_name=window, body=body, placement="replace", plain=plain,
-        )
-        if files:
-            self._paste_attachments(window, files)
-        result = self._send_compose_window(window, subject)
-        if files:
-            self._check_sent_attachment_count(subject, len(files))
-        return result
-
-    def _build_fresh_compose_script(
-        self,
-        *,
-        to: list[str],
-        cc: list[str] | None,
-        bcc: list[str] | None,
-        subject: str,
-        sender: str | None,
-    ) -> str:
-        """AppleScript body for ``_wrap_as_json_script``: a visible compose
-        window with the subject, recipients, body seed and, when given,
-        ``sender`` (already resolved, set last: set before the recipients
-        it cost a saved draft its recipients,
-        docs/research/icloud-draft-resync.md, Observation 6). Sets
-        ``resultData`` to ``{window: <the new window's name>}``.
-
-        The body seed is load-bearing: see ``_BODY_SEED``. It does not
-        reach the sent message; ``_send_fresh`` pastes over it."""
-        subject_safe = escape_applescript_string(sanitize_input(subject))
-        recipient_lines: list[str] = []
-        for group, cls in ((to, "to recipient"), (cc or [], "cc recipient"),
-                           (bcc or [], "bcc recipient")):
-            for addr in group:
-                addr_safe = escape_applescript_string(sanitize_input(addr))
-                recipient_lines.append(
-                    f'        make new {cls} at end of {cls}s '
-                    f'with properties {{address:"{addr_safe}"}}'
-                )
-        recipients_block = "\n".join(recipient_lines)
-        sender_line = (
-            "    set sender of theMessage to "
-            f'"{escape_applescript_string(sanitize_input(sender))}"'
-            if sender is not None
-            else ""
-        )
-        return f"""
-tell application "System Events"
-    tell application process "Mail"
-        set beforeNames to name of windows
-    end tell
-end tell
-tell application "Mail"
-    set theMessage to make new outgoing message with properties {{subject:"{subject_safe}", visible:true, content:"{_BODY_SEED}"}}
-    tell theMessage
-{recipients_block}
-    end tell
-{sender_line}
-    activate
-end tell
-{self._as_new_compose_window_block()}
-set resultData to {{|window|:newName}}
-"""
-
-    def _check_sent_attachment_count(self, subject: str, expected: int) -> None:
-        """After a send: the Sent copy of ``subject`` must carry
-        ``expected`` attachments. A mismatch raises, saying the message
-        WAS sent, so the caller inspects it before sending again."""
+    def _check_sent_attachments(self, subject: str, names: list[str]) -> None:
+        """After a send: the Sent copy of ``subject`` must carry every
+        file the composition pasted, by name. It may carry more: a
+        forward's has the original's files as well. A file missing
+        raises, saying the message WAS sent, so the caller inspects it
+        before sending again."""
         subject_safe = escape_applescript_string(subject)
-        count_out = self._run_applescript(
-            f'tell application "Mail" to return (count of mail attachments '
-            f'of (first message of sent mailbox whose subject is '
-            f'"{subject_safe}")) as text'
-        ).strip()
-        got = int(count_out) if count_out.isdigit() else -1
-        if got != expected:
+        raw = self._run_applescript(_wrap_as_json_script(f"""
+tell application "Mail"
+    set attNames to name of every mail attachment of (first message of sent mailbox whose subject is "{subject_safe}")
+    if attNames is missing value then set attNames to {{}}
+    set resultData to attNames
+end tell
+""", timeout=self.timeout))
+        carried = [str(n) for n in cast(list[Any], parse_applescript_json(raw))]
+        missing = list((Counter(names) - Counter(carried)).elements())
+        if missing:
             raise MailAppleScriptError(
                 f"send with attachments: message WAS sent, but the sent "
-                f"copy shows {count_out} of {expected} expected "
-                f"attachments — inspect the Sent mailbox copy "
-                f"(subject {subject!r}) before resending."
+                f"copy lacks {missing} of the files attached (it carries "
+                f"{carried}) — inspect the Sent mailbox copy (subject "
+                f"{subject!r}) before resending."
             )
 
     @staticmethod
@@ -5171,6 +5066,11 @@ end if
     ) -> dict[str, str]:
         """Create a draft (fresh, reply, or forward). Optionally send.
 
+        Every seed, saved or sent, is composed the one way
+        (``_compose``): in a visible compose window, the body pasted as
+        plain text, so Mail comes to the front for a few seconds. A
+        saved draft is that window closed with Save.
+
         Args:
             seed: ``"new"``, ``"reply"``, or ``"forward"``.
             seed_id: Identifier of the message to reply/forward. Accepts
@@ -5185,14 +5085,14 @@ end if
             subject: Subject. For ``seed="new"`` this is required by the
                 caller. For reply/forward, ``None`` keeps Mail's
                 auto-derived ``Re:``/``Fwd:`` prefix; non-None overrides.
-            body: Body text. For reply/forward, a non-empty body goes
-                above what Mail wrote, which stays: the quoted original,
-                or the forwarded message with its header block and every
-                attachment Mail carried. It is pasted as plain text in a
-                visible compose window (``_compose_note_above_seed``), so
-                Mail comes to the front for a few seconds. An empty body
-                leaves Mail's quote or forward exactly as Mail made it.
-            attachment_paths: List of file paths. Each must exist.
+            body: Body text. On a fresh message it is the whole body. For
+                reply/forward, a non-empty body goes above what Mail
+                wrote, which stays: the quoted original, or the forwarded
+                message with its header block and every attachment Mail
+                carried; an empty body leaves Mail's quote or forward
+                exactly as Mail made it.
+            attachment_paths: List of file paths, pasted into the body
+                after everything else. Each must exist.
             reply_all: For ``seed="reply"`` only — use ``reply to all``.
             from_account: Mail.app account name or UUID; ``None`` uses
                 Mail's default sender for the seed message.
@@ -5208,9 +5108,15 @@ end if
         Raises:
             ValueError: invalid seed, missing required fields, or a body
                 longer than a message body carries.
+            FileNotFoundError: a listed attachment does not exist.
             MailAccountNotFoundError: ``from_account`` doesn't match.
             MailMessageNotFoundError: ``seed_id`` not found in any mailbox.
-            MailAppleScriptError: AppleScript failure.
+            MailOutboundDisallowedError: on a send, a recipient is not on
+                the outbound allowlist.
+            MailDraftNotSettledError: the saved draft did not appear in
+                Drafts, so there is no id to return.
+            MailAppleScriptError: AppleScript failure, or a mechanical
+                read-back of the compose window failed.
         """
         self._validate_create_draft_args(seed, seed_id, to, subject)
         _refuse_overlong_body(body)
@@ -5228,140 +5134,169 @@ end if
                 to, cc, bcc, seed=seed, reply_all=reply_all
             )
 
-        # A fresh message sent at once is composed in a visible window and
-        # its body pasted: set through `content`, as a saved draft's is
-        # below, it would arrive inside <blockquote type="cite">, which
-        # iOS Mail draws as a purple bar. See _send_fresh.
-        if seed == "new" and send_now:
-            return self._send_fresh(
-                to=to or [],
-                cc=cc,
-                bcc=bcc,
-                subject=subject or "",
-                body=body,
-                plain=True,
-                from_account=from_account,
-                attachment_paths=attachment_paths,
-            )
-
         # If the caller handed us an RFC 5322 Message-ID (the form read
         # tools emit on the IMAP path per #148), resolve to Mail's
-        # internal id before the `whose id is` lookup below. (#205)
+        # internal id before the `whose id is` lookup. (#205)
         seed_id = self._maybe_resolve_rfc_seed_id(seed, seed_id)
-
-        seed_id_safe = (
-            escape_applescript_string(sanitize_input(seed_id))
-            if seed_id is not None
-            else None
-        )
-        headers_block = self._draft_headers_block(
+        return self._compose(
             seed=seed,
+            seed_id=seed_id,
+            reply_all=reply_all,
             to=to,
             cc=cc,
             bcc=bcc,
             subject=subject,
+            body=body,
+            plain=True,
             attachment_paths=attachment_paths,
             from_account=from_account,
+            send_now=send_now,
         )
 
-        # A note on a reply or forward goes ABOVE what Mail wrote, which
-        # only a visible compose window allows (_compose_note_above_seed).
-        # With no note, Mail's quote or forwarded message is left exactly
-        # as Mail made it, by the dictionary path below.
-        if seed != "new" and body:
-            return self._compose_note_above_seed(
-                seed=seed,
-                seed_id=seed_id,
-                seed_id_safe=seed_id_safe,
-                reply_all=reply_all,
-                headers_block=headers_block,
-                body=body,
-                send_now=send_now,
+    def _compose(
+        self,
+        *,
+        seed: str,
+        seed_id: str | None,
+        reply_all: bool,
+        to: list[str] | None,
+        cc: list[str] | None,
+        bcc: list[str] | None,
+        subject: str | None,
+        body: str,
+        plain: bool,
+        attachment_paths: list[Path] | None,
+        from_account: str | None,
+        send_now: bool,
+    ) -> dict[str, str]:
+        """The one composition behind every draft the connector saves
+        and every message it sends but the HTML reply
+        (``_send_html_reply``): ``create_draft`` for every seed and both
+        outcomes (``plain``), and a fresh ``_send_html_email`` (HTML).
+
+          1. Open a visible compose window (``_open_compose``): a fresh
+             message, or Mail's own reply or forward of the seed. Its
+             headers go through the dictionary: a reply's or forward's
+             subject override, each recipient group, and the sender, set
+             last. The window is found by comparing Mail's window names
+             before and after, never guessed from the subject, and the
+             subject and recipients it holds are read back.
+          2. On a send, those recipients pass the outbound allowlist, or
+             the window is discarded and nothing is pasted.
+          3. Paste the body and read it back (``_fill_compose``), then the
+             files, each seen in the window's AX tree.
+          4. Send: the verified send, then the Sent copy must carry every
+             file by name. Or save: close the window with Save and find
+             the draft it became.
+
+        Why every message goes this way, all measured on 2026-09-26 and
+        -27. Opened without a window, Mail's reply or forward exposes no
+        content, and every edit of it through the dictionary replaced
+        what Mail wrote. A body set through ``content`` arrives inside
+        Mail's ``<blockquote type="cite">``, so a human sending such a
+        saved draft from Mail.app sent it quoted; a body pasted above the
+        fresh seed leaves an empty one below it; files attached through
+        the dictionary after the paste bring it back
+        (docs/research/icloud-draft-resync.md, Observation 10). A draft
+        saved through the dictionary with a named sender was re-saved by
+        Mail under a new id and Message-ID 0.2–28 s after the save, and
+        every dictionary save left a hidden outgoing message behind; a
+        window closed with Save kept its id for 45 s in 6 runs of 6 and
+        left none (docs/research/draft-resave-spike.md).
+
+        Checked before anything is composed: on a send, every recipient
+        the caller named passes the outbound allowlist
+        (``MailOutboundDisallowedError``), here as well as at every
+        caller, since the connector is the hard block on a path by which
+        mail leaves; every attachment exists (``FileNotFoundError``); and
+        ``from_account`` names an account (``MailAccountNotFoundError``).
+        The body's length was refused where it entered the connector
+        (``_refuse_overlong_body``). A later failure salvages the window
+        to Drafts and raises ``MailAppleScriptError``, which says so when
+        the message was in fact sent.
+        """
+        if send_now:
+            assert_recipients_allowed_for_send(
+                to, cc, bcc, seed=seed, reply_all=reply_all
             )
-
-        # A fresh message's body is set here, never in the creation
-        # properties (see _build_creation_block); it may be empty. A reply
-        # or forward reaching this point has no body, and its content is
-        # not touched: any edit to it replaces what Mail wrote.
-        body_block = (
-            f'set content of theMessage to "{escape_applescript_string(sanitize_input(body))}"'
-            if seed == "new"
-            else ""
-        )
-        subject_safe = (
-            escape_applescript_string(sanitize_input(subject))
-            if subject is not None
+        files = _existing_files(attachment_paths)
+        sender = (
+            self._resolve_account_to_sender(from_account)
+            if from_account is not None
             else None
         )
-        creation_block = self._build_creation_block(
-            seed, seed_id_safe, reply_all, subject_safe,
+        window = self._open_compose(
+            seed=seed,
+            seed_id=seed_id,
+            reply_all=reply_all,
+            to=to,
+            cc=cc,
+            bcc=bcc,
+            subject=subject,
+            sender=sender,
+            snapshot_drafts=not send_now,
         )
-
-        # Terminal block: save (with id-bridging diff) or send.
         if send_now:
-            terminal_block = """
-                tell theMessage to send
-                return "SENT"
-            """
-        else:
-            terminal_block = f"""
-                save theMessage
+            self._gate_compose_recipients(
+                window.name, window.to, window.cc, window.bcc
+            )
+        self._fill_compose(
+            window.name, seed=seed, body=body, plain=plain, files=files
+        )
+        if send_now:
+            result = self._send_compose_window(window.name, window.subject)
+            if files:
+                self._check_sent_attachments(
+                    window.subject, [f.name for f in files]
+                )
+            return result
+        draft_id = self._save_compose_window_as_draft(
+            window.name, window.subject, window.before_ids
+        )
+        return {"draft_id": draft_id, "sent_message_id": ""}
 
-                -- The saved draft takes a moment to appear in Drafts
-                -- (measured 2026-09-11: absent at 0.5 s, present by
-                -- 1.5 s), so poll for it with a bound instead of
-                -- guessing a delay.
-                set newDraftId to ""
-                repeat with attempt from 1 to {self._DRAFT_APPEAR_POLLS}
-                    delay {self._DRAFT_APPEAR_INTERVAL_S}
-                    set afterIds to (id of every message of drafts mailbox)
-                    repeat with candRef in afterIds
-                        set candId to contents of candRef
-                        if candId is not in beforeIds then
-                            set newDraftId to (candId as text)
-                            exit repeat
-                        end if
-                    end repeat
-                    if newDraftId is not "" then exit repeat
-                end repeat
-                -- Appearing is not settling: a delete issued the instant
-                -- the id is listed does not take, one issued 1 s later
-                -- does, and no readable property of the draft changes in
-                -- between (measured 2026-09-11, see
-                -- docs/research/icloud-draft-resync.md).
-                if newDraftId is not "" then delay {self._DRAFT_SETTLE_S}
-                return newDraftId
-            """
+    def _fill_compose(
+        self,
+        window: str,
+        *,
+        seed: str,
+        body: str,
+        plain: bool,
+        files: list[Path],
+    ) -> None:
+        """Paste the caller's part into the open compose window.
 
-        # Pre-save snapshot for id diffing (only when saving as draft).
-        # `drafts mailbox` is Mail's aggregate of every account's drafts
-        # mailbox, whatever the locale names it.
-        snapshot_block = ""
-        if not send_now:
-            snapshot_block = """
-                set beforeIds to (id of every message of drafts mailbox)
-            """
+        The body is read back from a fresh process after the paste. A
+        fresh message's replaces everything the window holds (select all,
+        delete, paste), the one-space seed included, so an empty body is
+        an empty paste and leaves the body empty. A reply's or forward's
+        goes above what Mail wrote, and only when there is one: with no
+        body, Mail's quote or forward is left exactly as Mail made it.
 
-        script = f"""
-        tell application "Mail"
-            {snapshot_block}
-
-            {creation_block}
-
-            {body_block}
-            {headers_block}
-
-            {terminal_block}
-        end tell
+        The files go in last, at the end of the body, pasted as file URLs
+        (``_paste_attachments``), on every seed. Measured 2026-09-27 on
+        a reply and a forward whose body was not touched, each sent with
+        one file to the loopback and read back from its Sent copy (no
+        delivered copy arrived within 120 s;
+        docs/research/icloud-draft-resync.md, Observation 11): attached
+        through the dictionary (``make new attachment``), the file went
+        but Mail's part did not — the original went out unquoted, with
+        no "On … wrote:" or "Begin forwarded message:", above an empty
+        cite blockquote, and the forward lost both of the original's
+        files. Pasted at the end, the quote and the forwarded message
+        stayed as Mail made them, the forward kept both files, and the
+        caller's file sat after Mail's part, outside its blockquote.
         """
-
-        result = self._run_seeded_script(script, seed_id)
-
-        if send_now:
-            return {"draft_id": "", "sent_message_id": ""}
-        if not result:
-            raise self._draft_not_settled()
-        return {"draft_id": result, "sent_message_id": ""}
+        if seed == "new":
+            self._paste_verified(
+                window_name=window, body=body, placement="replace", plain=plain,
+            )
+        elif body:
+            self._paste_verified(
+                window_name=window, body=body, placement="above", plain=plain,
+            )
+        if files:
+            self._paste_attachments(window, files)
 
     def _draft_not_settled(self) -> MailDraftNotSettledError:
         return MailDraftNotSettledError(
@@ -5391,7 +5326,9 @@ end if
         clears it, a list replaces it."""
         if addrs is None:
             return ""
-        list_str = ", ".join(f'"{escape_applescript_string(a)}"' for a in addrs)
+        list_str = ", ".join(
+            f'"{escape_applescript_string(sanitize_input(a))}"' for a in addrs
+        )
         return f"""
                 delete (every {kind} recipient of theMessage)
                 repeat with addr in {{{list_str}}}
@@ -5407,119 +5344,73 @@ end if
         cc: list[str] | None,
         bcc: list[str] | None,
         subject: str | None,
-        attachment_paths: list[Path] | None,
-        from_account: str | None,
+        sender: str | None,
     ) -> str:
-        """AppleScript for everything create_draft applies to
-        ``theMessage`` besides its body: the subject override (reply and
-        forward; a fresh message gets its subject at creation), each
-        recipient group, the attachments, and the sender, set LAST — set
-        before the content and recipients, the first saved copy of a
-        draft carried no recipients (docs/research/icloud-draft-resync.md,
-        Observation 6)."""
+        """AppleScript for every header the composition sets on
+        ``theMessage`` through the dictionary: the subject override
+        (reply and forward; a fresh message gets its subject at
+        creation), each recipient group, and ``sender`` (already
+        resolved), set LAST — set before the content and recipients, the
+        first saved copy of a draft carried no recipients
+        (docs/research/icloud-draft-resync.md, Observation 6)."""
         parts = []
         if seed != "new" and subject is not None:
             subject_safe = escape_applescript_string(sanitize_input(subject))
             parts.append(f'set subject of theMessage to "{subject_safe}"')
         for kind, addrs in (("to", to), ("cc", cc), ("bcc", bcc)):
             parts.append(self._recipient_override_block(kind, addrs))
-        parts.append(self._build_attachment_block(attachment_paths))
         # The SECURITY_CHECKLIST two-step idiom (sanitize_input then
         # escape_applescript_string) applies even though the resolver
         # pulls from Mail.app's own account list — the convention exists
         # so we don't have to risk-assess each site individually, and the
         # Display-Name <email> form from #158 broadened what characters
         # can appear here. (#173)
-        if from_account is not None:
-            sender_email = self._resolve_account_to_sender(from_account)
-            sender_safe = escape_applescript_string(sanitize_input(sender_email))
+        if sender is not None:
+            sender_safe = escape_applescript_string(sanitize_input(sender))
             parts.append(f'set sender of theMessage to "{sender_safe}"')
         return "\n".join(part for part in parts if part)
 
-    def _compose_note_above_seed(
+    def _build_open_compose_script(
         self,
         *,
         seed: str,
         seed_id: str | None,
-        seed_id_safe: str | None,
         reply_all: bool,
-        headers_block: str,
-        body: str,
-        send_now: bool,
-    ) -> dict[str, str]:
-        """A reply or forward carrying the caller's text ABOVE what Mail
-        wrote: the quoted original, or the forwarded message with its
-        header block and every attachment Mail carried.
-
-        Measured through the loopback read-back (tests/integration/
-        test_loopback.py) on 2026-09-26. Mail's reply or forward opened
-        without a window exposes no content before it is sent: ``content``
-        reads empty, with 0 paragraphs and 0 attachments. Every edit of
-        that content through the dictionary replaced what Mail wrote, as
-        delivered: ``set content`` to the note lost the forwarded header
-        block and both attachments and put the original's text above the
-        note; ``make new paragraph at before paragraph 1`` did the same.
-        With no edit, the forward arrived whole.
-
-        So the message is opened in a VISIBLE compose window, its headers
-        are applied through the dictionary (header-only, content never
-        touched), and the caller's text is pasted as plain text at the top
-        (the HTML reply path's paste, cmd+up first) and read back from a
-        fresh process. Then the window is sent through the verified send,
-        or closed with Save and the new draft's id found. On a send, the
-        recipients read back from the window pass the allowlist gate
-        before anything is pasted; off-list, the window is discarded.
-        """
-        opened = self._open_seeded_compose(
-            seed=seed,
-            seed_id=seed_id,
-            seed_id_safe=seed_id_safe,
-            reply_all=reply_all,
-            headers_block=headers_block,
-            snapshot_drafts=not send_now,
-        )
-        window = str(opened["window"])
-        subject = str(opened["subject"])
-        if send_now:
-            self._gate_compose_recipients(
-                window,
-                [str(a) for a in opened.get("to") or []],
-                [str(a) for a in opened.get("cc") or []],
-                [str(a) for a in opened.get("bcc") or []],
-            )
-        self._paste_verified(
-            window_name=window, body=body, placement="above", plain=True,
-        )
-        if send_now:
-            return self._send_compose_window(window, subject)
-        before_ids = [int(i) for i in opened.get("before_ids") or []]
-        draft_id = self._save_compose_window_as_draft(window, subject, before_ids)
-        return {"draft_id": draft_id, "sent_message_id": ""}
-
-    def _open_seeded_compose(
-        self,
-        *,
-        seed: str,
-        seed_id: str | None,
-        seed_id_safe: str | None,
-        reply_all: bool,
-        headers_block: str,
+        to: list[str] | None,
+        cc: list[str] | None,
+        bcc: list[str] | None,
+        subject: str | None,
+        sender: str | None,
         snapshot_drafts: bool,
-    ) -> dict[str, Any]:
-        """Open Mail's reply or forward of the seed in a visible compose
-        window, apply ``headers_block``, and read back what the window
-        holds: its name (found by window-set diff, never guessed), subject
-        and recipients, and — when ``snapshot_drafts`` — the Drafts ids
-        that existed before, so a later save can find its own."""
+    ) -> str:
+        """AppleScript body for ``_wrap_as_json_script``: open the compose
+        window (``_build_creation_block``), name it by window-set diff,
+        apply the headers (``_draft_headers_block``), and set
+        ``resultData`` to what the window holds: its name, subject and
+        recipients, and — when ``snapshot_drafts`` — the Drafts ids that
+        existed before it opened, so the save can find its own."""
+        seed_id_safe = (
+            escape_applescript_string(sanitize_input(seed_id))
+            if seed_id is not None
+            else None
+        )
+        subject_safe = (
+            escape_applescript_string(sanitize_input(subject))
+            if subject is not None
+            else None
+        )
         creation_block = self._build_creation_block(
-            seed, seed_id_safe, reply_all, None, open_window=True,
+            seed, seed_id_safe, reply_all, subject_safe,
+        )
+        headers_block = self._draft_headers_block(
+            seed=seed, to=to, cc=cc, bcc=bcc, subject=subject, sender=sender,
         )
         snapshot = (
             "set beforeIds to (id of every message of drafts mailbox)"
             if snapshot_drafts
             else "set beforeIds to {}"
         )
-        script_body = f"""
+        return f"""
 tell application "System Events"
     tell application process "Mail"
         set beforeNames to name of windows
@@ -5542,10 +5433,34 @@ tell application "Mail"
     set resultData to {{|window|:newName, |subject|:(subject of theMessage as text), |to|:toAddrs, |cc|:ccAddrs, |bcc|:bccAddrs, |before_ids|:beforeIds}}
 end tell
 """
-        raw = self._run_seeded_script(
-            _wrap_as_json_script(script_body, timeout=self.timeout), seed_id
+
+    def _open_compose(
+        self,
+        *,
+        seed: str,
+        seed_id: str | None,
+        reply_all: bool,
+        to: list[str] | None,
+        cc: list[str] | None,
+        bcc: list[str] | None,
+        subject: str | None,
+        sender: str | None,
+        snapshot_drafts: bool,
+    ) -> _ComposeWindow:
+        """Open the compose window ``_build_open_compose_script``
+        describes and return what it reported; a seed that is gone is
+        ``MailMessageNotFoundError``."""
+        script = self._build_open_compose_script(
+            seed=seed, seed_id=seed_id, reply_all=reply_all, to=to, cc=cc,
+            bcc=bcc, subject=subject, sender=sender,
+            snapshot_drafts=snapshot_drafts,
         )
-        return cast(dict[str, Any], parse_applescript_json(raw))
+        raw = self._run_seeded_script(
+            _wrap_as_json_script(script, timeout=self.timeout), seed_id
+        )
+        return _compose_window_from_report(
+            cast(dict[str, Any], parse_applescript_json(raw))
+        )
 
     def _save_compose_window_as_draft(
         self, window: str, subject: str, before_ids: list[int]
