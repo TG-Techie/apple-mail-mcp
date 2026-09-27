@@ -685,21 +685,59 @@ def _render_recipients(record: dict[str, Any]) -> None:
             )
 
 
+# The property a body or text criterion reads.
+_CONTENT = "content"
+
+
 @dataclass(frozen=True)
 class _SearchCriterion:
     """One search predicate, as the script tests a message against it.
 
-    ``prop`` is the one message property the test reads (``subject``,
-    ``date received``), which the bulk path reads for the whole mailbox
-    in one event; None when the test needs the message itself (its
-    attachments, its content), which is asked one message at a time.
-    ``excludes`` renders the AppleScript condition that drops a
-    message, given the expression for that property's value, or for the
-    message when ``prop`` is None.
+    ``prop`` is the message property the test reads, and says where the
+    bulk path reads it:
+
+    - a property Mail answers for every message at once (``subject``,
+      ``date received``): read for the whole mailbox in one event;
+    - ``content`` (``_CONTENT``): read for a run of the positions the
+      other criteria kept, in one event, and only for those;
+    - None, when the test needs the message itself (its attachments):
+      asked one message at a time, of a message the others kept.
+
+    ``also`` names further properties the test reads, each read for the
+    whole mailbox like a ``prop`` (a text search tests the subject and
+    the sender beside the content). ``excludes`` renders the AppleScript
+    condition that drops a message, given the expression for the value
+    of ``prop`` and then one for each of ``also``, or the expression for
+    the message itself when ``prop`` is None.
     """
 
     prop: str | None
-    excludes: Callable[[str], str]
+    excludes: Callable[..., str]
+    also: tuple[str, ...] = ()
+
+
+def _condition(
+    criterion: _SearchCriterion, value: Callable[[str], str], message: str
+) -> str:
+    """``criterion.excludes`` rendered with ``value(p)`` as each
+    property's value, or with ``message`` when the test asks the
+    message itself."""
+    if criterion.prop is None:
+        return criterion.excludes(message)
+    return criterion.excludes(
+        value(criterion.prop), *(value(p) for p in criterion.also)
+    )
+
+
+def _mailbox_wide_props(criteria: list[_SearchCriterion]) -> list[str]:
+    """The properties the criteria read for the whole mailbox, each
+    once, in the order the criteria name them."""
+    props: list[str] = []
+    for c in criteria:
+        if c.prop is not None and c.prop != _CONTENT:
+            props.append(c.prop)
+        props += c.also
+    return list(dict.fromkeys(props))
 
 
 def _does_not_contain(text: str) -> Callable[[str], str]:
@@ -785,13 +823,10 @@ def _search_criteria(
 
     # Body / text filters (#145). AppleScript `contains` is
     # case-insensitive by default, matching IMAP `SEARCH BODY`/`TEXT`
-    # semantics. Reading `content of msg` is expensive — see #146 for
-    # the proactive warning surfaced before this script runs.
+    # semantics. Reading the content is the expensive part — see #146
+    # for the proactive warning surfaced before this script runs.
     if body_contains:
-        body_safe = escape_applescript_string(sanitize_input(body_contains))
-        criteria.append(_SearchCriterion(
-            None, lambda m: f'(content of {m}) does not contain "{body_safe}"'
-        ))
+        criteria.append(_SearchCriterion(_CONTENT, _does_not_contain(body_contains)))
 
     if text_contains:
         # `text_contains` is the IMAP `TEXT` predicate — substring match
@@ -801,11 +836,15 @@ def _search_criteria(
         # callers who need recipient matching should use `sender_contains`
         # or future params. Documented in TOOLS.md.
         text_safe = escape_applescript_string(sanitize_input(text_contains))
-        criteria.append(_SearchCriterion(None, lambda m: (
-            f'not ((content of {m}) contains "{text_safe}" or '
-            f'(subject of {m}) contains "{text_safe}" or '
-            f'(sender of {m}) contains "{text_safe}")'
-        )))
+        criteria.append(_SearchCriterion(
+            _CONTENT,
+            lambda content, subject, sender: (
+                f'not ({content} contains "{text_safe}" or '
+                f'{subject} contains "{text_safe}" or '
+                f'{sender} contains "{text_safe}")'
+            ),
+            also=("subject", "sender"),
+        ))
     return criteria, date_setup
 
 
@@ -828,6 +867,28 @@ _SEARCH_ROW_PROPERTIES: tuple[tuple[str, str, bool], ...] = (
 # account (2026-09-27), so a gap this wide costs about what one more
 # event would.
 _SEARCH_RUN_GAP = 8
+
+# The content, unlike a row property, is read only for the positions
+# the other criteria kept: a run of body reads takes in no position they
+# dropped. What a body costs is its message's, not the event's. Measured
+# on the test account's INBOX (2026-09-27), read-only: over 20 short
+# bodies Mail had read lately, one range read cost 116-127 ms (about
+# 6 ms a message) and a range of one per message 330-342 ms, so each
+# further event cost about 11 ms; over 20 older ones, 5-6 s whichever
+# way they were read (215-315 ms a message); five others cost 0.85-6.4 s
+# each on a first read; and one, whose body came back empty, cost from
+# 17 ms to 10.7 s a read, alone or in a range, between reads seconds
+# apart. So the cheapest body a gap would take in costs about the event
+# it saves, and a dear one costs seconds for a message no criterion
+# wanted.
+_SEARCH_CONTENT_RUN_GAP = 0
+
+# The kept positions wait for their bodies until there are as many as
+# matches still wanted (so no body is read past the limit), or this
+# many (so no one read holds more bodies than this, whatever the
+# limit), or the scan reaches the mailbox's end. Beside 50 bodies, the
+# one more event a batch costs (about 11 ms) is small.
+_SEARCH_CONTENT_BATCH = 50
 
 _SEARCH_OUT_OF_LINE_WARNING = (
     "the search's bulk reads did not line up (the mailbox changed while "
@@ -891,9 +952,7 @@ def _one_at_a_time_search_lines(
     attachment walk leaves the row with that list empty and a warning.
     """
     checks = [
-        "if "
-        + c.excludes(f"({c.prop} of msg)" if c.prop else "msg")
-        + " then set includeThis to false"
+        f"if {_condition(c, lambda p: f'({p} of msg)', 'msg')} then set includeThis to false"
         for c in criteria
     ]
     row: list[str] = []
@@ -970,22 +1029,42 @@ def _first_positions_lines(*, limit: str) -> list[str]:
     ]
 
 
-def _bulk_match_lines(
-    criteria: list[_SearchCriterion], *, limit: str
-) -> list[str]:
-    """Find the matched positions: read each criterion's property for
-    the whole mailbox in one event, test the values in the script, and
-    ask a message itself only for what has no bulk form, only when the
-    other criteria kept it. Every list must be as long as the id list;
-    one that is not means the mailbox changed between the reads."""
-    props = list(dict.fromkeys(c.prop for c in criteria if c.prop))
+def _one_message_line(index: str) -> str:
+    """Make ``msgRef`` a reference to the message at ``index`` of the id
+    list, by its id: making it costs no event, reading through it does."""
+    return (
+        "set msgRef to a reference to («class mssg» id "
+        f"(item {index} of allIdsRef) of mailboxRef)"
+    )
+
+
+def _value_expr(prop: str) -> str:
+    """The variable ``_value_lines`` sets for ``prop``."""
+    return _as_var(prop) + "Value"
+
+
+def _value_lines(prop: str, index: str) -> list[str]:
+    """Set ``prop``'s value for the message at ``index``: from its list
+    for the whole mailbox, or from the message when that read failed."""
+    return [
+        f"if {_as_var(prop)}InBulk then",
+        f"    set {_value_expr(prop)} to item {index} of {_as_var(prop)}AllRef",
+        "else",
+        f"    {_one_message_line(index)}",
+        f"    set {_value_expr(prop)} to ({prop} of msgRef)",
+        "end if",
+    ]
+
+
+def _mailbox_read_lines(props: list[str]) -> list[str]:
+    """Read the ids, and each of ``props``, for the whole mailbox, each
+    in one event. Every list must be as long as the id list; one that
+    is not means the mailbox changed between the reads."""
     lines = [
         "set allIds to id of messages of mailboxRef",
         "set allIdsRef to a reference to allIds",
         "set total to count of allIds",
     ]
-    checks: list[str] = []
-    one_message = "set msgRef to a reference to («class mssg» id (item i of allIdsRef) of mailboxRef)"
     for prop in props:
         stem = _as_var(prop)
         lines += _bulk_read_lines(
@@ -995,41 +1074,162 @@ def _bulk_match_lines(
             f"set {stem}AllRef to a reference to {stem}All",
             f"if {stem}InBulk and (count of {stem}All) is not total then set aligned to false",
         ]
-        checks += [
-            f"if {stem}InBulk then",
-            f"    set {stem}Value to item i of {stem}AllRef",
-            "else",
-            f"    {one_message}",
-            f"    set {stem}Value to ({prop} of msgRef)",
-            "end if",
-        ] + [
-            f"if {c.excludes(stem + 'Value')} then set includeThis to false"
+    return lines
+
+
+def _scan_check_lines(criteria: list[_SearchCriterion]) -> list[str]:
+    """Test the message at position ``i`` against the criteria the scan
+    decides: each on a property read for the whole mailbox against its
+    list, then each that asks the message itself, only while the others
+    keep it."""
+    checks: list[str] = []
+    for prop in dict.fromkeys(c.prop for c in criteria if c.prop):
+        checks += _value_lines(prop, "i") + [
+            f"if {_condition(c, _value_expr, 'msgRef')} then set includeThis to false"
             for c in criteria if c.prop == prop
         ]
     by_message = [c for c in criteria if c.prop is None]
     if by_message:
-        checks.append(f"if includeThis then {one_message}")
+        checks.append(f"if includeThis then {_one_message_line('i')}")
     checks += [
-        f"if includeThis and ({c.excludes('msgRef')}) then set includeThis to false"
+        f"if includeThis and ({_condition(c, _value_expr, 'msgRef')}) then set includeThis to false"
         for c in by_message
     ]
-    return lines + [
+    return checks
+
+
+def _content_run_lines() -> list[str]:
+    """From the kept position at ``candFirst`` of ``cands``, extend a run
+    to ``candLast`` over the kept positions that follow within
+    ``_SEARCH_CONTENT_RUN_GAP``; read the run's content in one event,
+    and then its ids, which must be as many and, message by message, the
+    ids the criteria kept, for the content read before them to be those
+    messages'. A content read that fails is warned about, and each
+    message's is read on its own; ids that do not line up leave
+    ``aligned`` false and end the tests."""
+    where = ' for mailbox positions " & runStart & "-" & runEnd & "'
+    return [
+        "set runStart to item candFirst of candsRef",
+        "set runEnd to runStart",
+        "set candLast to candFirst",
+        "repeat while candLast < candCount",
+        f"    if (item (candLast + 1) of candsRef) - runEnd > {_SEARCH_CONTENT_RUN_GAP + 1} then exit repeat",
+        "    set candLast to candLast + 1",
+        "    set runEnd to item candLast of candsRef",
+        "end repeat",
+        *_bulk_read_lines(
+            target="contentRun",
+            expr="content of messages runStart thru runEnd of mailboxRef",
+            what="content", flag="contentRunRead", where=where,
+        ),
+        "set contentRunRef to a reference to contentRun",
+        "if contentRunRead then",
+        "    try",
+        "        set runIds to id of messages runStart thru runEnd of mailboxRef",
+        "    on error",
+        "        set aligned to false",
+        "        exit repeat",
+        "    end try",
+        "    set runIdsRef to a reference to runIds",
+        "    if (count of runIds) is not (runEnd - runStart + 1) or (count of contentRun) is not (count of runIds) then",
+        "        set aligned to false",
+        "        exit repeat",
+        "    end if",
+        "end if",
+    ]
+
+
+def _content_test_lines(criteria: list[_SearchCriterion]) -> list[str]:
+    """Test the content criteria on the ``candCount`` kept positions in
+    ``cands``, a run of them at a time (``_content_run_lines``), and add
+    each position they keep to ``matched``. A message whose content, or
+    a property beside it, cannot be read is left out with a warning, as
+    in the scan. ``cands`` is emptied for the scan to fill again."""
+    also = list(dict.fromkeys(p for c in criteria for p in c.also))
+    candidate = [
+        "set idx to item k of candsRef",
+        "set includeThis to true",
+        "try",
+        "    if contentRunRead then",
+        "        set j to idx - runStart + 1",
+        "        if (item j of runIdsRef) is not (item idx of allIdsRef) then set aligned to false",
+        f"        set {_value_expr(_CONTENT)} to item j of contentRunRef",
+        "    else",
+        f"        {_one_message_line('idx')}",
+        f"        set {_value_expr(_CONTENT)} to ({_CONTENT} of msgRef)",
+        "    end if",
+        *_indented([line for p in also for line in _value_lines(p, "idx")], 4),
+        *[
+            f"    if includeThis and ({_condition(c, _value_expr, 'msgRef')}) then set includeThis to false"
+            for c in criteria
+        ],
+        "on error errMsg number errNum",
+        "    set includeThis to false",
+        '    set end of warnList to ("filter check failed for message " & ((item idx of allIdsRef) as text) & ": " & errMsg & " (error " & errNum & ")")',
+        "end try",
+        "if includeThis then",
+        "    set end of matched to idx",
+        "    set matchCount to matchCount + 1",
+        "end if",
+    ]
+    return [
+        "set candsRef to a reference to cands",
+        "set candFirst to 1",
+        "repeat while candFirst <= candCount",
+        *_indented(_content_run_lines(), 4),
+        "    repeat with k from candFirst to candLast",
+        *_indented(candidate, 8),
+        "    end repeat",
+        "    if not aligned then exit repeat",
+        "    set candFirst to candLast + 1",
+        "end repeat",
+        "set cands to {}",
+        "set candCount to 0",
+    ]
+
+
+def _bulk_match_lines(
+    criteria: list[_SearchCriterion], *, limit: str
+) -> list[str]:
+    """Find the matched positions. The scan reads each criterion's
+    property for the whole mailbox in one event and tests the values in
+    the script, and asks a message itself only for what has no bulk
+    form, only when the other criteria kept it. With a content
+    criterion, a position the scan keeps is a candidate: the candidates
+    wait in ``cands`` until they are as many as the matches still
+    wanted, or fill a batch, or the scan ends, and then their content is
+    read a run at a time and tested (``_content_test_lines``)."""
+    content = [c for c in criteria if c.prop == _CONTENT]
+    keep, count = ("cands", "candCount") if content else ("matched", "matchCount")
+    checks = _scan_check_lines([c for c in criteria if c.prop != _CONTENT])
+    kept = [f"set end of {keep} to i", f"set {count} to {count} + 1"]
+    scan = [
+        "set includeThis to true",
+        "try",
+        *_indented(checks, 4),
+        "on error errMsg number errNum",
+        "    set includeThis to false",
+        '    set end of warnList to ("filter check failed for message " & ((item i of allIdsRef) as text) & ": " & errMsg & " (error " & errNum & ")")',
+        "end try",
+        "if includeThis then",
+        *_indented(kept, 4),
+        "end if",
+    ] if checks else kept
+    flush = [
+        f"if candCount > 0 and (candCount >= {limit} - matchCount or candCount >= {_SEARCH_CONTENT_BATCH} or i = total) then",
+        *_indented(_content_test_lines(content), 4),
+        "    if not aligned then exit repeat",
+        "end if",
+    ] if content else []
+    return _mailbox_read_lines(_mailbox_wide_props(criteria)) + [
         "set matched to {}",
         "set matchCount to 0",
+        *(["set cands to {}", "set candCount to 0"] if content else []),
         "if aligned then",
         "    repeat with i from 1 to total",
         f"        if matchCount >= {limit} then exit repeat",
-        "        set includeThis to true",
-        "        try",
-        *_indented(checks, 12),
-        "        on error errMsg number errNum",
-        "            set includeThis to false",
-        '            set end of warnList to ("filter check failed for message " & ((item i of allIdsRef) as text) & ": " & errMsg & " (error " & errNum & ")")',
-        "        end try",
-        "        if includeThis then",
-        "            set end of matched to i",
-        "            set matchCount to matchCount + 1",
-        "        end if",
+        *_indented(scan, 8),
+        *_indented(flush, 8),
         "    end repeat",
         "end if",
     ]
@@ -1184,7 +1384,7 @@ def _search_script_body(
     """The tell block of the AppleScript search; see
     ``AppleMailConnector._search_messages_applescript`` for the design
     and the measurements behind it."""
-    filter_props = list(dict.fromkeys(c.prop for c in criteria if c.prop))
+    filter_props = _mailbox_wide_props(criteria)
     match = (
         _bulk_match_lines(criteria, limit=limit)
         if criteria
@@ -2413,9 +2613,16 @@ class AppleMailConnector:
         # (a cost in the mailbox's size, as the old loop's `messages of
         # mb` already was) and tested in the script, and each row
         # property is read once per run of matched positions (a cost in
-        # the rows returned). Attachments and body content have no
-        # cheap bulk form and are asked one message at a time, of
-        # messages the other criteria kept. Items of those lists are
+        # the rows returned). Attachments have no cheap bulk form and
+        # are asked one message at a time, of messages the other
+        # criteria kept. The content a body or text criterion tests is
+        # read over runs of the positions the other criteria kept, and
+        # only those, in batches no larger than the matches still
+        # wanted, so no body is read that the limit does not need; what
+        # a body costs is its message's, from milliseconds to seconds
+        # (see _SEARCH_CONTENT_RUN_GAP). A text criterion's subject and
+        # sender are read for the whole mailbox like a criterion's
+        # property. Items of those lists are
         # reached through `a reference to` the list: at the script's
         # top level `item i of aList` slows with the list's length (26 s
         # over 50000 items, 83 ms through a reference, measured without
@@ -2427,12 +2634,13 @@ class AppleMailConnector:
         # leaves the message out with a warning; an unreadable
         # recipient list is empty with a warning). And the lists must
         # line up by position: each is checked against the id list's
-        # length, each row's id against the one the criteria matched,
-        # and the first and last matched positions' ids are read again
-        # at the end. A mailbox that changed under the reads fails one
-        # of those, and the search starts over one message at a time,
-        # the old loop, over references Mail hands out by id, saying
-        # so in a warning.
+        # length, a content run's ids, read after its bodies, against
+        # the ones the criteria kept, each row's id against the one the
+        # criteria matched, and the first and last matched positions'
+        # ids are read again at the end. A mailbox that changed under
+        # the reads fails one of those, and the search starts over one
+        # message at a time, the old loop, over references Mail hands
+        # out by id, saying so in a warning.
         #
         # The script returns {messages, warnings}; the Python side hands
         # the warnings to ``on_warning``, which ``search_messages`` lifts

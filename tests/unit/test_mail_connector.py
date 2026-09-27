@@ -4638,19 +4638,17 @@ class TestSearchReadsInBulk:
         assert "whose" not in script
 
     @patch.object(AppleMailConnector, "_run_applescript")
-    def test_attachment_and_body_filters_read_one_message_at_a_time(
+    def test_the_attachment_filter_reads_one_message_at_a_time(
         self, mock_run: MagicMock, connector: AppleMailConnector
     ) -> None:
-        """Mail has no cheap bulk form of these, so they are asked only
-        of a message the other criteria kept, through a reference by id
-        that costs no event to make."""
+        """Mail has no cheap bulk form of it, so it is asked only of a
+        message the other criteria kept, through a reference by id that
+        costs no event to make."""
         script = self._script(
             mock_run, connector, subject_contains="q3", has_attachment=True,
-            body_contains="budget",
         )
         bulk = self._bulk(script)
         assert "mail attachments of messages" not in bulk
-        assert "content of messages" not in bulk
         assert (
             "set msgRef to a reference to («class mssg» id "
             "(item i of allIdsRef) of mailboxRef)" in bulk
@@ -4659,9 +4657,161 @@ class TestSearchReadsInBulk:
             "if includeThis and ((count of mail attachments of msgRef) = 0) "
             "then set includeThis to false" in bulk
         )
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_a_body_filter_reads_content_over_runs_of_the_kept_positions(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        """The content is read for a run of the positions the other
+        criteria kept, in one event, and tested in the script; never for
+        the whole mailbox, and never through the scan's per-message
+        reference."""
+        script = self._script(
+            mock_run, connector, subject_contains="q3", has_attachment=True,
+            body_contains="budget",
+        )
+        bulk = self._bulk(script)
+        assert "content of messages of mailboxRef" not in bulk
+        assert "(content of msgRef) does not contain" not in bulk
         assert (
-            'if includeThis and ((content of msgRef) does not contain "budget") '
+            "set contentRun to content of messages runStart thru runEnd of mailboxRef"
+            in bulk
+        )
+        assert "set contentValue to item j of contentRunRef" in bulk
+        assert (
+            'if includeThis and (contentValue does not contain "budget") '
             "then set includeThis to false" in bulk
+        )
+        # The scan keeps a candidate; the content decides the match.
+        scan, _sep, content = bulk.partition("set candsRef to a reference to cands")
+        assert "set end of cands to i" in scan
+        assert "set end of matched to i" not in scan
+        assert "set end of matched to idx" in content
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_a_text_filter_reads_subject_and_sender_for_the_whole_mailbox(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        """TEXT is the content, the subject or the sender. The two
+        headers cost one event each for the whole mailbox, rather than
+        two events for every message the content did not match; the
+        rows then take them from those lists too."""
+        bulk = self._bulk(self._script(mock_run, connector, text_contains="alice"))
+        assert "set subjectAll to subject of messages of mailboxRef" in bulk
+        assert "set senderAll to sender of messages of mailboxRef" in bulk
+        assert (
+            'if includeThis and (not (contentValue contains "alice" or '
+            'subjectValue contains "alice" or senderValue contains "alice")) '
+            "then set includeThis to false" in bulk
+        )
+        assert "set subjectValue to item idx of subjectAllRef" in bulk
+        assert "set senderValue to item idx of senderAllRef" in bulk
+        # A row reads them over its run only if the mailbox-wide read failed.
+        assert "if not subjectInBulk then" in bulk
+        assert "if not senderInBulk then" in bulk
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_with_only_a_content_filter_every_position_is_a_candidate(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        """Nothing is left for the scan to test, so it keeps each
+        position without a guard around nothing."""
+        bulk = self._bulk(self._script(mock_run, connector, text_contains="alice"))
+        scan = bulk.partition("if candCount > 0 and")[0].rpartition(
+            "repeat with i from 1 to total"
+        )[2]
+        assert scan.split() == (
+            "if matchCount >= 999999999 then exit repeat "
+            "set end of cands to i set candCount to candCount + 1"
+        ).split()
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_bodies_are_read_no_further_than_the_limit_needs(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        """The kept positions are tested as soon as there are as many as
+        the matches still wanted, so no body is read past the point
+        where the limit is reached; and at most a batch of them at a
+        time, however high the limit."""
+        from apple_mail_mcp.mail_connector import _SEARCH_CONTENT_BATCH
+
+        bulk = self._bulk(
+            self._script(mock_run, connector, body_contains="budget", limit=10)
+        )
+        assert (
+            "if candCount > 0 and (candCount >= 10 - matchCount or "
+            f"candCount >= {_SEARCH_CONTENT_BATCH} or i = total) then" in bulk
+        )
+        assert bulk.count("if matchCount >= 10 then exit repeat") == 1
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_a_content_run_takes_in_no_position_the_criteria_dropped(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        from apple_mail_mcp.mail_connector import _SEARCH_CONTENT_RUN_GAP
+
+        assert _SEARCH_CONTENT_RUN_GAP == 0
+        bulk = self._bulk(self._script(mock_run, connector, body_contains="budget"))
+        assert (
+            f"if (item (candLast + 1) of candsRef) - runEnd > "
+            f"{_SEARCH_CONTENT_RUN_GAP + 1} then exit repeat" in bulk
+        )
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_a_content_read_that_fails_is_redone_one_message_at_a_time(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        bulk = self._bulk(self._script(mock_run, connector, body_contains="budget"))
+        [read] = self._guarded_reads(bulk, "set contentRun to")
+        assert "on error errMsg number errNum" in read
+        assert (
+            '("content could not be read in bulk for mailbox positions " '
+            "& runStart & \"-\" & runEnd & \": \"" in read
+        )
+        assert (
+            "set msgRef to a reference to («class mssg» id "
+            "(item idx of allIdsRef) of mailboxRef)" in bulk
+        )
+        assert "set contentValue to (content of msgRef)" in bulk
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_a_content_run_must_line_up_with_the_matched_ids(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        """The run's ids are read after its bodies: if they are the ids
+        the criteria kept at those positions, the bodies read before
+        them are those messages' bodies."""
+        bulk = self._bulk(self._script(mock_run, connector, body_contains="budget"))
+        _before, _sep, after = bulk.partition("set contentRun to content of messages")
+        assert (
+            "set runIds to id of messages runStart thru runEnd of mailboxRef"
+            in after.partition("repeat with k from")[0]
+        )
+        assert (
+            "if (count of runIds) is not (runEnd - runStart + 1) or "
+            "(count of contentRun) is not (count of runIds) then" in bulk
+        )
+        assert (
+            "if (item j of runIdsRef) is not (item idx of allIdsRef) "
+            "then set aligned to false" in bulk
+        )
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_the_one_at_a_time_search_tests_content_as_before(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        script = self._script(
+            mock_run, connector, body_contains="budget", text_contains="alice"
+        )
+        loop = script.partition("set msgs to messages of mailboxRef")[2]
+        assert (
+            'if (content of msg) does not contain "budget" '
+            "then set includeThis to false" in loop
+        )
+        assert (
+            'if not ((content of msg) contains "alice" or (subject of msg) '
+            'contains "alice" or (sender of msg) contains "alice") '
+            "then set includeThis to false" in loop
         )
 
     @patch.object(AppleMailConnector, "_run_applescript")
