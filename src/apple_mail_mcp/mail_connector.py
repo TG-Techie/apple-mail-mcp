@@ -8,14 +8,13 @@ import os
 import re
 import subprocess
 import time
-import urllib.parse
 import warnings
 from collections.abc import Callable
 from datetime import date as _date
 from datetime import timedelta as _timedelta
 from email.utils import parseaddr
 from pathlib import Path
-from typing import IO, Any, cast
+from typing import IO, Any, Literal, cast
 
 from imapclient.exceptions import IMAPClientError, LoginError
 
@@ -46,6 +45,7 @@ from .outbound_allowlist import (
     assert_recipients_allowed_for_send,
 )
 from .utils import (
+    SANITIZE_MAX_LENGTH,
     applescript_account_clause,
     applescript_iso_date_statements,
     distinct_filenames,
@@ -85,13 +85,36 @@ _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # AppleScript fallback against a mailbox where IMAP would help.
 _SLOW_SEARCH_THRESHOLD_SEC = 5.0
 
-# One-character body seed for scriptable compose windows. An EMPTY
-# `make new outgoing message` body has a WebArea that refuses keyboard
-# focus outright (observed live 2026-09-05 — see
-# _build_attach_compose_script). Any content fixes it, so this is the
-# least invasive content there is: a single space, which survives into
-# the sent body as one invisible character.
+# One-character body seed for a compose window made by `make new
+# outgoing message`. Such a window with an EMPTY body had a WebArea that
+# refused keyboard focus by every route tried (observed 2026-09-05; not
+# reproduced since, see docs/research/paste-focus-failed.md, so it
+# stays). The seed does not reach the sent message: the fresh-send
+# composition selects the whole body and deletes it before pasting
+# (``_PASTE_CARET_KEYS["replace"]``), because Mail keeps anything set
+# through ``content`` inside a <blockquote type="cite">.
 _BODY_SEED = " "
+
+# Where a clipboard paste lands in a compose window's body, as the keys
+# pressed just before cmd+v. Measured through the loopback read-back on
+# 2026-09-27 (docs/research/icloud-draft-resync.md, Observation 10):
+#   above   - cmd+up: above what Mail wrote (a reply's quote, a forward's
+#             header block and attachments), which stays as Mail made it.
+#   replace - cmd+a, delete: the whole body. On a fresh message that is
+#             the seed inside Mail's URLShare wrapper; pasting above it
+#             instead sent an empty <blockquote type="cite">, which iOS
+#             Mail draws as a purple quoted-reply bar.
+#   end     - cmd+down: after everything, where the fresh-send
+#             composition pastes its attachments once the body is in.
+_PastePlacement = Literal["above", "replace", "end"]
+_PASTE_CARET_KEYS: dict[_PastePlacement, str] = {
+    "above": "key code 126 using command down\n            delay 0.2",
+    "replace": (
+        'keystroke "a" using command down\n            delay 0.3\n'
+        "            key code 51\n            delay 0.3"
+    ),
+    "end": "key code 125 using command down\n            delay 0.2",
+}
 
 
 # MCP-tool field name → Mail.app AppleScript `rule type` enum identifier.
@@ -3999,14 +4022,15 @@ class AppleMailConnector:
         callers route RFC 5322 ids through
         ``_maybe_resolve_rfc_seed_id`` first (#205). (#193)
 
-        Body is intentionally NOT included in the ``make new outgoing
-        message with properties`` dict for the ``"new"`` seed.
-        Mail.app injects a stray leading newline when ``content:`` is
-        part of the creation properties for an invisible message; that
-        newline triggers iOS Mail's blockquote rendering (purple bar).
-        Body is set via a separate ``set content of theMessage`` call in
-        the caller's body_block instead. Apple Developer Forum thread
-        738842 / FB11734014.
+        The ``"new"`` seed serves saved drafts only; a fresh message
+        sent at once is composed by ``_send_fresh``. Its body is set by
+        the caller's separate ``set content of theMessage``, which was
+        once thought to keep Mail from quoting it. Measured 2026-09-27
+        through the loopback read-back, it does not: a body set that way
+        and sent arrived with a leading newline, inside Mail's URLShare
+        wrapper and a ``<blockquote type="cite">``, and quoted with "> "
+        in the plain part (docs/research/icloud-draft-resync.md,
+        Observation 10).
         """
         if seed == "new":
             return (
@@ -4033,27 +4057,6 @@ class AppleMailConnector:
             if origMsg is missing value then error "SEED_NOT_FOUND"
             set theMessage to {verb} origMsg opening window {"true" if open_window else "false"}
         """
-
-    @staticmethod
-    def _build_emlx_bytes(
-        mime_bytes: bytes,
-    ) -> bytes:
-        """Wrap raw MIME bytes in Apple Mail's .emlx container format.
-
-        .emlx layout:
-            {byte_count}      \\n   ← decimal length of mime_bytes, space-padded
-            {mime_bytes}
-            \\n
-            {minimal Apple plist}
-        """
-        plist = (
-            b'<?xml version="1.0" encoding="UTF-8"?>\n'
-            b'<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"'
-            b' "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
-            b'<plist version="1.0">\n<dict>\n</dict>\n</plist>\n'
-        )
-        header = f"{len(mime_bytes)}      \n".encode()
-        return header + mime_bytes + b"\n" + plist
 
     @staticmethod
     def _as_verified_send_block() -> str:
@@ -4169,16 +4172,16 @@ class AppleMailConnector:
 
     @staticmethod
     def _as_new_compose_window_block() -> str:
-        """AppleScript fragment: name the compose window a reply or
-        forward verb just opened, by comparing Mail's window names before
-        and after it, counting each name. A name already open does not
-        hide a new window of the same name: a draft saved through the
-        dictionary leaves its window behind
-        (docs/research/icloud-draft-resync.md, Observation 5), and a plain
-        set difference then saw no new window at all (2026-09-26).
+        """AppleScript fragment: name the compose window just opened (by
+        a reply or forward verb, or by ``make new outgoing message``),
+        by comparing Mail's window names before and after, counting each
+        name. A name already open does not hide a new window of the same
+        name: a draft saved through the dictionary leaves its window
+        behind (docs/research/icloud-draft-resync.md, Observation 5), and
+        a plain set difference then saw no new window at all (2026-09-26).
 
         Needs ``beforeNames`` (System Events' ``name of windows`` of Mail)
-        set before the verb; sets ``newName``. Errors NO_COMPOSE_WINDOW
+        set before the window is opened; sets ``newName``. Errors NO_COMPOSE_WINDOW
         when no window appeared within 5 s, and
         COMPOSE_WINDOW_NOT_UNIQUE when the new window shares its name
         with one already open: every later step (paste, read-back,
@@ -4254,153 +4257,6 @@ if sameNamed > 1 then error "COMPOSE_WINDOW_NOT_UNIQUE: Mail opened a compose wi
         end tell
         """
 
-    def _send_new_via_eml(
-        self,
-        *,
-        to: list[str],
-        cc: list[str] | None,
-        bcc: list[str] | None,
-        subject: str,
-        body: str,
-        from_account: str | None,
-        attachment_paths: list[Path] | None,
-    ) -> dict[str, str]:
-        """Send a brand-new message via Mail.app's mailto: URL handler.
-
-        Mail.app's AppleScript compose path (``make new outgoing message`` +
-        ``set content``) always wraps the body in an
-        ``Apple-Mail-URLShareWrapperClass`` div / ``<blockquote type="cite">``
-        with invisible CSS.  macOS Mail hides the bar; iOS Mail ignores the
-        CSS and renders a purple quoted-reply bar.  Apple Developer Forum
-        thread 738842 / FB11734014.
-
-        Fix — no ``content`` property setter involved:
-
-        1. ``open location "mailto:..."`` opens a clean compose window
-           (Mail's URL handler populates recipients/subject/body — the
-           URLShare blockquote never appears).
-        2. Verified Send directly from that window: bounded wait for the
-           Send button to be enabled, click, then poll window-gone +
-           sent-copy postconditions (``_as_verified_send_block``).
-
-        History: this path originally closed the compose window
-        ``saving yes`` and reopened the draft before clicking Send. Live
-        exploration (2026-07-20, docs/reference/UI_GROUNDING_MAIL_SEND.md)
-        showed the close FAILS SILENTLY (like every Mail-dictionary close),
-        leaving a half-state window whose Send button never re-enables —
-        the mechanism behind a send that reported SENT but dispatched
-        nothing. The earlier claim "verified 2026-05-23 … no purple bar on
-        iOS" covered the close/reopen variant; the direct-send output needs
-        a one-time iOS visual re-check.
-
-        Limitations
-        -----------
-        * Attachments not supported — mailto: carries no binary payload.
-        * ``from_account`` not supported — Mail's URL handler composes
-          from the default account and exposes no sender to set. Both
-          raise ``NotImplementedError`` before anything is composed; the
-          server-layer guard refuses them up front so this is a backstop.
-
-        Called only from ``create_draft`` when ``seed="new"`` and
-        ``send_now=True``.  The outbound allowlist gate has already run.
-        """
-        if from_account is not None:
-            raise NotImplementedError(
-                "mailto-send path cannot choose the sending account; Mail "
-                "composes from its default account. Save the draft without "
-                "send_now (it keeps the chosen sender) and send it from "
-                "Mail.app, or omit from_account."
-            )
-        if attachment_paths:
-            raise NotImplementedError(
-                "mailto-send path does not support attachments. "
-                "Save the draft without send_now and send it manually "
-                "from Mail.app, or send without attachments. (draft_send "
-                "on a fresh draft routes back here — it is NOT a "
-                "workaround; server-layer guards refuse it up front.)"
-            )
-
-        # Build mailto: URL.  Percent-encode every field so arbitrary text
-        # (newlines, unicode, special characters) survives URL transport.
-        # safe='@,' for the recipient list keeps literal @ and , unencoded.
-        to_str = ",".join(to)
-        params: list[tuple[str, str]] = []
-        if subject:
-            params.append(("subject", subject))
-        if body:
-            params.append(("body", body))
-        if cc:
-            params.append(("cc", ",".join(cc)))
-        if bcc:
-            params.append(("bcc", ",".join(bcc)))
-
-        query = "&".join(
-            f"{k}={urllib.parse.quote(v, safe='')}" for k, v in params
-        )
-        mailto_url = f"mailto:{urllib.parse.quote(to_str, safe='@,')}"
-        if query:
-            mailto_url += "?" + query
-
-        mailto_url_safe = escape_applescript_string(mailto_url)
-
-        # When subject is empty Mail names the compose window "New Message".
-        win_subject = subject if subject else "New Message"
-        win_subject_safe = escape_applescript_string(win_subject)
-        # Empty subject: the sent-copy postcondition can't match ("New
-        # Message" is a window name, not the subject) — the verified-send
-        # block then relies on window-gone alone.
-        subject_for_sent_safe = escape_applescript_string(subject or "")
-        verified_send_block = self._as_verified_send_block()
-
-        script = f"""
-        set composeName to "{win_subject_safe}"
-        set composeSubject to "{subject_for_sent_safe}"
-
-        -- Step 1: open compose window via mailto: URL handler (no content
-        -- setter — the URL handler populates recipients/subject/body, so
-        -- the Apple-Mail-URLShareWrapperClass blockquote never appears).
-        tell application "Mail"
-            open location "{mailto_url_safe}"
-            activate
-        end tell
-
-        -- Step 2: resolve the compose window BY NAME with a bounded poll
-        -- (the URL handler opens it asynchronously; fixed delays race).
-        set composeReady to false
-        repeat 10 times
-            delay 0.5
-            tell application "System Events"
-                tell application process "Mail"
-                    if exists window composeName then set composeReady to true
-                end tell
-            end tell
-            if composeReady then exit repeat
-        end repeat
-        if not composeReady then
-            tell application "System Events"
-                tell application process "Mail"
-                    set openNames to (name of windows) as text
-                end tell
-            end tell
-            return "NO_COMPOSE_WINDOW:expected " & composeName & " — open: " & openNames
-        end if
-
-        -- Step 3: verified Send directly from the live mailto window
-        -- (enabled-gate wait, window-gone + sent-copy postconditions).
-        -- The former close-saving-yes → reopen-draft dance is GONE: the
-        -- close failed silently (like every Mail-dictionary close, see
-        -- docs/reference/UI_GROUNDING_MAIL_SEND.md), leaving a half-state
-        -- window whose Send never re-enabled — observed live 2026-07-20.
-        {verified_send_block}
-        return sendOutcome
-        """
-        result = self._run_applescript(script).strip()
-        if result == "SENT":
-            return {"draft_id": "", "sent_message_id": ""}
-        raise MailAppleScriptError(
-            f"mailto-send: {result!r}"
-        )
-
     @staticmethod
     def _paste_probe_strings(body: str, plain: bool = False) -> tuple[str, str]:
         """Compute the paste read-back probes for a body.
@@ -4426,64 +4282,81 @@ if sameNamed > 1 then error "COMPOSE_WINDOW_NOT_UNIQUE: Mail opened a compose wi
         raw_marker = body.strip()[:16] if body.lstrip().startswith("<") else ""
         return snippet, raw_marker
 
+    @staticmethod
+    def _text_paste_fill(body: str, plain: bool) -> str:
+        """AppleScript that puts ``body`` on the pasteboard ``pb``: as
+        HTML, or as plain text when ``plain``."""
+        body_safe = escape_applescript_string(sanitize_input(body))
+        flavor = "public.utf8-plain-text" if plain else "public.html"
+        return (
+            f'set theBody to "{body_safe}"\n'
+            "set bodyNSString to current application's NSString's "
+            "stringWithString:theBody\n"
+            "set bodyData to bodyNSString's dataUsingEncoding:"
+            "(current application's NSUTF8StringEncoding)\n"
+            "pb's clearContents()\n"
+            f'pb\'s setData:bodyData forType:"{flavor}"'
+        )
+
+    @staticmethod
+    def _files_paste_fill(attachment_paths: list[Path]) -> str:
+        """AppleScript that puts the files on the pasteboard ``pb`` as
+        file URLs, which Mail pastes into a compose body as attachments,
+        as it does a drag from Finder."""
+        paths_safe = ", ".join(
+            f'"{escape_applescript_string(str(Path(p).resolve()))}"'
+            for p in attachment_paths
+        )
+        return (
+            "set fileURLs to current application's NSMutableArray's array()\n"
+            f"repeat with apath in {{{paths_safe}}}\n"
+            "    (fileURLs's addObject:(current application's NSURL's "
+            "fileURLWithPath:(apath as text)))\n"
+            "end repeat\n"
+            "pb's clearContents()\n"
+            "pb's writeObjects:fileURLs"
+        )
+
+    @staticmethod
     def _build_paste_script(
-        self,
         *,
         window_name: str,
-        body: str,
-        place_above_existing: bool,
+        fill: str,
+        placement: _PastePlacement,
         undo_first: bool,
-        plain: bool = False,
     ) -> str:
-        """Full osascript source: verified HTML paste into the named
-        compose window (2026-07-22 raw-``<p>`` regression fixes), or a
-        plain-text paste when ``plain``:
+        """Full osascript source: paste into the named compose window's
+        body whatever ``fill`` puts on the pasteboard (``_text_paste_fill``
+        or ``_files_paste_fill``), at ``placement`` (``_PASTE_CARET_KEYS``):
 
           1. readiness — poll until the body WebArea EXISTS (window-name
              alone races WebKit initialization);
           2. focus — ``set focused`` then VERIFY AXFocusedUIElement is the
              WebArea (a click can leave focus in the To field, sending
              cmd+v to the wrong control);
-          3. paste, then restore the clipboard IMMEDIATELY (shortest
-           possible hold; restore also runs on every error path).
+          3. caret, paste, then restore the clipboard IMMEDIATELY
+             (shortest possible hold; restore also runs on every error
+             path).
 
-        Returns "PASTED_UNVERIFIED" — content verification happens in a
-        SEPARATE osascript run (``_build_readback_script``): within one
-        process System Events serves a stale AX subtree after WebKit
-        re-renders, so an in-script read-back sees nothing (observed
-        live). ``undo_first`` prepends cmd+z for the retry attempt.
+        Returns "PASTED_UNVERIFIED" — what the paste did is read back in
+        a SEPARATE osascript run (``_build_readback_script``,
+        ``_build_attachment_ax_verify_script``): within one process
+        System Events serves a stale AX subtree after WebKit re-renders,
+        so an in-script read-back sees nothing (observed live).
+        ``undo_first`` prepends cmd+z for the retry attempt.
         """
-        body_safe = escape_applescript_string(sanitize_input(body))
         win_safe = escape_applescript_string(window_name)
-        # Caret to the start, so the paste lands ABOVE whatever the
-        # window already holds: Mail's auto-quoted original on a reply,
-        # and the one-space body seed on the attachments path.
-        #
-        # Do NOT try to remove that seed by editing around the paste.
-        # Three placements were measured on 2026-09-05 and all three
-        # were wrong: select-all (cmd+a) took the ATTACHMENTS with it and
-        # sent 0 of 2, because Mail keeps them in the body; a backspace
-        # at the very end deleted an attachment and sent 1 of 2; and a
-        # forward-delete either side of the paste left the seed in the
-        # sent HTML anyway. A single space is invisible in the rendered
-        # body, so it is left alone.
-        caret_block = (
-            "key code 126 using command down\n            delay 0.2"
-            if place_above_existing
-            else ""
-        )
         undo_block = (
             'keystroke "z" using command down\n            delay 0.5'
             if undo_first
             else ""
         )
-        flavor = "public.utf8-plain-text" if plain else "public.html"
+        caret_keys = _PASTE_CARET_KEYS[placement]
         return f"""
 use framework "AppKit"
 use framework "Foundation"
 use scripting additions
 
-set theBody to "{body_safe}"
 set composeName to "{win_safe}"
 
 set pb to current application's NSPasteboard's generalPasteboard()
@@ -4496,10 +4369,7 @@ repeat with t in savedTypes
     end if
 end repeat
 
-set bodyNSString to current application's NSString's stringWithString:theBody
-set bodyData to bodyNSString's dataUsingEncoding:(current application's NSUTF8StringEncoding)
-pb's clearContents()
-pb's setData:bodyData forType:"{flavor}"
+{fill}
 
 try
     tell application "Mail" to activate
@@ -4551,7 +4421,7 @@ try
     tell application "System Events"
         tell application process "Mail"
             {undo_block}
-            {caret_block}
+            {caret_keys}
             keystroke "v" using command down
             delay 0.8
         end tell
@@ -4780,71 +4650,45 @@ end tell
         self._gate_compose_recipients(
             win_name, resolved_to, resolved_cc, resolved_bcc
         )
-        return self._inject_html_and_send(
-            window_name=win_name,
-            sent_subject=derived_subject,
-            body=body,
-            place_above_existing=True,
-        )
-
-    def _inject_html_and_send(
-        self,
-        *,
-        window_name: str,
-        sent_subject: str,
-        body: str,
-        place_above_existing: bool,
-    ) -> dict[str, str]:
-        """Clipboard-inject HTML into the named compose window (verified),
-        then run the verified send. ``place_above_existing`` moves the
-        caret to the top first (cmd+up) so pasted HTML lands ABOVE Mail's
-        auto-quoted original.
-
-        Three osascript invocations — paste, read-back, send — because a
-        fresh process is the only reliable way to read the post-paste AX
-        tree (within one process System Events serves a stale subtree
-        after WebKit re-renders; observed live 2026-07-22). The read-back
-        must see the tag-stripped text and must NOT see the raw source
-        (the 2026-07-21 literal-``<p>`` regression); one undo-and-retry,
-        then a loud PASTE_FAILED. The compose window is left intact on
-        failure for recovery.
-        """
-        self._paste_verified(
-            window_name=window_name,
-            body=body,
-            place_above_existing=place_above_existing,
-        )
-        return self._send_compose_window(window_name, sent_subject)
+        self._paste_verified(window_name=win_name, body=body, placement="above")
+        return self._send_compose_window(win_name, derived_subject)
 
     def _paste_verified(
         self,
         *,
         window_name: str,
         body: str,
-        place_above_existing: bool,
+        placement: _PastePlacement,
         plain: bool = False,
     ) -> None:
-        """Paste ``body`` into the named compose window and read it back
-        from a fresh process: HTML by default, plain text when ``plain``.
-        One undo-and-retry; on a second failure the window is salvaged to
-        Drafts and ``MailAppleScriptError`` names what the read-back saw.
+        """Paste ``body`` into the named compose window at ``placement``
+        and read it back: HTML by default, plain text when ``plain``.
+
+        The read-back is its own osascript process, since a fresh process
+        is the only reliable way to read the post-paste AX tree (within
+        one, System Events serves a stale subtree after WebKit
+        re-renders; observed live 2026-07-22). It must see the
+        tag-stripped text and must NOT see the raw source (the 2026-07-21
+        literal-``<p>`` regression). One undo-and-retry; on a second
+        failure the window is salvaged to Drafts and
+        ``MailAppleScriptError`` names what the read-back saw.
         """
         snippet, raw_marker = self._paste_probe_strings(body, plain=plain)
+        fill = self._text_paste_fill(body, plain)
 
         for attempt in (1, 2):
             paste_result = self._run_applescript(
                 self._build_paste_script(
                     window_name=window_name,
-                    body=body,
-                    place_above_existing=place_above_existing,
+                    fill=fill,
+                    placement=placement,
                     undo_first=(attempt == 2),
-                    plain=plain,
                 )
             ).strip()
             if paste_result != "PASTED_UNVERIFIED":
                 salvage = self._salvage_compose_to_draft(window_name)
                 raise MailAppleScriptError(
-                    f"html-send: {paste_result!r} (compose window: {salvage})"
+                    f"paste: {paste_result!r} (compose window: {salvage})"
                 )
             seen = self._run_applescript(
                 self._build_readback_script(window_name)
@@ -4860,10 +4704,48 @@ end tell
             if attempt == 2:
                 salvage = self._salvage_compose_to_draft(window_name)
                 raise MailAppleScriptError(
-                    f"html-send: 'PASTE_FAILED:read-back saw [{seen}] "
+                    f"paste: 'PASTE_FAILED:read-back saw [{seen}] "
                     f"wanted [{snippet}] without raw [{raw_marker}]' "
                     f"(compose window: {salvage})"
                 )
+
+    def _paste_attachments(
+        self, window_name: str, attachment_paths: list[Path]
+    ) -> None:
+        """Paste the files at the end of the named compose window's body,
+        then wait for each to show in the window's AX tree. On any
+        failure the window is salvaged to Drafts and
+        ``MailAppleScriptError`` raised; nothing is sent.
+
+        Pasted, not attached through the dictionary: ``make new
+        attachment`` on a window whose body had been pasted put Mail's
+        URLShare wrapper and an empty ``<blockquote type="cite">`` back
+        into the sent message (measured 2026-09-27,
+        docs/research/icloud-draft-resync.md, Observation 10). A pasted
+        file shows in the AX tree exactly as a dictionary-attached one
+        does, so the same verification reads both.
+        """
+        outcome = self._run_applescript(
+            self._build_paste_script(
+                window_name=window_name,
+                fill=self._files_paste_fill(attachment_paths),
+                placement="end",
+                undo_first=False,
+            )
+        ).strip()
+        if outcome == "PASTED_UNVERIFIED":
+            outcome = self._run_applescript(
+                self._build_attachment_ax_verify_script(
+                    window_name=window_name,
+                    filenames=[Path(p).name for p in attachment_paths],
+                )
+            ).strip()
+        if outcome != "ATTACHMENTS_VERIFIED":
+            salvage = self._salvage_compose_to_draft(window_name)
+            raise MailAppleScriptError(
+                f"attachments: {outcome!r}; send NOT attempted "
+                f"(compose window: {salvage})"
+            )
 
     def _gate_compose_recipients(
         self,
@@ -4907,7 +4789,7 @@ end tell
             return {"draft_id": "", "sent_message_id": ""}
         salvage = self._salvage_compose_to_draft(window_name)
         raise MailAppleScriptError(
-            f"html-send: {result!r} (compose window: {salvage})"
+            f"verified send: {result!r} (compose window: {salvage})"
         )
 
     def _send_html_email(
@@ -4922,23 +4804,10 @@ end tell
         attachment_paths: list[Path] | None = None,
         reply_to: str | None = None,
     ) -> dict[str, str]:
-        """Send an HTML email directly via clipboard injection.
-
-        Translates the clipboard-inject AppleScript pattern into a Python
-        method call. Does NOT save a draft first — composes via mailto:,
-        injects HTML via the system clipboard into the compose window's
-        body WebArea, and clicks Send directly.
-
-        Limitations
-        -----------
-        * Attachments on replies not supported (fresh messages with
-          attachments take ``_send_html_new_with_attachments``).
-        * ``from_account`` is honoured on replies only, where the sender is
-          set on the outgoing message. Fresh messages compose through
-          mailto: (or ``make new outgoing message`` with no sender set)
-          and raise ``NotImplementedError`` when one is asked for, before
-          anything is composed; the server-layer guard refuses it up
-          front so this is a backstop.
+        """Send an HTML email at once; no draft is saved first. A fresh
+        message goes through ``_send_fresh``, a reply into a thread
+        through ``_send_html_reply``. Either way the HTML reaches the
+        compose window by clipboard paste, never through ``content``.
 
         Args:
             to: List of recipient email addresses.
@@ -4946,25 +4815,24 @@ end tell
             bcc: Optional BCC recipient list.
             subject: Email subject line.
             body: HTML string for the email body.
-            from_account: Account name or UUID to send from. Replies only.
+            from_account: Account name, UUID or one of its addresses to
+                send from; set as the message's sender. ``None`` leaves
+                Mail's default.
             attachment_paths: Fresh messages only.
+            reply_to: Message id to reply to; enables reply mode.
 
         Returns:
             ``{"draft_id": "", "sent_message_id": ""}`` on success.
 
         Raises:
-            NotImplementedError: attachments on a reply, or from_account
-                on a fresh message.
-            MailAppleScriptError: If the compose window's body area is not
-                found (NO_BODY_AREA) or any other non-SENT result.
+            NotImplementedError: attachments on a reply.
+            MailAccountNotFoundError: ``from_account`` matches no account.
+            FileNotFoundError: a listed attachment does not exist.
+            ValueError: the body is longer than a paste carries.
+            MailAppleScriptError: a mechanical read-back failed. Nothing
+                was sent, except when the error says the message WAS sent
+                and its Sent copy has the wrong number of attachments.
         """
-        if from_account is not None and reply_to is None:
-            raise NotImplementedError(
-                "HTML send cannot choose the sending account on a fresh "
-                "message; Mail composes from its default account. Omit "
-                "from_account, or save a draft (it keeps the chosen "
-                "sender) and send it from Mail.app."
-            )
         if attachment_paths and reply_to is not None:
             raise NotImplementedError(
                 "HTML replies with attachments are not supported yet — "
@@ -4974,16 +4842,6 @@ end tell
                 "a reply draft via draft_create and send manually from "
                 "Mail.app."
             )
-        if attachment_paths:
-            return self._send_html_new_with_attachments(
-                to=to,
-                cc=cc,
-                bcc=bcc,
-                subject=subject,
-                body=body,
-                attachment_paths=attachment_paths,
-            )
-
         if reply_to is not None:
             return self._send_html_reply(
                 to=to,
@@ -4994,50 +4852,18 @@ end tell
                 from_account=from_account,
                 reply_to=reply_to,
             )
-
-        # Build mailto: URL with URL-encoded subject and recipients.
-        # subject is URL-encoded for the mailto: URL; body is NEVER in the
-        # URL (clipboard injection — a URL body would insert the raw HTML
-        # source as literal text). cc/bcc ride the URL too — they used to
-        # be accepted and silently DROPPED on this fresh path (the mail
-        # went out without them; found 2026-08-24).
-        to_str = urllib.parse.quote(",".join(to), safe="@,")
-        encoded_subject = urllib.parse.quote(subject, safe="")
-        mailto_url = f"mailto:{to_str}?subject={encoded_subject}"
-        if cc:
-            mailto_url += "&cc=" + urllib.parse.quote(",".join(cc), safe=",")
-        if bcc:
-            mailto_url += "&bcc=" + urllib.parse.quote(",".join(bcc), safe=",")
-        mailto_url_safe = escape_applescript_string(mailto_url)
-
-        # Compose window name = subject ("New Message" when empty) — the
-        # window is resolved BY NAME throughout; `window 1` may be the
-        # viewer (docs/reference/UI_GROUNDING_MAIL_SEND.md).
-        win_subject = subject if subject else "New Message"
-
-        # Step 1: open the compose window (URL handler populates
-        # recipients + subject). The paste step polls for the body
-        # WebArea itself — readiness = WebArea present, NOT window name;
-        # window-name-only readiness raced WebKit init and caused the
-        # 2026-07-21 raw-<p> paste degradation.
-        self._run_applescript(
-            f'tell application "Mail"\n'
-            f'    open location "{mailto_url_safe}"\n'
-            f'    activate\n'
-            f'end tell\n'
-            f'return "OPENED"'
-        )
-
-        # Steps 2–4: verified paste (separate read-back process), then
-        # verified send. Shared with the reply path.
-        return self._inject_html_and_send(
-            window_name=win_subject,
-            sent_subject=subject or "",
+        return self._send_fresh(
+            to=to,
+            cc=cc,
+            bcc=bcc,
+            subject=subject,
             body=body,
-            place_above_existing=False,
+            plain=False,
+            from_account=from_account,
+            attachment_paths=attachment_paths,
         )
 
-    def _send_html_new_with_attachments(
+    def _send_fresh(
         self,
         *,
         to: list[str],
@@ -5045,115 +4871,96 @@ end tell
         bcc: list[str] | None,
         subject: str,
         body: str,
-        attachment_paths: list[Path],
+        plain: bool,
+        from_account: str | None,
+        attachment_paths: list[Path] | None,
     ) -> dict[str, str]:
-        """Send a fresh HTML email WITH attachments.
+        """Send a fresh message at once: the one composition behind
+        ``create_draft(seed="new", send_now=True)`` (``plain``) and a
+        fresh ``_send_html_email`` (HTML).
 
-        Composes via ``make new outgoing message`` instead of the
-        mailto: URL handler: the mailto window never registers in
-        Mail's ``outgoing messages`` collection, so ``make new
-        attachment`` cannot target it (verified live 2026-08-24). The
-        scriptable compose window accepts attachments; the HTML body
-        still arrives via the shared clipboard-inject machinery —
-        ``content`` is NEVER set (that is the purple-bar mechanism).
+          1. Compose a visible window with ``make new outgoing message``:
+             the recipients, the one-space body seed (``_BODY_SEED``),
+             and, when ``from_account`` names an account, that account
+             as sender, set last. The window is found by comparing
+             Mail's window names before and after, never guessed from
+             the subject.
+          2. Paste the body over everything the window holds (select
+             all, delete, paste) and read it back from a fresh process.
+          3. Paste the attachments, if any, after the body, and wait for
+             each in the window's AX tree.
+          4. The verified send, then the Sent copy's attachment count.
 
-        Known trade-off: this compose path wraps the sent body in
-        Mail's URLShare scaffolding with an EMPTY ``<blockquote
-        type="cite">`` (body text sits above it, outside the quote).
-        Whether iOS Mail renders a purple bar for the empty quote is
-        unverified — folded into the standing one-time iOS visual
-        re-check (see ``_send_new_via_eml`` docstring).
+        Why this shape, measured through the loopback read-back on
+        2026-09-27 (docs/research/icloud-draft-resync.md, Observation
+        10): a body set through ``content`` arrives inside Mail's
+        ``<blockquote type="cite">``; a body pasted above the seed
+        leaves an empty one below it; files attached through the
+        dictionary after the paste bring it back. This composition
+        arrives with the named sender, the text as written, the files
+        intact, and nothing quoted. It replaced the mailto: URL handler,
+        which composes from Mail's default account and cannot carry
+        attachments.
 
-        Six osascript invocations: compose(+recipients+attachments) →
-        AX attachment verify (poll; the send is NOT attempted unless
-        every attachment is visible in the compose window) → verified
-        paste → read-back → verified send → sent-copy attachment
-        count. A count mismatch after SENT raises loudly and says the
-        message DID go out.
+        Checked before anything is composed: every attachment exists
+        (``FileNotFoundError``), the body fits a paste (``ValueError``;
+        ``sanitize_input`` would cut it silently), and ``from_account``
+        names an account (``MailAccountNotFoundError``). A later failure
+        salvages the window to Drafts and raises
+        ``MailAppleScriptError``, which says so when the message was in
+        fact sent. The outbound allowlist gate is the caller's.
         """
-        win_subject = subject if subject else "New Message"
-
-        self._run_applescript(
-            self._build_attach_compose_script(
-                to=to, cc=cc, bcc=bcc, subject=subject,
-                attachment_paths=attachment_paths,
+        files = [Path(p) for p in attachment_paths or []]
+        for f in files:
+            if not f.is_file():
+                raise FileNotFoundError(f"attachment not found: {f}")
+        if len(body) > SANITIZE_MAX_LENGTH:
+            raise ValueError(
+                f"body is {len(body)} characters; a send carries at most "
+                f"{SANITIZE_MAX_LENGTH}. Nothing was composed or sent."
+            )
+        sender = (
+            self._resolve_account_to_sender(from_account)
+            if from_account is not None
+            else None
+        )
+        raw = self._run_applescript(
+            _wrap_as_json_script(
+                self._build_fresh_compose_script(
+                    to=to, cc=cc, bcc=bcc, subject=subject, sender=sender,
+                ),
+                timeout=self.timeout,
             )
         )
-
-        verify = self._run_applescript(
-            self._build_attachment_ax_verify_script(
-                window_name=win_subject,
-                filenames=[Path(a).name for a in attachment_paths],
-            )
-        ).strip()
-        if verify != "ATTACHMENTS_VERIFIED":
-            salvage = self._salvage_compose_to_draft(win_subject)
-            raise MailAppleScriptError(
-                f"html-send with attachments: attachment never appeared "
-                f"in the compose window — {verify!r}; send NOT attempted "
-                f"(compose window: {salvage})"
-            )
-
-        result = self._inject_html_and_send(
-            window_name=win_subject,
-            sent_subject=subject or "",
-            body=body,
-            place_above_existing=True,
+        window = str(cast(dict[str, Any], parse_applescript_json(raw))["window"])
+        self._paste_verified(
+            window_name=window, body=body, placement="replace", plain=plain,
         )
-
-        subject_safe = escape_applescript_string(subject or "")
-        count_out = self._run_applescript(
-            f'tell application "Mail" to return (count of mail attachments '
-            f'of (first message of sent mailbox whose subject is '
-            f'"{subject_safe}")) as text'
-        ).strip()
-        expected = len(attachment_paths)
-        got = int(count_out) if count_out.isdigit() else -1
-        if got != expected:
-            raise MailAppleScriptError(
-                f"html-send with attachments: message WAS sent, but the "
-                f"sent copy shows {count_out} of {expected} expected "
-                f"attachments — inspect the Sent mailbox copy "
-                f"(subject {subject!r}) before resending."
-            )
+        if files:
+            self._paste_attachments(window, files)
+        result = self._send_compose_window(window, subject)
+        if files:
+            self._check_sent_attachment_count(subject, len(files))
         return result
 
-    def _build_attach_compose_script(
+    def _build_fresh_compose_script(
         self,
         *,
         to: list[str],
         cc: list[str] | None,
         bcc: list[str] | None,
         subject: str,
-        attachment_paths: list[Path],
+        sender: str | None,
     ) -> str:
-        """AppleScript: scriptable compose window with recipients and
-        attachments. The real body arrives later via clipboard injection.
+        """AppleScript body for ``_wrap_as_json_script``: a visible compose
+        window with the subject, recipients, body seed and, when given,
+        ``sender`` (already resolved, set last: set before the recipients
+        it cost a saved draft its recipients,
+        docs/research/icloud-draft-resync.md, Observation 6). Sets
+        ``resultData`` to ``{window: <the new window's name>}``.
 
-        ``content`` is set to a one-character seed, and that is
-        load-bearing rather than cosmetic. Observed live 2026-09-05: a
-        compose window made by ``make new outgoing message`` with an
-        EMPTY body has a WebArea that will not accept keyboard focus by
-        any route — ``set focused``, ``click``, a real coordinate click
-        inside its own bounds, and Tab from the subject field all leave
-        ``AXFocusedUIElement`` at ``missing value``, so the paste step
-        failed with PASTE_FOCUS_FAILED and the only attachment-capable
-        send path was dead. Setting any content makes the same WebArea
-        focus on the first try. A mailto-made window never had the
-        problem, which is why plain HTML sends kept working.
-
-        The seed is a single space and is deliberately left in place.
-        Removing it is not worth what it costs: cmd+a selects the
-        attachments too and the paste then destroys them (measured: 0 of
-        2 sent), a backspace at the end of the body deletes an
-        attachment (1 of 2), and a forward-delete either side of the
-        paste does not remove it at all. One space renders as nothing.
-
-        This method previously avoided the ``content`` setter because it
-        is what introduces Mail's URLShare quote scaffolding. That
-        scaffolding is present either way in this path and is tracked as
-        the standing iOS purple-bar re-check; the seed does not change
-        it."""
+        The body seed is load-bearing: see ``_BODY_SEED``. It does not
+        reach the sent message; ``_send_fresh`` pastes over it."""
         subject_safe = escape_applescript_string(sanitize_input(subject))
         recipient_lines: list[str] = []
         for group, cls in ((to, "to recipient"), (cc or [], "cc recipient"),
@@ -5165,20 +4972,48 @@ end tell
                     f'with properties {{address:"{addr_safe}"}}'
                 )
         recipients_block = "\n".join(recipient_lines)
-        # _build_attachment_block validates existence and targets
-        # `theMessage` — same block the draft path uses.
-        attach_block = self._build_attachment_block(attachment_paths)
+        sender_line = (
+            "    set sender of theMessage to "
+            f'"{escape_applescript_string(sanitize_input(sender))}"'
+            if sender is not None
+            else ""
+        )
         return f"""
+tell application "System Events"
+    tell application process "Mail"
+        set beforeNames to name of windows
+    end tell
+end tell
 tell application "Mail"
     set theMessage to make new outgoing message with properties {{subject:"{subject_safe}", visible:true, content:"{_BODY_SEED}"}}
     tell theMessage
 {recipients_block}
     end tell
-{attach_block}
+{sender_line}
     activate
 end tell
-return "COMPOSED"
+{self._as_new_compose_window_block()}
+set resultData to {{|window|:newName}}
 """
+
+    def _check_sent_attachment_count(self, subject: str, expected: int) -> None:
+        """After a send: the Sent copy of ``subject`` must carry
+        ``expected`` attachments. A mismatch raises, saying the message
+        WAS sent, so the caller inspects it before sending again."""
+        subject_safe = escape_applescript_string(subject)
+        count_out = self._run_applescript(
+            f'tell application "Mail" to return (count of mail attachments '
+            f'of (first message of sent mailbox whose subject is '
+            f'"{subject_safe}")) as text'
+        ).strip()
+        got = int(count_out) if count_out.isdigit() else -1
+        if got != expected:
+            raise MailAppleScriptError(
+                f"send with attachments: message WAS sent, but the sent "
+                f"copy shows {count_out} of {expected} expected "
+                f"attachments — inspect the Sent mailbox copy "
+                f"(subject {subject!r}) before resending."
+            )
 
     @staticmethod
     def _build_attachment_ax_verify_script(
@@ -5333,16 +5168,18 @@ end if
                 to, cc, bcc, seed=seed, reply_all=reply_all
             )
 
-        # For brand-new messages sent immediately, bypass Mail.app's compose
-        # MIME encoding path, which wraps the body in <blockquote type="cite">
-        # causing iOS Mail to render a purple bar. See _send_new_via_eml.
+        # A fresh message sent at once is composed in a visible window and
+        # its body pasted: set through `content`, as a saved draft's is
+        # below, it would arrive inside <blockquote type="cite">, which
+        # iOS Mail draws as a purple bar. See _send_fresh.
         if seed == "new" and send_now:
-            return self._send_new_via_eml(
+            return self._send_fresh(
                 to=to or [],
                 cc=cc,
                 bcc=bcc,
                 subject=subject or "",
                 body=body,
+                plain=True,
                 from_account=from_account,
                 attachment_paths=attachment_paths,
             )
@@ -5591,7 +5428,7 @@ end if
                 [str(a) for a in opened.get("bcc") or []],
             )
         self._paste_verified(
-            window_name=window, body=body, place_above_existing=True, plain=True,
+            window_name=window, body=body, placement="above", plain=True,
         )
         if send_now:
             return self._send_compose_window(window, subject)

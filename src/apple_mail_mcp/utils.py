@@ -10,6 +10,11 @@ _UUID_RE = re.compile(
     r"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
 )
 
+# The longest string ``sanitize_input`` passes through; it cuts anything
+# longer. A caller for whom a cut would lose data (a message body) checks
+# against this and refuses instead.
+SANITIZE_MAX_LENGTH = 10000
+
 
 def is_account_uuid(value: str) -> bool:
     """True iff the string matches the standard UUID format Mail.app emits.
@@ -186,9 +191,8 @@ def sanitize_input(value: Any) -> str:
     s = s.replace("\x00", "")
 
     # Limit length
-    max_length = 10000
-    if len(s) > max_length:
-        s = s[:max_length]
+    if len(s) > SANITIZE_MAX_LENGTH:
+        s = s[:SANITIZE_MAX_LENGTH]
 
     return s
 

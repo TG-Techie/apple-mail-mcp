@@ -239,13 +239,37 @@ def html_part(source: str) -> str:
     """The first text/html part of ``source``, transfer encoding undone
     (so quoted-printable soft breaks cannot split what a test looks
     for); "" when there is none."""
+    return _first_body_part(source, "text/html")
+
+
+def plain_part(source: str) -> str:
+    """The first text/plain part of ``source`` that is the body rather
+    than an attached file, transfer encoding undone; "" when there is
+    none."""
+    return _first_body_part(source, "text/plain")
+
+
+def _first_body_part(source: str, content_type: str) -> str:
     message = email.message_from_string(source)
     for part in message.walk():
-        if part.get_content_type() == "text/html":
+        if part.get_content_type() == content_type and not part.get_filename():
             payload = part.get_payload(decode=True)
             charset = part.get_content_charset() or "utf-8"
             return cast(bytes, payload).decode(charset, errors="replace")
     return ""
+
+
+def assert_not_quoted(source: str) -> None:
+    """Nothing in the message is Mail's quote of itself: no
+    ``<blockquote type="cite">`` in the HTML, which iOS Mail draws as a
+    purple quoted-reply bar whether or not it holds text, and no quoted
+    line in the plain-text part, which is how the same quote renders
+    there. Measured 2026-09-27 (docs/research/icloud-draft-resync.md,
+    Observation 10): a body Mail's scripting ``content`` ever held
+    arrives inside one."""
+    assert 'type="cite"' not in html_part(source), "a cite blockquote arrived"
+    quoted = [ln for ln in plain_part(source).splitlines() if ln.startswith(">")]
+    assert not quoted, f"quoted lines arrived in the plain part: {quoted!r}"
 
 
 # ---------------------------------------------------------------------------

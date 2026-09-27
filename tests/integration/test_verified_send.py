@@ -35,12 +35,13 @@ def connector() -> AppleMailConnector:
     return AppleMailConnector(timeout=90)
 
 
-class TestVerifiedMailtoSend:
+class TestVerifiedFreshSend:
     def test_send_success_implies_sent_copy(
         self, connector: AppleMailConnector
     ) -> None:
-        """A "SENT" result must mean a real Sent-mailbox copy exists —
-        the exact guarantee the 2026-07-20 vanished send violated."""
+        """A "SENT" result from a fresh plain send must mean a real
+        Sent-mailbox copy exists — the exact guarantee the 2026-07-20
+        vanished send violated."""
         subject = f"verified-send-int-{uuid.uuid4().hex[:8]}"
         result = connector.create_draft(
             seed="new",
@@ -153,11 +154,10 @@ class TestHtmlSendWithAttachments:
         self, connector: AppleMailConnector, tmp_path
     ) -> None:
         """Fresh HTML send with attachments + cc, end to end against real
-        Mail.app: compose via `make new outgoing message` (the mailto
-        window is not scriptable for attachments), AX-verified attach,
-        clipboard-injected HTML, verified send, sent-copy checks for
-        attachment count / cc header / rendered HTML. Cleans up the sent
-        copy."""
+        Mail.app: compose via `make new outgoing message`, clipboard-
+        injected HTML over the seeded body, the files pasted after it and
+        AX-verified, verified send, sent-copy checks for attachment count
+        / cc header / rendered HTML. Cleans up the sent copy."""
         subject = f"attach-int-{uuid.uuid4().hex[:8]}"
         f1 = tmp_path / "first.txt"
         f1.write_text("integration attachment one")

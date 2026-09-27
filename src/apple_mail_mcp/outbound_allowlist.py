@@ -83,10 +83,11 @@ def single_address(recipient: str) -> str | None:
 
     None when the string parses as anything other than exactly one
     well-formed address: two addresses joined by a comma or a space, a
-    display name with no address, an address with a newline in it. The
-    mailto: send path splits on commas (RFC 6068) and Mail's compose
-    path accepts whatever text it is handed, so a string that is not one
-    address is one this layer cannot say where it would go.
+    display name with no address, an address with a newline in it. Mail's
+    compose path accepts whatever text it is handed as an address (and
+    the mailto: path the connector once sent through split on commas,
+    RFC 6068), so a string that is not one address is one this layer
+    cannot say where it would go.
     """
     parsed = getaddresses([recipient])
     if len(parsed) != 1:

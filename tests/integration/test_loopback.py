@@ -11,10 +11,13 @@ Real Mail.app; run via:
     MAIL_TEST_MODE=true MAIL_TEST_ACCOUNT=<account> MAIL_TEST_LOOPBACK=<address> \\
         uv run pytest tests/integration/test_loopback.py --run-integration -v
 
-Without MAIL_TEST_LOOPBACK every test here skips. A fresh send cannot
-name its sender on this version (Mail composes it from its default
-account), so the test account must be Mail.app's default account; the
-first test that finds otherwise fails, and the rest refuse to send.
+Without MAIL_TEST_LOOPBACK every test here skips. A test that names no
+sender sends from Mail's default account, so the test account must be
+Mail.app's default account; the first test that finds otherwise fails,
+and the rest refuse to send. The tests that name a sender name the test
+account, because the read-back is the test account's INBOX: a loopback
+delivered to an account other than the sender's would need the
+read-back account made configurable, which nothing here does.
 
 Each test moves everything it sent and received to Trash when it ends,
 pass or fail (see ``MailTrash``). Every subject starts with the suite's
@@ -25,6 +28,7 @@ import asyncio
 import uuid
 from dataclasses import dataclass
 from email import message_from_string
+from email.utils import parseaddr
 from pathlib import Path
 
 import pytest
@@ -37,6 +41,7 @@ from .mail_readback import (
     MailTrash,
     SentCopy,
     assert_html_rendered,
+    assert_not_quoted,
     bare_message_id,
     compose_window_count,
     header,
@@ -107,10 +112,10 @@ class Loopback:
             _wrong_default_sender.append(sender)
             pytest.fail(
                 f"The Sent copy of {subject!r} is From {sender!r}, not the test "
-                f"account's {self.account_address!r}. A fresh send cannot name "
-                "its sender on this version, so Mail's default account sent "
-                "it: the test account must be Mail.app's default account for "
-                "the loopback tests."
+                f"account's {self.account_address!r}. A send that names no "
+                "sender goes out from Mail's default account, so the test "
+                "account must be Mail.app's default account for the loopback "
+                "tests."
             )
         arrival = wait_for_arrival(self.connector, self.account, sent.rfc_message_id)
         return sent, trash.arrived(arrival)
@@ -124,6 +129,22 @@ class Loopback:
         assert header(arrival.headers, "Subject") == subject
         delivered_id = bare_message_id(header(arrival.headers, "Message-Id") or "")
         assert delivered_id == sent.rfc_message_id
+
+    def assert_from_named_sender(self, arrival: Arrival) -> None:
+        """The delivered From is the sender the connector resolves the
+        test account to, display name included. The display name is what
+        tells a named sender from Mail's default here, since the test
+        account is also Mail's default: a send that names no sender
+        arrived From the bare address (measured 2026-09-27,
+        docs/research/icloud-draft-resync.md, Observation 10). With no
+        full name configured on the account the two cannot be told
+        apart, and this checks the address only."""
+        wanted_name, wanted_address = parseaddr(
+            self.connector._resolve_account_to_sender(self.account)
+        )
+        got_name, got_address = parseaddr(header(arrival.headers, "From") or "")
+        assert got_address.lower() == wanted_address.lower()
+        assert got_name == wanted_name
 
 
 @pytest.fixture
@@ -153,6 +174,7 @@ def test_fresh_html_arrives_intact(loop: Loopback) -> None:
 
         loop.assert_delivered(arrival, sent, subject)
         assert_html_rendered(arrival.source, f"<b>marker-{hexid}</b>")
+        assert_not_quoted(arrival.source)
         assert arrival.attachment_count == 0
         assert arrival.attachment_names == ()
         assert f"marker-{hexid}" in arrival.content
@@ -183,13 +205,13 @@ def test_fresh_html_with_cc_and_attachments_arrives_intact(
         }
         assert "ccprobe@example.com" in (header(arrival.headers, "Cc") or "")
         assert_html_rendered(arrival.source, f"<b>marker-{hexid}</b>")
+        assert_not_quoted(arrival.source)
 
 
 def test_plain_fresh_send_via_draft_path_arrives_intact(loop: Loopback) -> None:
-    """``create_draft(seed="new", send_now=True)`` sends through the
-    mailto: path (``_send_new_via_eml``), which exists so the body is not
-    wrapped in ``<blockquote type="cite">``: iOS Mail draws that as a
-    purple quoted-reply bar."""
+    """``create_draft(seed="new", send_now=True)``, no sender named: the
+    body arrives as written, and not inside ``<blockquote type="cite">``,
+    which iOS Mail draws as a purple quoted-reply bar."""
     hexid = _hex()
     subject = f"{PREFIX}plain-eml-{hexid}"
     body = f"plain <text> & symbols marker-{hexid}"
@@ -204,8 +226,83 @@ def test_plain_fresh_send_via_draft_path_arrives_intact(loop: Loopback) -> None:
 
         loop.assert_delivered(arrival, sent, subject)
         assert body in arrival.content
-        assert '<blockquote type="cite">' not in arrival.source
-        assert 'type="cite"' not in html_part(arrival.source)
+        assert_not_quoted(arrival.source)
+
+
+def test_plain_fresh_send_from_a_named_sender_arrives_from_it(loop: Loopback) -> None:
+    """``create_draft(seed="new", send_now=True, from_account=...)``: the
+    named account sends it, and the body arrives as written, over two
+    lines, unquoted."""
+    hexid = _hex()
+    subject = f"{PREFIX}plain-sender-{hexid}"
+    body = f"plain <text> & symbols marker-{hexid}\nsecond line 2 > 1"
+    with MailTrash(loop.connector, loop.account) as trash:
+        trash.windows(subject)
+        loop.prepare(trash, subject)
+        result = loop.connector.create_draft(
+            seed="new", to=[loop.address], subject=subject, body=body,
+            from_account=loop.account, send_now=True,
+        )
+        assert result == SENT
+        sent, arrival = loop.receive(trash, subject)
+
+        loop.assert_delivered(arrival, sent, subject)
+        loop.assert_from_named_sender(arrival)
+        for line in body.splitlines():
+            assert line in arrival.content
+        assert_not_quoted(arrival.source)
+        assert arrival.attachment_count == 0
+
+
+def test_plain_fresh_send_from_a_named_sender_carries_attachments(
+    loop: Loopback, tmp_path: Path
+) -> None:
+    """The same with two files: both arrive, by name and byte for byte,
+    and the body is still unquoted."""
+    hexid = _hex()
+    subject = f"{PREFIX}plain-attachments-{hexid}"
+    body = f"plain with files <b>not markup</b> & marker-{hexid}"
+    files = _two_files(tmp_path, hexid)
+    with MailTrash(loop.connector, loop.account) as trash:
+        trash.windows(subject)
+        loop.prepare(trash, subject)
+        result = loop.connector.create_draft(
+            seed="new", to=[loop.address], subject=subject, body=body,
+            from_account=loop.account, attachment_paths=files, send_now=True,
+        )
+        assert result == SENT
+        sent, arrival = loop.receive(trash, subject)
+
+        loop.assert_delivered(arrival, sent, subject)
+        loop.assert_from_named_sender(arrival)
+        assert body in arrival.content
+        assert sorted(arrival.attachment_names) == ["first.txt", "second.txt"]
+        assert arrival.attachment_count == 2
+        assert _attachment_bytes(arrival.source) == {
+            f.name: f.read_bytes() for f in files
+        }
+        assert_not_quoted(arrival.source)
+
+
+def test_fresh_html_from_a_named_sender_arrives_from_it(loop: Loopback) -> None:
+    hexid = _hex()
+    subject = f"{PREFIX}html-sender-{hexid}"
+    with MailTrash(loop.connector, loop.account) as trash:
+        trash.windows(subject)
+        loop.prepare(trash, subject)
+        result = loop.connector._send_html_email(
+            to=[loop.address], cc=None, bcc=None, subject=subject,
+            body=f"<p>named sender <b>marker-{hexid}</b></p><p>two &amp; more</p>",
+            from_account=loop.account,
+        )
+        assert result == SENT
+        sent, arrival = loop.receive(trash, subject)
+
+        loop.assert_delivered(arrival, sent, subject)
+        loop.assert_from_named_sender(arrival)
+        assert_html_rendered(arrival.source, f"<b>marker-{hexid}</b>")
+        assert "two &amp; more" in html_part(arrival.source)
+        assert_not_quoted(arrival.source)
 
 
 def test_html_reply_threads_at_the_receiver(loop: Loopback) -> None:
