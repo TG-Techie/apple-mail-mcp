@@ -1156,7 +1156,7 @@ and sent immediately, with **mechanical dispatch verification**: a success
 result means the compose window closed AND a copy exists in the Sent
 mailbox (see `docs/reference/UI_GROUNDING_MAIL_SEND.md`).
 
-Two modes:
+Three modes:
 
 - **Fresh mail** (default): `to` and `subject` required.
 - **Reply into a thread**: pass `reply_to=<message id>` (Mail internal or
@@ -1164,6 +1164,13 @@ Two modes:
   Mail carries the threading headers (`In-Reply-To`/`References`);
   `subject` defaults to the derived `Re: …`; recipients default to Mail's
   derived reply set. The HTML is pasted ABOVE the auto-quoted original.
+- **Forward**: pass `forward_of=<message id>` (the same id forms) and
+  `to`, which is required: Mail derives no recipient for a forward.
+  `subject` defaults to Mail's `Fwd: …`. The HTML is pasted ABOVE Mail's
+  forwarded message, which keeps its header block ("Begin forwarded
+  message:") and the original's attachments. This is Mail's own forward
+  of the message; a fresh message with the original pasted into it is
+  not a forward.
 
 **Reply-all:** there is no `reply_all` flag. Fetch the thread participants
 (`get_thread`/`get_messages`) and pass them explicitly via `to`/`cc`.
@@ -1179,14 +1186,15 @@ every send path.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `to` | array | Fresh mode | `[]` | Recipients. In reply mode, explicit values REPLACE Mail's derived set. |
-| `subject` | string | Fresh mode | `""` | Subject. Reply mode derives `Re: …` when omitted. |
+| `to` | array | Fresh and forward modes | `[]` | Recipients. In reply mode, explicit values REPLACE Mail's derived set; a forward has none to derive. |
+| `subject` | string | Fresh mode | `""` | Subject. Reply and forward modes derive `Re: …` / `Fwd: …` when omitted. |
 | `body` | string | Yes | - | HTML string for the email body, at most 10,000 characters. |
 | `cc` | array | No | `[]` | CC recipients (replace derived CC when replying). |
 | `bcc` | array | No | `[]` | BCC recipients. |
-| `from_account` | string | No | null | Mail.app account name or UUID. Null uses Mail's default sender. Set as the sender of the message composed, fresh or reply. |
-| `reply_to` | string | No | null | Message id to reply to; enables reply mode. |
-| `attachment_paths` | array | No | `[]` | File paths to attach. **Fresh mode only** (not supported with `reply_to`). Each file must exist, must not carry an executable extension (`.exe`, `.sh`, …), and must be under 25MB. |
+| `from_account` | string | No | null | Mail.app account name or UUID. Null uses Mail's default sender. Set as the sender of the message composed, in every mode. |
+| `reply_to` | string | No | null | Message id to reply to; enables reply mode. Mutually exclusive with `forward_of`. |
+| `forward_of` | string | No | null | Message id to forward, in the same forms as `reply_to`; enables forward mode. |
+| `attachment_paths` | array | No | `[]` | File paths to attach, in every mode, pasted after everything else: on a reply or forward, after Mail's quote or forwarded message. Each file must exist, must not carry an executable extension (`.exe`, `.sh`, …), and must be under 25MB. |
 
 **Returns:**
 
@@ -1197,12 +1205,15 @@ every send path.
 **Error Codes:**
 
 - `outbound_disallowed`: one or more recipients off the allowlist —
-  nothing was sent; in reply mode the compose window was discarded.
+  nothing was sent; when it was one Mail derived for a reply, the
+  compose window it was read from was discarded.
 - `allowlist_unavailable`: the outbound allowlist cannot be read, so
   every send is refused — nothing was sent.
-- `validation_error`: missing `to`/`subject` in fresh mode, a body over
-  10,000 characters (refused rather than cut), or `attachment_paths`
-  combined with `reply_to` — nothing was sent.
+- `validation_error`: missing `to`/`subject` in fresh mode, missing `to`
+  in forward mode, `reply_to` together with `forward_of`, or a body over
+  10,000 characters (refused rather than cut) — nothing was sent.
+- `message_not_found`: `reply_to` / `forward_of` matches no message in
+  Mail — nothing was sent.
 - `file_not_found` / `validation_error` (attachments): a listed file is
   missing, has a blocked extension, or exceeds 25MB — nothing was sent.
 - `applescript_error`: a mechanical read-back failed
@@ -1219,23 +1230,31 @@ every send path.
   carries the text of Mail's send-error sheet ("Cannot send message
   using the server …").
 
-**Composition (fresh mode):** the message is composed in a visible
-window made by `make new outgoing message`, found by comparing Mail's
-window names before and after (a window of the same name already open
-stops the send with `COMPOSE_WINDOW_NOT_UNIQUE`). The HTML is pasted
-over the window's whole body and read back, and any attachments are
-pasted after it as files. Each attachment must be mechanically visible
-in the compose window's AX tree before Send is clicked (an image shows
-there inline, as an image, anything else as an attachment button), and
-the Sent-mailbox copy is checked after dispatch to carry every file,
-by name. The sender, when named, is set on the composed message. This
-is the composition every saved draft uses too (see `draft_create`).
-Read back from a delivered copy, the message carries nothing quoted: no
-`blockquote type="cite"`, which iOS Mail draws as a purple bar
-(docs/research/icloud-draft-resync.md, Observation 10).
+**Composition:** every mode is composed in a visible window: a fresh
+message made by `make new outgoing message`, or Mail's own reply or
+forward window. The window is found by comparing Mail's window names
+before and after (a window of the same name already open stops the send
+with `COMPOSE_WINDOW_NOT_UNIQUE`). The subject, recipients and sender
+are set on its message, and the recipients it then holds, those Mail
+derived for a reply included, pass the outbound allowlist before
+anything is pasted. The HTML is pasted and read back: over the whole
+body of a fresh message; above Mail's quote or forwarded message on a
+reply or forward, where an empty body leaves Mail's part as Mail made
+it. Any attachments are pasted after everything else, as files. Each
+must be mechanically visible in the compose window's AX tree before
+Send is clicked (an image shows there inline, as an image, anything
+else as an attachment button), and the Sent-mailbox copy is checked
+after dispatch to carry every file, by name; a forward's carries the
+original's files as well. This is the composition every saved draft
+uses too (see `draft_create`). Read back from a delivered copy, a fresh
+message carries nothing quoted: no `blockquote type="cite"`, which iOS
+Mail draws as a purple bar (docs/research/icloud-draft-resync.md,
+Observation 10). Attached through Mail's scripting dictionary instead,
+a file on a reply or forward sent the original unquoted and cost a
+forward the original's files (Observation 11).
 
-**Limitations:** attachments not supported in reply mode; en-US Mail
-UI labels; sends require Mail.app UI automation permission.
+**Limitations:** en-US Mail UI labels; sends require Mail.app UI
+automation permission.
 
 ---
 
