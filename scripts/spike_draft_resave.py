@@ -25,6 +25,12 @@ Variants (see the note for what each measures):
     sweep       trash every draft whose subject this spike created (from the
                 log) until none has appeared for a quiet period
 
+Since 2026-09-27 connector.create_draft saves every draft from a compose
+window closed with Save, as the note recommended. So v1-named, v1-none
+and v4-update now measure that path, not the dictionary save the note's
+Observations 2, 3 and 6 measured, and v5-reveal finds no hidden window
+to reveal. v2 still saves through the dictionary, as written here.
+
 Every run: create, then poll the Drafts entries carrying the run's subject
 every 2 s until 45 s after the create returned (id, Message-ID, sender,
 account), then read the windows of that name, the outgoing-message

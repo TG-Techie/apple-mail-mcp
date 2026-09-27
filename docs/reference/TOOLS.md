@@ -886,8 +886,8 @@ Create a draft (fresh, reply, or forward). Does not send; send it with
 | `cc` | array[string] | No | [] | CC recipients (same semantics as `to` for reply/forward). |
 | `bcc` | array[string] | No | [] | BCC recipients. |
 | `subject` | string | When fresh | None | Subject. For reply/forward, `None` keeps Mail's `Re:`/`Fwd:` prefix. |
-| `body` | string | No | "" | Body text, at most 10,000 characters; a longer body is refused (`validation_error`) rather than cut. For reply/forward, a non-empty body goes **above** what Mail wrote, which stays: the quoted original, or the forwarded message with its header block and every attachment Mail carried. It is pasted as plain text in a visible compose window, so Mail comes to the front for a few seconds. An empty body leaves Mail's quote or forward exactly as Mail made it. |
-| `attachment_paths` | array[string] | No | [] | List of file paths to attach. Each must exist, must not carry an executable extension (`.exe`, `.sh`, …), and must be under 25MB — the same checks as `email_send_html`. |
+| `body` | string | No | "" | Body text, at most 10,000 characters; a longer body is refused (`validation_error`) rather than cut. Pasted as plain text (see **Composition**). For reply/forward, a non-empty body goes **above** what Mail wrote, which stays: the quoted original, or the forwarded message with its header block and every attachment Mail carried. An empty body leaves Mail's quote or forward exactly as Mail made it. |
+| `attachment_paths` | array[string] | No | [] | List of file paths to attach, pasted into the body after everything else: on a reply or forward, after Mail's quote or forwarded message. Each must exist, must not carry an executable extension (`.exe`, `.sh`, …), and must be under 25MB — the same checks as `email_send_html`. |
 | `reply_all` | boolean | No | False | For `reply_to` only — use `reply to all`. |
 | `template_name` | string | No | None | Optional template to render for `subject` + `body`. Caller-supplied `subject`/`body` override the rendered output. |
 | `template_vars` | object | No | None | Variables for the template renderer. Requires `template_name`. |
@@ -905,6 +905,25 @@ Create a draft (fresh, reply, or forward). Does not send; send it with
 ```
 
 `sent_message_id` is reserved for future use.
+
+**Composition:** every draft is composed in a visible compose window,
+so Mail comes to the front for a few seconds of each save: a fresh
+message made by `make new outgoing message`, or Mail's own reply or
+forward window. The subject, recipients and sender are set on the
+message, the body is pasted and read back, the files are pasted and
+each seen in the window, and the window is closed with Save. The id
+returned is the draft that save made, and in every run measured it
+held for the 45 s watched. Drafts saved through Mail's scripting
+dictionary instead, as they were until 2026-09-27, were re-saved by
+Mail under a new id within seconds when they named a sender, held
+their body inside a quote (`blockquote type="cite"`), so they went out
+quoted when sent from Mail.app, and lost Mail's quote or forwarded
+message when they carried a file on a reply or forward
+(docs/research/draft-resave-spike.md,
+docs/research/icloud-draft-resync.md, Observations 10 and 11). A
+window of the same name already open stops the save with
+`COMPOSE_WINDOW_NOT_UNIQUE`, and saving needs Mail.app UI automation
+permission, as sending does.
 
 **Examples:**
 
@@ -948,7 +967,14 @@ draft_create(reply_to="160989", template_name="thanks-for-meeting")
 - `rate_limited`: more than 20 calls in 60 s to the `expensive_ops`
   tier, which draft saves, updates and deletes share with searches and
   the other mutations.
-- `applescript_error`, `unknown`: Lower-level failures.
+- `applescript_error`: a mechanical read-back of the compose window
+  failed (`NO_COMPOSE_WINDOW:…`, `COMPOSE_WINDOW_NOT_UNIQUE:…`,
+  `NO_BODY_AREA`, `PASTE_FAILED:…`, `ATTACH_MISSING:…`, `draft save:
+  …`), and the error carries the actual UI state. A window a failed
+  paste leaves is closed with Save, so what was composed so far is in
+  Drafts, and the error ends with that outcome; a window whose name was
+  not unique is left open. Also lower-level failures.
+- `unknown`: anything else.
 
 ---
 
@@ -956,9 +982,11 @@ draft_create(reply_to="160989", template_name="thanks-for-meeting")
 
 Update an existing draft. Implemented as **recreate-then-delete** —
 Mail.app forbids mutating saved drafts, so this tool reads the
-current state, creates a new draft with the merged fields, and then
-removes the old one. Threading headers (for replies) and forward
-anchors are preserved via persisted seed metadata. Does not send.
+current state, creates a new draft with the merged fields, composed
+as `draft_create` composes one (a visible compose window closed with
+Save), and then removes the old one. Threading headers (for replies)
+and forward anchors are preserved via persisted seed metadata. Does
+not send.
 
 **⚠️ Returns a NEW `draft_id`** — after a success the input id is no
 longer valid. Callers caching the id must re-read the response.
@@ -1073,10 +1101,12 @@ every send (`allowlist_unavailable`). A refused send leaves the draft
 exactly as it was. A send the allowlist does not already cover asks the
 user to confirm.
 
-Every draft goes out from the sender it was saved with. A fresh draft
-is sent as `email_send_html` sends a fresh message (see its
-composition), as plain text, with the draft's attachments read out of
-the draft first.
+Every draft goes out from the sender it was saved with, composed as
+`draft_create` composes one and sent through the window's Send button
+with the same mechanical read-back as `email_send_html`: a fresh draft
+as plain text over the whole body, a reply's or forward's own text
+above Mail's quote or forwarded message, with the draft's attachments
+read out of the draft first and pasted after everything else.
 
 **Parameters:**
 
@@ -1180,9 +1210,9 @@ every send path.
   `NO_COMPOSE_WINDOW:…`, `COMPOSE_WINDOW_NOT_UNIQUE:…`, `NO_BODY_AREA`,
   `PASTE_FAILED:…`, `ATTACH_MISSING:…`) — the error carries the actual
   UI state; the message was NOT sent, with ONE exception: an error
-  saying "message WAS sent, but the sent copy shows N of M expected
-  attachments" means dispatch succeeded and the post-send
-  attachment-count check failed — inspect the Sent copy before
+  saying "message WAS sent, but the sent copy lacks [...] of the files
+  attached" means dispatch succeeded and the post-send check that the
+  Sent copy carries every file failed — inspect the Sent copy before
   resending. A compose window a failure leaves is closed with Save, so
   the message is in Drafts; the error ends with that outcome. When
   Mail could not send through the account's server, that outcome also
@@ -1197,8 +1227,9 @@ over the window's whole body and read back, and any attachments are
 pasted after it as files. Each attachment must be mechanically visible
 in the compose window's AX tree before Send is clicked (an image shows
 there inline, as an image, anything else as an attachment button), and
-the Sent-mailbox copy is checked for the attachment count after
-dispatch. The sender, when named, is set on the composed message.
+the Sent-mailbox copy is checked after dispatch to carry every file,
+by name. The sender, when named, is set on the composed message. This
+is the composition every saved draft uses too (see `draft_create`).
 Read back from a delivered copy, the message carries nothing quoted: no
 `blockquote type="cite"`, which iOS Mail draws as a purple bar
 (docs/research/icloud-draft-resync.md, Observation 10).
