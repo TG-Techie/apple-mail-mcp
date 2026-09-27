@@ -71,6 +71,7 @@ from .utils import (
     applescript_iso_date_statements,
     distinct_filenames,
     escape_applescript_string,
+    format_recipients,
     get_flag_index,
     parse_applescript_json,
     safe_attachment_filename,
@@ -489,6 +490,98 @@ def _attachment_walk_block(
     )
     lines.append(f"{pad}end try")
     return "\n".join(lines)
+
+
+# A message's recipient elements, in emitted order:
+#   (Mail element, JSON key, AppleScript list variable)
+_RECIPIENT_KINDS: tuple[tuple[str, str, str], ...] = (
+    ("to recipients", "to", "toList"),
+    ("cc recipients", "cc", "ccList"),
+    ("bcc recipients", "bcc", "bccList"),
+)
+
+# The fields a message record takes from _recipient_read_block's lists.
+_RECIPIENT_FIELDS = ", ".join(
+    f"|{key}|:{var}" for _element, key, var in _RECIPIENT_KINDS
+)
+
+
+def _recipient_read_block(
+    *, message_var: str, warnings_var: str, indent: int
+) -> str:
+    """Emit the AppleScript that reads ``<message_var>``'s to, cc and bcc
+    recipients into ``toList``, ``ccList`` and ``bccList``: one
+    ``{|name|, |address|}`` record per recipient, which Python renders
+    with ``format_address`` (``_render_recipients``) exactly as the
+    IMAP path renders an ENVELOPE address.
+
+    One Apple event per kind. ``properties of <kind> of <msg>`` returns
+    every recipient of that kind at once, and name and address are then
+    read from the local records. Measured on the test account: about
+    16 ms per event, where the six ``name of`` / ``address of`` reads of
+    the same three lists took about 100 ms. ``recipients of <msg>``
+    would be one event for all three, but it does not tell them apart:
+    read that way, a Cc recipient reported its class as ``to
+    recipient``.
+
+    Each kind is read under its own ``try``. A failure leaves that list
+    empty and appends a warning naming the kind and the message to
+    ``warnings_var`` (which the caller initialises), so an unreadable
+    list is reported rather than passed off as an empty one, and one
+    bad kind does not take the others with it. A recipient without a
+    display name has Mail's ``missing value`` as its name, which JSON
+    cannot carry; it becomes ``""``, as does a missing address.
+
+    Args:
+        message_var: AppleScript variable holding the message.
+        warnings_var: AppleScript list variable collecting warnings.
+        indent: Leading spaces for the emitted block.
+
+    Returns:
+        AppleScript fragment ready to interpolate. The message record
+        takes the lists with ``_RECIPIENT_FIELDS``.
+    """
+    pad = " " * indent
+    lines: list[str] = []
+    for element, key, var in _RECIPIENT_KINDS:
+        lines += [
+            f"{pad}set {var} to {{}}",
+            f"{pad}try",
+            f"{pad}    set rcpts to properties of {element} of {message_var}",
+            f"{pad}    repeat with rcpt in rcpts",
+            f"{pad}        set rcptName to name of rcpt",
+            f'{pad}        if rcptName is missing value then set rcptName to ""',
+            f"{pad}        set rcptAddress to address of rcpt",
+            f'{pad}        if rcptAddress is missing value then set rcptAddress to ""',
+            f"{pad}        set end of {var} to {{|name|:rcptName, |address|:rcptAddress}}",
+            f"{pad}    end repeat",
+            f"{pad}on error errMsg number errNum",
+            f"{pad}    set {var} to {{}}",
+            f"{pad}    set end of {warnings_var} to "
+            f'("{key} recipients unreadable for message " & '
+            f'(id of {message_var} as text) & ": " & errMsg & '
+            f'" (error " & errNum & ")")',
+            f"{pad}end try",
+        ]
+    return "\n".join(lines)
+
+
+def _render_recipients(record: dict[str, Any]) -> None:
+    """Replace the recipient records a script emitted with the row's
+    strings, in place: each ``{name, address}`` through
+    ``format_address``, the renderer the IMAP rows use.
+
+    A record without one of the keys is left without it. Every script
+    that reads recipients emits all three, so there is nothing to
+    render, and an empty list here would say the message has no
+    recipients when nothing was read.
+    """
+    for _element, key, _var in _RECIPIENT_KINDS:
+        if key in record:
+            record[key] = format_recipients(
+                (str(r.get("name") or ""), str(r.get("address") or ""))
+                for r in record[key] or []
+            )
 
 
 def _search_filter_statements(
@@ -1851,6 +1944,11 @@ class AppleMailConnector:
         else:
             attachments_clause = ""
             attachments_field = ""
+        # Recipients: three reads per matching row, under per-kind
+        # guards whose failures join warnList like the ones above.
+        recipients_clause = _recipient_read_block(
+            message_var="msg", warnings_var="warnList", indent=20
+        )
 
         tell_body = f'''
         tell application "Mail"
@@ -1878,7 +1976,8 @@ class AppleMailConnector:
                     end try
                 end try
                 if includeThis then{attachments_clause}
-                    set msgRecord to {{|id|:(id of msg as text), |rfc_message_id|:(message id of msg), |subject|:(subject of msg), |sender|:(sender of msg), |date_received|:(date received of msg as text), |read_status|:(read status of msg), |flagged|:(flagged status of msg){attachments_field}}}
+{recipients_clause}
+                    set msgRecord to {{|id|:(id of msg as text), |rfc_message_id|:(message id of msg), |subject|:(subject of msg), |sender|:(sender of msg), |date_received|:(date received of msg as text), |read_status|:(read status of msg), |flagged|:(flagged status of msg), {_RECIPIENT_FIELDS}{attachments_field}}}
                     set end of resultData to msgRecord
                     set matchCount to matchCount + 1
                 end if
@@ -1902,10 +2001,13 @@ class AppleMailConnector:
             if on_warning is not None:
                 for w in warns:
                     on_warning(w)
-            return messages
-        # Defensive fallback for any pre-existing test fixtures that
-        # might emit the bare-list form.
-        return cast(list[dict[str, Any]], parsed)
+        else:
+            # Defensive fallback for any pre-existing test fixtures that
+            # might emit the bare-list form.
+            messages = cast(list[dict[str, Any]], parsed)
+        for message in messages:
+            _render_recipients(message)
+        return messages
 
     def get_message(
         self,
@@ -2126,6 +2228,11 @@ class AppleMailConnector:
             if include_content
             else 'set msgContent to ""'
         )
+        # Guarded: the lookup's own try below would otherwise turn an
+        # unreadable recipient list into "message not found".
+        recipients_clause = _recipient_read_block(
+            message_var="msg", warnings_var="recipWarnings", indent=24
+        )
 
         tell_body = f'''
         tell application "Mail"
@@ -2135,7 +2242,9 @@ class AppleMailConnector:
                     try
                         set msg to first message of mb {id_where}
                         {content_clause}
-                        set resultData to {{|id|:(id of msg as text), |rfc_message_id|:(message id of msg), |subject|:(subject of msg), |sender|:(sender of msg), |date_received|:(date received of msg as text), |read_status|:(read status of msg), |flagged|:(flagged status of msg), |content|:msgContent}}
+                        set recipWarnings to {{}}
+{recipients_clause}
+                        set resultData to {{|id|:(id of msg as text), |rfc_message_id|:(message id of msg), |subject|:(subject of msg), |sender|:(sender of msg), |date_received|:(date received of msg as text), |read_status|:(read status of msg), |flagged|:(flagged status of msg), |content|:msgContent, {_RECIPIENT_FIELDS}, |warnings|:recipWarnings}}
                         exit repeat
                     end try
                 end repeat
@@ -2151,12 +2260,18 @@ class AppleMailConnector:
         script = _wrap_as_json_script(tell_body, timeout=self.timeout)
         result = self._run_applescript(script)
         msg = cast(dict[str, Any], parse_applescript_json(result))
+        _render_recipients(msg)
+        warnings = cast(list[str], msg.pop("warnings", None) or [])
 
         if include_attachments:
-            attachments, warnings = self._enumerate_attachments_for_message(
-                message_id
+            attachments, attachment_warnings = (
+                self._enumerate_attachments_for_message(message_id)
             )
             msg["attachments"] = attachments
+            warnings += attachment_warnings
+        # With attachments the row always says whether enumeration
+        # warned; without, it carries warnings only when there are some.
+        if include_attachments or warnings:
             msg["warnings"] = warnings
 
         return msg
@@ -2353,7 +2468,7 @@ class AppleMailConnector:
                 "subject and misses members whose subject was rewritten "
                 f"mid-thread ({why})."
             )
-        return self._collect_thread_applescript(anchor)
+        return self._collect_thread_applescript(anchor, on_warning=on_warning)
 
     def _imap_get_thread(
         self, anchor: dict[str, Any],
@@ -2781,7 +2896,12 @@ class AppleMailConnector:
                 return result
         return None
 
-    def _get_thread_applescript(self, message_id: str) -> list[dict[str, Any]]:
+    def _get_thread_applescript(
+        self,
+        message_id: str,
+        *,
+        on_warning: Callable[[str], None] | None = None,
+    ) -> list[dict[str, Any]]:
         """AppleScript path for get_thread (the universal baseline).
 
         Composes _resolve_thread_anchor_applescript (call 1) and
@@ -2794,9 +2914,11 @@ class AppleMailConnector:
         Message-ID / In-Reply-To / References headers across the candidate
         set. Members whose subject was rewritten mid-thread are not found
         (documented limitation of this path; fixed by the IMAP path).
+        ``on_warning`` receives what ``_collect_thread_applescript``
+        reports.
         """
         anchor = self._resolve_thread_anchor_applescript(message_id)
-        return self._collect_thread_applescript(anchor)
+        return self._collect_thread_applescript(anchor, on_warning=on_warning)
 
     def _resolve_thread_anchor_applescript(
         self, message_id: str,
@@ -2870,7 +2992,10 @@ class AppleMailConnector:
         }
 
     def _collect_thread_applescript(
-        self, anchor: dict[str, Any],
+        self,
+        anchor: dict[str, Any],
+        *,
+        on_warning: Callable[[str], None] | None = None,
     ) -> list[dict[str, Any]]:
         """AppleScript call 2 + Python graph walk.
 
@@ -2878,6 +3003,11 @@ class AppleMailConnector:
         fetches subject-prefiltered candidates across all mailboxes of the
         anchor's account, and walks the reference graph to assemble the
         thread. Returns the final sorted search-shape list.
+
+        ``on_warning`` (if given) receives each warning about a row in the
+        result: a recipient list that could not be read. One about a
+        candidate the walk left out is about nothing returned, and is
+        dropped with it.
         """
         from .utils import normalize_subject, parse_rfc822_ids, walk_thread_graph
 
@@ -2885,6 +3015,11 @@ class AppleMailConnector:
         base_subject = normalize_subject(cast(str, anchor["subject"]))
         account_safe = escape_applescript_string(sanitize_input(account_name))
         subject_safe = escape_applescript_string(sanitize_input(base_subject))
+        # Guarded: the mailbox's try below would otherwise drop every
+        # candidate in the mailbox over one unreadable recipient list.
+        recipients_clause = _recipient_read_block(
+            message_var="m", warnings_var="recipWarnings", indent=24
+        )
 
         candidates_body = f'''
         tell application "Mail"
@@ -2903,7 +3038,9 @@ class AppleMailConnector:
                                 if hname is "references" then set refs to (content of h)
                             end repeat
                         end try
-                        set candRecord to {{|id|:(id of m as text), |rfc_message_id|:(message id of m), |in_reply_to|:inReplyTo, |references_raw|:refs, |subject|:(subject of m), |sender|:(sender of m), |date_received|:(date received of m as text), |read_status|:(read status of m), |flagged|:(flagged status of m)}}
+                        set recipWarnings to {{}}
+{recipients_clause}
+                        set candRecord to {{|id|:(id of m as text), |rfc_message_id|:(message id of m), |in_reply_to|:inReplyTo, |references_raw|:refs, |subject|:(subject of m), |sender|:(sender of m), |date_received|:(date received of m as text), |read_status|:(read status of m), |flagged|:(flagged status of m), {_RECIPIENT_FIELDS}, |warnings|:recipWarnings}}
                         set end of resultData to candRecord
                     end repeat
                 on error
@@ -2968,6 +3105,9 @@ class AppleMailConnector:
                 ),
                 "subject": anchor["subject"],
                 "sender": "",
+                "to": [],
+                "cc": [],
+                "bcc": [],
                 "date_received": "",
                 "read_status": False,
                 "flagged": False,
@@ -2981,11 +3121,16 @@ class AppleMailConnector:
         # Drop threading-internal scratch fields from output rows. Per
         # #148 we KEEP rfc_message_id alongside id (dual-emit), so
         # callers can hand it to the IMAP fast paths from #149/#150/
-        # #151/#152 even when get_thread fell back to AppleScript.
+        # #151/#152 even when get_thread fell back to AppleScript. A
+        # row's recipient warnings leave it for the caller.
         for m in thread:
             m.pop("in_reply_to", None)
             m.pop("references_raw", None)
             m.pop("references_parsed", None)
+            _render_recipients(m)
+            for warning in m.pop("warnings", None) or []:
+                if on_warning is not None:
+                    on_warning(warning)
 
         return thread
 
@@ -3771,6 +3916,9 @@ class AppleMailConnector:
             if include_content
             else 'set msgContent to ""'
         )
+        recipients_clause = _recipient_read_block(
+            message_var="msg", warnings_var="recipWarnings", indent=16
+        )
 
         tell_body = f"""
         tell application "Mail"
@@ -3778,7 +3926,9 @@ class AppleMailConnector:
             set sel to selection
             repeat with msg in sel
                 {content_clause}
-                set msgRecord to {{|id|:(id of msg as text), |subject|:(subject of msg), |sender|:(sender of msg), |date_received|:(date received of msg as text), |read_status|:(read status of msg), |flagged|:(flagged status of msg), |content|:msgContent}}
+                set recipWarnings to {{}}
+{recipients_clause}
+                set msgRecord to {{|id|:(id of msg as text), |subject|:(subject of msg), |sender|:(sender of msg), |date_received|:(date received of msg as text), |read_status|:(read status of msg), |flagged|:(flagged status of msg), |content|:msgContent, {_RECIPIENT_FIELDS}, |warnings|:recipWarnings}}
                 set end of resultData to msgRecord
             end repeat
         end tell
@@ -3788,28 +3938,38 @@ class AppleMailConnector:
         result = self._run_applescript(script)
         messages = cast(list[dict[str, Any]], parse_applescript_json(result))
 
-        if include_attachments:
-            for m in messages:
-                msg_id = cast(str, m.get("id", ""))
-                try:
-                    attachments, warnings = (
-                        self._enumerate_attachments_for_message(msg_id)
-                    )
-                except MailMessageNotFoundError:
-                    # The id came directly from `selection` so a "not
-                    # found" here means Mail.app lost the reference
-                    # between the two AppleScript calls (e.g. user
-                    # deleted or moved the message in the gap). Surface
-                    # as a warning rather than dropping the row.
-                    attachments = []
-                    warnings = [
-                        "attachment enumeration could not relocate "
-                        f"selected message {msg_id}"
-                    ]
+        for m in messages:
+            _render_recipients(m)
+            warnings = cast(list[str], m.pop("warnings", None) or [])
+            if include_attachments:
+                attachments, attachment_warnings = (
+                    self._selected_message_attachments(cast(str, m.get("id", "")))
+                )
                 m["attachments"] = attachments
+                warnings += attachment_warnings
+            # As in _get_message_applescript: with attachments the row
+            # always carries warnings; without, only when there are some.
+            if include_attachments or warnings:
                 m["warnings"] = warnings
 
         return messages
+
+    def _selected_message_attachments(
+        self, msg_id: str
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        """Attachments and warnings of one message ``selection`` listed."""
+        try:
+            return self._enumerate_attachments_for_message(msg_id)
+        except MailMessageNotFoundError:
+            # The id came directly from `selection` so a "not
+            # found" here means Mail.app lost the reference
+            # between the two AppleScript calls (e.g. user
+            # deleted or moved the message in the gap). Surface
+            # as a warning rather than dropping the row.
+            return [], [
+                "attachment enumeration could not relocate "
+                f"selected message {msg_id}"
+            ]
 
     def delete_draft(self, draft_id: str) -> bool:
         """Move a draft to Trash (lifecycle endpoint for cancellation).

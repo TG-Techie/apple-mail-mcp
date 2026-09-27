@@ -4083,23 +4083,27 @@ class TestAppleMailConnector:
             '['
             '{"id":"100","rfc_message_id":"<anchor@x>","in_reply_to":"",'
             '"references_raw":"","subject":"Q3","sender":"a@x",'
+            '"to":[{"name":"","address":"b@x"}],"cc":[],"bcc":[],"warnings":[],'
             '"date_received":"Mon Jan 1 2024","read_status":true,"flagged":false},'
             '{"id":"101","rfc_message_id":"<r1@x>","in_reply_to":"<anchor@x>",'
             '"references_raw":"<anchor@x>","subject":"Re: Q3","sender":"b@x",'
+            '"to":[{"name":"","address":"a@x"}],"cc":[],"bcc":[],"warnings":[],'
             '"date_received":"Tue Jan 2 2024","read_status":true,"flagged":false},'
             '{"id":"102","rfc_message_id":"<r2@x>","in_reply_to":"<r1@x>",'
             '"references_raw":"<anchor@x> <r1@x>","subject":"Re: Q3","sender":"a@x",'
+            '"to":[{"name":"","address":"b@x"}],"cc":[],"bcc":[],"warnings":[],'
             '"date_received":"Wed Jan 3 2024","read_status":false,"flagged":false}'
             ']'
         ]
         result = connector._get_thread_applescript("100")
         assert len(result) == 3
         assert [m["id"] for m in result] == ["100", "101", "102"]
-        # Response rows match search_messages shape (7 fields including
-        # the dual-emit rfc_message_id from #148).
+        # Response rows match search_messages shape (the dual-emit
+        # rfc_message_id from #148, and the recipients).
         for m in result:
             assert set(m.keys()) == {
                 "id", "rfc_message_id", "subject", "sender",
+                "to", "cc", "bcc",
                 "date_received", "read_status", "flagged",
             }
 
@@ -4156,6 +4160,308 @@ class TestAppleMailConnector:
         # Base subject strips all Re: prefixes.
         assert 'subject contains "Q3 Report"' in candidate_script
         assert 'subject contains "Re:' not in candidate_script
+
+
+# What the recipient block emits for one message, as the JSON the
+# script returns: Mail's name is missing value for a recipient without
+# a display name, which the script turns into "".
+_RECIPIENT_RECORDS: dict[str, list[dict[str, str]]] = {
+    "to": [
+        {"name": "Jane Doe", "address": "jane@example.com"},
+        {"name": "", "address": "ops@example.org"},
+    ],
+    "cc": [{"name": "", "address": "cc@example.net"}],
+    "bcc": [],
+}
+_RECIPIENT_ROWS = {
+    "to": ["Jane Doe <jane@example.com>", "ops@example.org"],
+    "cc": ["cc@example.net"],
+    "bcc": [],
+}
+
+
+def _as_record(**fields: Any) -> dict[str, Any]:
+    """One message record as the AppleScript read paths emit it."""
+    return {
+        "id": "100", "rfc_message_id": "m-100@example.com",
+        "subject": "Q3", "sender": "a@example.com",
+        "date_received": "Mon", "read_status": False, "flagged": False,
+        **_RECIPIENT_RECORDS, **fields,
+    }
+
+
+class TestRecipientFields:
+    """Every AppleScript message row carries ``to``, ``cc`` and ``bcc``:
+    search, get_message, the thread candidates, and the selection. The
+    script reads each kind's recipients in one ``properties of`` event,
+    under its own guard, and emits ``{name, address}`` records; Python
+    renders them with the same ``format_address`` the IMAP rows use."""
+
+    @pytest.fixture
+    def connector(self) -> AppleMailConnector:
+        return AppleMailConnector(timeout=30)
+
+    def _assert_reads_recipients(self, script: str, message_var: str) -> None:
+        for kind, var in (("to", "toList"), ("cc", "ccList"), ("bcc", "bccList")):
+            # One event per kind, into a local list the loop walks.
+            assert (
+                f"set rcpts to properties of {kind} recipients of {message_var}"
+                in script
+            )
+            # Record keys quoted; the list lands in the record.
+            assert f"|{kind}|:{var}" in script
+            # A failure is a warning naming the kind, never a silent [].
+            assert f'"{kind} recipients unreadable for message "' in script
+        assert "|name|:rcptName, |address|:rcptAddress" in script
+        # missing value cannot be serialised to JSON.
+        assert 'if rcptName is missing value then set rcptName to ""' in script
+        assert (
+            'if rcptAddress is missing value then set rcptAddress to ""' in script
+        )
+
+    def _assert_each_kind_guarded(self, script: str) -> None:
+        """Each kind's read sits under its own try, so one unreadable
+        list does not take the other two with it."""
+        blocks = script.split("set rcpts to properties of ")[1:]
+        assert len(blocks) == 3
+        for block in blocks:
+            guarded, _, _rest = block.partition("end try")
+            assert "on error errMsg number errNum" in guarded
+
+    # ---- search ----
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_search_script_reads_recipients(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        mock_run.return_value = '{"messages":[],"warnings":[]}'
+        connector._search_messages_applescript("Gmail", "INBOX")
+        script = mock_run.call_args[0][0]
+        self._assert_reads_recipients(script, "msg")
+        self._assert_each_kind_guarded(script)
+        # Failures go to the search's own warning list.
+        assert "set end of warnList to" in script.split(
+            "set rcpts to properties of to recipients"
+        )[1]
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_search_rows_render_recipients(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        mock_run.return_value = json.dumps(
+            {"messages": [_as_record()], "warnings": []}
+        )
+        [row] = connector._search_messages_applescript("Gmail", "INBOX")
+        assert {k: row[k] for k in ("to", "cc", "bcc")} == _RECIPIENT_ROWS
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_search_with_attachments_still_reads_recipients(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        mock_run.return_value = '{"messages":[],"warnings":[]}'
+        connector._search_messages_applescript(
+            "Gmail", "INBOX", include_attachments=True
+        )
+        script = mock_run.call_args[0][0]
+        self._assert_reads_recipients(script, "msg")
+        assert "|bcc|:bccList, |attachments|:attList" in script
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_search_passes_a_recipient_warning_on(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        warning = "cc recipients unreadable for message 100: x (error -10000)"
+        mock_run.return_value = json.dumps(
+            {"messages": [_as_record(cc=[])], "warnings": [warning]}
+        )
+        seen: list[str] = []
+        [row] = connector._search_messages_applescript(
+            "Gmail", "INBOX", on_warning=seen.append
+        )
+        assert seen == [warning]
+        assert row["cc"] == []
+
+    # ---- get_message ----
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_get_message_script_reads_recipients(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        mock_run.return_value = json.dumps(_as_record(content="", warnings=[]))
+        connector._get_message_applescript("100", include_content=False)
+        script = mock_run.call_args[0][0]
+        self._assert_reads_recipients(script, "msg")
+        self._assert_each_kind_guarded(script)
+        assert "|warnings|:recipWarnings" in script
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_get_message_row_renders_recipients_and_no_empty_warnings(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        mock_run.return_value = json.dumps(_as_record(content="", warnings=[]))
+        row = connector._get_message_applescript("100", include_content=False)
+        assert {k: row[k] for k in ("to", "cc", "bcc")} == _RECIPIENT_ROWS
+        # The row's shape is unchanged when nothing went wrong.
+        assert "warnings" not in row
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_get_message_keeps_a_recipient_warning_on_the_row(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        """get_messages lifts a row's warnings to the response."""
+        warning = "to recipients unreadable for message 100: x (error -1728)"
+        mock_run.return_value = json.dumps(
+            _as_record(content="", to=[], warnings=[warning])
+        )
+        row = connector._get_message_applescript("100", include_content=False)
+        assert row["to"] == []
+        assert row["warnings"] == [warning]
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_get_message_merges_recipient_and_attachment_warnings(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        recipient_warning = "bcc recipients unreadable for message 100: x"
+        attachment_warning = "attachment enumeration failed for message 100: y"
+        mock_run.side_effect = [
+            json.dumps(_as_record(content="", warnings=[recipient_warning])),
+            json.dumps({"attachments": [], "warnings": [attachment_warning]}),
+        ]
+        row = connector._get_message_applescript(
+            "100", include_content=False, include_attachments=True
+        )
+        assert row["warnings"] == [recipient_warning, attachment_warning]
+
+    # ---- get_thread ----
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_thread_candidate_script_reads_recipients(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        mock_run.side_effect = [
+            '{"account":"Gmail","rfc_message_id":"a@x","subject":"Q3",'
+            '"in_reply_to":"","references_raw":""}',
+            "[]",
+        ]
+        connector._get_thread_applescript("100")
+        script = mock_run.call_args_list[1][0][0]
+        self._assert_reads_recipients(script, "m")
+        self._assert_each_kind_guarded(script)
+        assert "|warnings|:recipWarnings" in script
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_thread_rows_render_recipients_and_report_member_warnings(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        """A warning about a thread member reaches the caller and leaves
+        the row; one about a candidate that is not in the thread is not
+        about anything returned, and goes with it."""
+        member_warning = "cc recipients unreadable for message 100: x"
+        stranger_warning = "to recipients unreadable for message 999: y"
+        member = _as_record(
+            rfc_message_id="a@x", in_reply_to="", references_raw="",
+            warnings=[member_warning],
+        )
+        stranger = _as_record(
+            id="999", rfc_message_id="elsewhere@x", in_reply_to="",
+            references_raw="", warnings=[stranger_warning],
+        )
+        mock_run.side_effect = [
+            '{"account":"Gmail","rfc_message_id":"a@x","subject":"Q3",'
+            '"in_reply_to":"","references_raw":""}',
+            json.dumps([member, stranger]),
+        ]
+        seen: list[str] = []
+        [row] = connector._get_thread_applescript("100", on_warning=seen.append)
+        assert {k: row[k] for k in ("to", "cc", "bcc")} == _RECIPIENT_ROWS
+        assert "warnings" not in row
+        assert seen == [member_warning]
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_thread_anchor_missing_from_candidates_still_has_the_fields(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        mock_run.side_effect = [
+            '{"account":"Gmail","rfc_message_id":"a@x","subject":"Q3",'
+            '"in_reply_to":"","references_raw":""}',
+            "[]",
+        ]
+        [row] = connector._get_thread_applescript("100")
+        assert (row["to"], row["cc"], row["bcc"]) == ([], [], [])
+
+    # ---- selection ----
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_selection_script_reads_recipients(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        mock_run.return_value = "[]"
+        connector.get_selected_messages(include_content=False)
+        script = mock_run.call_args[0][0]
+        self._assert_reads_recipients(script, "msg")
+        self._assert_each_kind_guarded(script)
+        assert "|warnings|:recipWarnings" in script
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_selection_rows_render_recipients_and_merge_warnings(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        recipient_warning = "to recipients unreadable for message 100: x"
+        mock_run.side_effect = [
+            json.dumps([_as_record(content="", warnings=[recipient_warning])]),
+            json.dumps({"attachments": [], "warnings": []}),
+        ]
+        [row] = connector.get_selected_messages(
+            include_content=False, include_attachments=True
+        )
+        assert {k: row[k] for k in ("to", "cc", "bcc")} == _RECIPIENT_ROWS
+        assert row["warnings"] == [recipient_warning]
+
+    # ---- the two paths agree ----
+
+    @patch("apple_mail_mcp.imap_connector.IMAPClient")
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_the_applescript_row_and_the_imap_row_agree(
+        self,
+        mock_run: MagicMock,
+        mock_imap_cls: MagicMock,
+        connector: AppleMailConnector,
+    ) -> None:
+        """One message, as Mail's recipient properties report it and as
+        the IMAP ENVELOPE carries it, renders the same lists."""
+        from datetime import datetime
+
+        from imapclient.response_types import Address, Envelope
+
+        from apple_mail_mcp.imap_connector import ImapConnector
+
+        mock_run.return_value = json.dumps(
+            {"messages": [_as_record()], "warnings": []}
+        )
+        [applescript_row] = connector._search_messages_applescript(
+            "Gmail", "INBOX"
+        )
+
+        client = MagicMock()
+        mock_imap_cls.return_value = client
+        client.search.return_value = [1]
+        client.fetch.return_value = {1: {b"FLAGS": (), b"ENVELOPE": Envelope(
+            date=datetime(2026, 1, 1), subject=b"Q3",
+            from_=(Address(None, None, b"a", b"example.com"),),
+            sender=None, reply_to=None,
+            to=(
+                Address(b"Jane Doe", None, b"jane", b"example.com"),
+                Address(None, None, b"ops", b"example.org"),
+            ),
+            cc=(Address(None, None, b"cc", b"example.net"),),
+            bcc=None,
+            in_reply_to=None, message_id=b"<m-100@example.com>",
+        )}}
+        [imap_row] = ImapConnector("h", 993, "u@e.com", "pw").search_messages()
+
+        for key in ("to", "cc", "bcc"):
+            assert applescript_row[key] == imap_row[key], key
+        assert applescript_row["to"] == _RECIPIENT_ROWS["to"]
 
 
 class TestDualEmitRfcMessageId:
