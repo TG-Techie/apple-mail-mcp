@@ -150,7 +150,15 @@ class TestVerifiedHtmlReplyAndForwardWithAFile:
     Sent copy holds is printed before it is asserted on, so a miss still
     reports all of it.
 
-    NOT YET RUN."""
+    Run 2026-09-27, one send each at most, spaced by the INBOX's
+    delivery report. The forward ran once at 08:06 EDT and passed: its
+    Sent copy had the note above "Begin forwarded message", the seed's
+    marker inside it, the seed's two files and the caller's, and the
+    seed's Message-ID in References. No delivery report about it reached
+    the test account's INBOX by 08:13, where example.com's nullMX report
+    had come back 7 s after each of two of the suite's sends at
+    04:31-04:32; the INBOX had received nothing at all since then. So
+    the reply was not run, and has never been."""
 
     @pytest.fixture
     def seed(self, connector: AppleMailConnector, test_account: str) -> Seed:
