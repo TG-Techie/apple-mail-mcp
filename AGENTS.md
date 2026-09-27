@@ -92,7 +92,7 @@ quoted original and a forward's own attachments.
 
 ## AppleScript Gotchas
 
-**JSON output from AppleScript:** Scripts emit JSON via ASObjC + `NSJSONSerialization` (wrap with `_wrap_as_json_script`, parse with `parse_applescript_json`). Always quote the `name` record key as `|name|:` — the bare form is silently dropped during NSDictionary conversion. Coerce `missing value` to safe defaults (`{}` / `0`) before serializing. See applescript-mail skill for details.
+**JSON output from AppleScript:** Scripts emit JSON via ASObjC + `NSJSONSerialization` (wrap with `_wrap_as_json_script`, parse with `parse_applescript_json`). Always quote the `name` record key as `|name|:` — the bare form is silently dropped during NSDictionary conversion. Coerce `missing value` to safe defaults (`{}` / `0`) before serializing. See applescript-mail skill for details. Observed 2026-09-27: a `resultData` holding `|mv_in_record|:missing value` and `|mv_in_list|:{1, missing value, "x"}`, run through `_wrap_as_json_script`, came back as `"mv_in_list":[1,null,"x"],"mv_in_record":null`; when the rejection happens is not established, so coercing stays the safe practice.
 
 **Gmail mode:** Gmail's label-based system doesn't support standard IMAP move. The `update_message` tool has a `gmail_mode` parameter that uses copy+delete instead of move.
 
@@ -150,7 +150,7 @@ Load these skills when working in their domains:
 - **applescript-mail** — Apple Mail AppleScript patterns, quirks, workarounds, JSON emission via ASObjC
 - **api-design** — Tool design philosophy, decision tree for new tools
 - **integration-testing** — Real Mail.app testing, why mocks miss AppleScript bugs
-- **performance-patterns** — Operation timings, `whose` clause optimization, batch patterns, Gmail notes
+- **performance-patterns** — Operation timings, the cost of an Apple event, bulk property reads, batch patterns, Gmail notes
 
 ## Key Files
 

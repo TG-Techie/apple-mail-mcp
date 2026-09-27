@@ -19,6 +19,8 @@ set accEmails to email addresses of acc
 if accEmails is missing value then set accEmails to {}
 ```
 
+Observed 2026-09-27, against that rule: a record `{|mv_in_record|:missing value, |mv_in_list|:{1, missing value, "x"}}` returned through `_wrap_as_json_script` inside a Mail tell block came back as `"mv_in_list":[1,null,"x"],"mv_in_record":null`, not an error. When the rejection does happen is not established, so keep coercing; that is the safe practice until someone finds the case.
+
 **Error propagation:** Do NOT wrap the tell-body in `try / on error` when you want typed exceptions (`MailAccountNotFoundError`, `MailMessageNotFoundError`, etc.). Let AppleScript errors bubble via stderr — `_run_applescript` maps them to the right exception type.
 
 ## Gmail Label-Based System
