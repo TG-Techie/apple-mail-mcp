@@ -45,6 +45,7 @@ from .exceptions import (
     MailComposeWindowError,
     MailDraftNotFoundError,
     MailDraftNotSettledError,
+    MailError,
     MailImapMoveUnsupportedError,
     MailImapRequiredError,
     MailImapTrashNotFoundError,
@@ -218,6 +219,64 @@ def _compose_window_from_report(report: dict[str, Any]) -> _ComposeWindow:
         window_id=int(report.get("window_id") or 0) or None,
         mail_pid=int(report.get("mail_pid") or 0) or None,
     )
+
+
+# What a send that went out finds of the copy it filed in Sent. Exactly
+# one of the two: the copy, found by identity, or why none was. With the
+# files pasted, that makes three endings and no others (``_sent_ending``):
+# the copy carries every file, and the send returns its ids; it lacks
+# one, and the send raises that the message WAS sent; it was not
+# identified, and the send returns no id and a warning. A copy not found
+# has no files to be missing, and an id is never returned unverified.
+
+
+@dataclass(frozen=True)
+class _SentCopy:
+    """The copy a send filed in Sent: the one message in Sent with the
+    window's subject whose id was not there before the window opened.
+    ``rfc_message_id`` is bare, as the read tools emit it."""
+
+    mail_id: str
+    rfc_message_id: str
+    attachment_names: tuple[str, ...]
+
+    def result(self) -> dict[str, Any]:
+        """The send's result: the copy's Mail id, which ``get_messages``
+        takes, and its RFC Message-ID."""
+        return {
+            "draft_id": "",
+            "sent_message_id": self.mail_id,
+            "sent_rfc_message_id": self.rfc_message_id,
+        }
+
+
+@dataclass(frozen=True)
+class _SentCopyUnidentified:
+    """A send whose copy in Sent could not be told: none appeared in time,
+    more than one did, or looking failed; ``why`` says which. The message
+    went out either way: the verified send saw it go."""
+
+    why: str
+
+    def result(self, *, files_pasted: bool) -> dict[str, Any]:
+        """The send's result: success with no id, and one warning saying
+        why, and that the files, when there were any, are unverified
+        rather than missing."""
+        unverified = (
+            ", and the files it was sent with are unverified"
+            if files_pasted
+            else ""
+        )
+        return {
+            "draft_id": "",
+            "sent_message_id": "",
+            "sent_rfc_message_id": "",
+            "warnings": [
+                f"The message was sent, but its copy in Sent could not be "
+                f"identified: {self.why}. No id is returned{unverified}; "
+                "look in Sent before sending it again."
+            ],
+        }
 
 
 def _closing_of(raw: str, *, by: Closer, at: float) -> Closed | None:
@@ -733,6 +792,22 @@ class AppleMailConnector:
     # take, at 1 s and 3 s it did; nothing readable on the draft marks
     # the difference, so this is a measured bound, not a signal.
     _DRAFT_SETTLE_S = 1.0
+    # How long a send looks for the copy it filed in Sent once the
+    # verified send has seen its window go: one look at once, then 30
+    # more 1 s apart. For a subject Sent did not hold, the verified send
+    # has already seen a copy with it, so the first look finds it; for
+    # one it held, that older copy satisfied the verified send and the
+    # new one may still be coming. 30 s is what the integration suite
+    # allows a Sent copy after a send returns (SENT_COPY_TIMEOUT_S,
+    # tests/integration/mail_readback.py), and every copy it has read
+    # arrived within it, a forward with three files among them; the
+    # send's grounding saw copies appear "within seconds"
+    # (docs/reference/UI_GROUNDING_MAIL_SEND.md). How long the copy of a
+    # large attachment takes is unmeasured. The looks are separate
+    # scripts, so the Mail lock is free between them, and a copy not seen
+    # in time is a warning, never an error: the message went out.
+    _SENT_APPEAR_POLLS = 30
+    _SENT_APPEAR_INTERVAL_S = 1.0
 
     _IMAP_BREAKER_TTL_S: float = 30.0
     """How long to skip IMAP for an account after a fallback-triggering
@@ -5285,7 +5360,7 @@ end tell
             window.to or None, window.cc or None, window.bcc or None, seed="new"
         )
 
-    def _send_compose_window(self, window_name: str, sent_subject: str) -> dict[str, str]:
+    def _send_compose_window(self, window_name: str, sent_subject: str) -> None:
         """Run the verified send on the named compose window; on any
         outcome but SENT the window is salvaged to Drafts and the outcome
         raised."""
@@ -5299,7 +5374,7 @@ end tell
         )
         result = self._run_applescript(send_script).strip()
         if result == "SENT":
-            return {"draft_id": "", "sent_message_id": ""}
+            return
         salvage = self._salvage_compose_to_draft(window_name)
         raise MailComposeWindowError(
             f"verified send: {result!r} (compose window: {salvage})",
@@ -5318,7 +5393,7 @@ end tell
         attachment_paths: list[Path] | None = None,
         reply_to: str | None = None,
         forward_of: str | None = None,
-    ) -> dict[str, str]:
+    ) -> dict[str, Any]:
         """Send an HTML email at once; no draft is saved first. A fresh
         message, a reply (``reply_to``) or a forward (``forward_of``),
         each through the one composition (``_compose``), the HTML pasted
@@ -5349,7 +5424,11 @@ end tell
                 At most one of ``reply_to`` and ``forward_of``.
 
         Returns:
-            ``{"draft_id": "", "sent_message_id": ""}`` on success.
+            What a send returns (``_sent_ending``): ``{"draft_id": "",
+            "sent_message_id": <Mail id>, "sent_rfc_message_id":
+            <Message-ID>}`` for the copy it filed in Sent, or, when that
+            copy could not be identified, both ids ``""`` and a
+            ``warnings`` list saying why. Either way the message was sent.
 
         Raises:
             ValueError: both ``reply_to`` and ``forward_of``; a fresh
@@ -5389,29 +5468,100 @@ end tell
             send_now=True,
         )
 
-    def _check_sent_attachments(self, subject: str, names: list[str]) -> None:
-        """After a send: the Sent copy of ``subject`` must carry every
-        file the composition pasted, by name. It may carry more: a
-        forward's has the original's files as well. A file missing
-        raises, saying the message WAS sent, so the caller inspects it
-        before sending again."""
-        subject_safe = escape_applescript_string(subject)
-        raw = self._run_applescript(_wrap_as_json_script(f"""
-tell application "Mail"
-    set attNames to name of every mail attachment of (first message of sent mailbox whose subject is "{subject_safe}")
-    if attNames is missing value then set attNames to {{}}
-    set resultData to attNames
-end tell
-""", timeout=self.timeout))
-        carried = [str(n) for n in cast(list[Any], parse_applescript_json(raw))]
+    def _sent_ending(
+        self, window: _ComposeWindow, files: list[Path]
+    ) -> dict[str, Any]:
+        """What a send that went out returns, by the copy it filed in
+        Sent (``_find_sent_copy``): found, it must carry every file the
+        composition pasted, by name, and its ids are returned; not
+        identified, no id is returned, with a warning saying why."""
+        copy = self._find_sent_copy(window.subject, window.before_ids)
+        if isinstance(copy, _SentCopyUnidentified):
+            logger.warning("a send's copy in Sent was not identified: %s", copy.why)
+            return copy.result(files_pasted=bool(files))
+        self._check_sent_attachments(copy, [f.name for f in files])
+        return copy.result()
+
+    @staticmethod
+    def _check_sent_attachments(copy: _SentCopy, names: list[str]) -> None:
+        """The copy a send filed must carry every file the composition
+        pasted, by name. It may carry more: a forward's has the
+        original's files as well. A file missing raises, saying the
+        message WAS sent, so the caller inspects that copy before sending
+        again."""
+        carried = list(copy.attachment_names)
         missing = list((Counter(names) - Counter(carried)).elements())
         if missing:
             raise MailAppleScriptError(
                 f"send with attachments: message WAS sent, but the sent "
                 f"copy lacks {missing} of the files attached (it carries "
-                f"{carried}) — inspect the Sent mailbox copy (subject "
-                f"{subject!r}) before resending."
+                f"{carried}) — inspect that copy in Sent (id "
+                f"{copy.mail_id}) before resending."
             )
+
+    def _find_sent_copy(
+        self, subject: str, before_ids: list[int]
+    ) -> _SentCopy | _SentCopyUnidentified:
+        """The copy a send filed in Sent: the one message in Sent with
+        ``subject`` whose id is not among ``before_ids``, taken before its
+        window opened. Looked for at once, then every
+        ``_SENT_APPEAR_INTERVAL_S`` for ``_SENT_APPEAR_POLLS`` more looks,
+        each its own script. More than one new message with the subject
+        (another send of it since the window opened) is not guessed
+        between. Never raises: the message went out, and what fails here
+        is only knowing which copy is its."""
+        before = set(before_ids)
+        try:
+            for look in range(self._SENT_APPEAR_POLLS + 1):
+                if look:
+                    time.sleep(self._SENT_APPEAR_INTERVAL_S)
+                new = [i for i in self._sent_ids_with_subject(subject) if i not in before]
+                if len(new) == 1:
+                    return self._read_sent_copy(new[0])
+                if new:
+                    return _SentCopyUnidentified(
+                        f"{len(new)} messages with its subject reached Sent "
+                        "while it was composed and sent, and which is its "
+                        "copy cannot be told"
+                    )
+        except (MailError, ValueError) as exc:
+            return _SentCopyUnidentified(f"looking for it in Sent failed: {exc}")
+        waited = self._SENT_APPEAR_POLLS * self._SENT_APPEAR_INTERVAL_S
+        return _SentCopyUnidentified(
+            f"no new message with its subject appeared in Sent within {waited:g}s"
+        )
+
+    def _sent_ids_with_subject(self, subject: str) -> list[int]:
+        """Mail's ids for every message in Sent (every account's) whose
+        subject is ``subject``: ids only, so a look stays cheap however
+        often the subject was used before."""
+        subject_safe = escape_applescript_string(subject)
+        raw = self._run_applescript(_wrap_as_json_script(f"""
+tell application "Mail"
+    set resultData to (id of every message of sent mailbox whose subject is "{subject_safe}")
+end tell
+""", timeout=self.timeout))
+        return [int(i) for i in cast(list[Any], parse_applescript_json(raw))]
+
+    def _read_sent_copy(self, mail_id: int) -> _SentCopy:
+        """The message in Sent with Mail's id ``mail_id``: its RFC
+        Message-ID (bare) and the names of its files."""
+        raw = self._run_applescript(_wrap_as_json_script(f"""
+tell application "Mail"
+    set m to first message of sent mailbox whose id is "{mail_id}"
+    set rfcId to message id of m
+    if rfcId is missing value then set rfcId to ""
+    set attNames to name of every mail attachment of m
+    if attNames is missing value then set attNames to {{}}
+    set resultData to {{|id|:(id of m as text), |message_id|:rfcId, |attachment_names|:attNames}}
+end tell
+""", timeout=self.timeout))
+        record = cast(dict[str, Any], parse_applescript_json(raw))
+        return _SentCopy(
+            mail_id=str(record["id"]),
+            rfc_message_id=str(record["message_id"]).strip().strip("<>"),
+            attachment_names=tuple(str(n) for n in record["attachment_names"]),
+        )
 
     @staticmethod
     def _build_attachment_ax_verify_script(
@@ -5515,7 +5665,7 @@ end if
         reply_all: bool = False,
         from_account: str | None = None,
         send_now: bool = False,
-    ) -> dict[str, str]:
+    ) -> dict[str, Any]:
         """Create a draft (fresh, reply, or forward). Optionally send.
 
         Every seed, saved or sent, is composed the one way
@@ -5548,14 +5698,14 @@ end if
             reply_all: For ``seed="reply"`` only — use ``reply to all``.
             from_account: Mail.app account name or UUID; ``None`` uses
                 Mail's default sender for the seed message.
-            send_now: ``False`` saves as draft and returns
-                ``{"draft_id": ...}``. ``True`` sends and returns
-                ``{"draft_id": "", "sent_message_id": ""}`` (sent_message_id
-                is empty on this version — recovering the just-sent message
-                across IMAP sync is unreliable).
+            send_now: ``False`` saves as draft. ``True`` sends, and no
+                draft is kept.
 
         Returns:
-            ``{"draft_id": <persisted-id>, "sent_message_id": <id-or-empty>}``.
+            A save: ``{"draft_id": <the draft's id>, "sent_message_id":
+            ""}``. A send: what ``_sent_ending`` returns, the ids of the
+            copy it filed in Sent, or ``""`` for both and a ``warnings``
+            list when that copy could not be identified.
 
         Raises:
             ValueError: invalid seed, missing required fields, or a body
@@ -5568,7 +5718,9 @@ end if
             MailDraftNotSettledError: the saved draft did not appear in
                 Drafts, so there is no id to return.
             MailAppleScriptError: AppleScript failure, or a mechanical
-                read-back of the compose window failed.
+                read-back of the compose window failed; on a send, the
+                message WAS sent when the error says so (its Sent copy
+                lacks a file it was sent with).
         """
         self._validate_compose_args(seed, seed_id, to, subject)
         _refuse_overlong_body(body)
@@ -5620,7 +5772,7 @@ end if
         attachment_paths: list[Path] | None,
         from_account: str | None,
         send_now: bool,
-    ) -> dict[str, str]:
+    ) -> dict[str, Any]:
         """The one composition behind every draft the connector saves
         and every message it sends: ``create_draft`` for every seed and
         both outcomes (``plain``), and ``_send_html_email`` for every
@@ -5639,9 +5791,12 @@ end if
              that can see.
           3. Paste the body and read it back (``_fill_compose``), then the
              files, each seen in the window's AX tree.
-          4. Send: the verified send, then the Sent copy must carry every
-             file by name. Or save: close the window with Save and find
-             the draft it became.
+          4. Send: the verified send, then find the copy it filed in Sent
+             by identity, which must carry every file by name, and return
+             its ids (``_sent_ending``). Or save: close the window with
+             Save and find the draft it became. Either ending is the entry
+             with the window's subject whose id the opening script did
+             not see (``_ENDING_MAILBOX``).
 
         Why every message goes this way, all measured on 2026-09-26 and
         -27. Opened without a window, Mail's reply or forward exposes no
@@ -5711,13 +5866,9 @@ end if
                 window.name, seed=seed, body=body, plain=plain, files=files
             )
             if send_now:
-                result = self._send_compose_window(window.name, window.subject)
+                self._send_compose_window(window.name, window.subject)
                 end_window(Closed(how="sent", by="composition", at=time.time()))
-                if files:
-                    self._check_sent_attachments(
-                        window.subject, [f.name for f in files]
-                    )
-                return result
+                return self._sent_ending(window, files)
             try:
                 draft_id = self._save_compose_window_as_draft(
                     window.name, window.subject, window.before_ids

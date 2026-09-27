@@ -24,6 +24,7 @@ from .mail_readback import (
     MailTrash,
     Seed,
     assert_html_rendered,
+    assert_sent,
     bare_message_id,
     compose_window_count,
     earlier_seed,
@@ -39,8 +40,6 @@ pytestmark = pytest.mark.skipif(
     "not config.getoption('--run-integration')",
     reason="Integration tests disabled by default. Use --run-integration to run."
 )
-
-SENT = {"draft_id": "", "sent_message_id": ""}
 
 
 @pytest.fixture
@@ -63,7 +62,7 @@ class TestVerifiedFreshSend:
             body="phase-0 integration probe",
             send_now=True,
         )
-        assert result == {"draft_id": "", "sent_message_id": ""}
+        assert_sent(result)
         # The verified-send block already polled for the Sent copy before
         # returning SENT; re-read it here independently.
         assert sent_count_for_subject(connector, subject) >= 1
@@ -86,7 +85,7 @@ class TestVerifiedHtmlSend:
             body="<p><b>phase-0</b> html integration probe</p>",
             from_account=None,
         )
-        assert result == {"draft_id": "", "sent_message_id": ""}
+        assert_sent(result)
         assert sent_count_for_subject(connector, subject) >= 1
         assert_html_rendered(
             sent_source_for_subject(connector, subject), "<b>phase-0</b>"
@@ -123,7 +122,7 @@ class TestVerifiedHtmlReply:
             from_account=None,
             reply_to=target,
         )
-        assert result == {"draft_id": "", "sent_message_id": ""}
+        assert_sent(result)
         assert sent_count_for_subject(connector, f"Re: {orig_subject}") >= 1
         # The whole point of reply mode: threading headers on the wire.
         headers = connector._run_applescript(
@@ -184,7 +183,7 @@ class TestVerifiedHtmlReplyAndForwardWithAFile:
                 attachment_paths=[caller],
             )
             print(f"sent {subject!r} at {time.strftime('%H:%M:%S')}: {result}")
-            assert result == SENT
+            assert_sent(result)
             assert compose_window_count(connector, subject) == 0
             forward = sent_copy(connector, subject)
             html = html_part(forward.source)
@@ -225,7 +224,7 @@ class TestVerifiedHtmlReplyAndForwardWithAFile:
                 attachment_paths=[caller],
             )
             print(f"sent {subject!r} at {time.strftime('%H:%M:%S')}: {result}")
-            assert result == SENT
+            assert_sent(result)
             assert compose_window_count(connector, subject) == 0
             reply = sent_copy(connector, subject)
             html = html_part(reply.source)
@@ -334,7 +333,7 @@ class TestHtmlSendWithAttachments:
                 from_account=None,
                 attachment_paths=[f1, f2],
             )
-            assert result == {"draft_id": "", "sent_message_id": ""}
+            assert_sent(result)
             assert sent_count_for_subject(connector, subject) == 1
             src = sent_source_for_subject(connector, subject)
             assert "first.txt" in src

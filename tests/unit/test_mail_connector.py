@@ -5,6 +5,7 @@ import logging
 import tempfile
 import time
 import warnings
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -6119,7 +6120,7 @@ class TestCreateDraft:
         scripts, _ = self._save(connector)
         assert all("click sendBtn" not in s for s in scripts)
 
-    def test_new_send_returns_empty_ids(
+    def test_new_send_returns_its_sent_copys_ids(
         self, connector: AppleMailConnector
     ) -> None:
         _scripted(connector, _compose_outcomes("hello", window="hi", plain=True))
@@ -6130,7 +6131,7 @@ class TestCreateDraft:
             body="hello",
             send_now=True,
         )
-        assert result == {"draft_id": "", "sent_message_id": ""}
+        assert result == _SENT
 
     def test_new_send_composes_a_window_and_pastes_the_body_as_plain_text(
         self, connector: AppleMailConnector
@@ -6151,8 +6152,8 @@ class TestCreateDraft:
             body="line1\nline2",
             send_now=True,
         )
-        assert len(captured) == 4
-        compose_s, paste_s, readback_s, send_s = captured
+        assert len(captured) == 6
+        compose_s, paste_s, readback_s, send_s, _, _ = captured
         assert "make new outgoing message" in compose_s
         assert all("open location" not in s for s in captured)
         assert all("mailto:" not in s for s in captured)
@@ -6167,8 +6168,8 @@ class TestCreateDraft:
         self, connector: AppleMailConnector
     ) -> None:
         """Every later step addresses the window the compose script
-        reported, not a name guessed from the subject, and the send looks
-        for the subject Mail holds."""
+        reported, not a name guessed from the subject, and the send and
+        the look for its Sent copy go by the subject Mail holds."""
         outcomes = _compose_outcomes("x", window="the new one", plain=True)
         outcomes[0] = _compose_meta("the new one", subject="hi")
         captured = _scripted(connector, outcomes)
@@ -6176,11 +6177,12 @@ class TestCreateDraft:
             seed="new", to=["a@example.com"], subject="hi", body="x",
             send_now=True,
         )
-        for script in captured[1:]:
+        for script in captured[1:4]:
             assert 'set composeName to "the new one"' in script or (
                 'window "the new one"' in script
             )
         assert 'set composeSubject to "hi"' in captured[3]
+        assert 'sent mailbox whose subject is "hi"' in captured[4]
 
     def test_new_send_no_compose_window_raises(
         self, connector: AppleMailConnector
@@ -6252,8 +6254,9 @@ class TestCreateDraft:
         self, connector: AppleMailConnector, tmp_path: Path
     ) -> None:
         """Attachments on a fresh send are pasted after the body, seen in
-        the compose window before Send, and counted on the Sent copy.
-        Before this the mailto: path could not carry them and refused."""
+        the compose window before Send, and read on the Sent copy the
+        send filed. Before this the mailto: path could not carry them and
+        refused."""
         f1 = tmp_path / "report.pdf"
         f1.write_bytes(b"%PDF-fake")
         f2 = tmp_path / "data.csv"
@@ -6272,16 +6275,17 @@ class TestCreateDraft:
             attachment_paths=[f1, f2],
             send_now=True,
         )
-        assert result == {"draft_id": "", "sent_message_id": ""}
-        assert len(captured) == 7
-        compose_s, paste_s, readback_s, files_s, verify_s, send_s, count_s = captured
+        assert result == _SENT
+        assert len(captured) == 8
+        (compose_s, paste_s, readback_s, files_s, verify_s, send_s,
+         _, copy_s) = captured
         assert "make new attachment" not in compose_s
         assert "writeObjects:fileURLs" in files_s
         assert str(f1.resolve()) in files_s
         assert str(f2.resolve()) in files_s
         assert f1.name in verify_s and f2.name in verify_s
         assert "click sendBtn" in send_s
-        assert "name of every mail attachment" in count_s
+        assert "name of every mail attachment of m" in copy_s
 
     def test_new_send_missing_attachment_composes_nothing(
         self, connector: AppleMailConnector, tmp_path: Path
@@ -6467,8 +6471,8 @@ class TestCreateDraft:
             seed=seed, seed_id="160989", to=["a@example.com"], body="",
             send_now=True,
         )
-        assert result == {"draft_id": "", "sent_message_id": ""}
-        assert len(captured) == 2
+        assert result == _SENT
+        assert len(captured) == 4  # open, verified send, the Sent look
         assert "click sendBtn" in captured[1]
         assert all("tell theMessage to send" not in s for s in captured)
 
@@ -6492,9 +6496,9 @@ class TestCreateDraft:
         **kwargs: Any,
     ) -> tuple[list[str], dict[str, str]]:
         """Run create_draft with a note, answering each script in turn:
-        open the window, paste, read back, then send, or close-and-save
-        and find the saved draft's id."""
-        tail = ["SENT"] if send_now else ["SALVAGED", "7"]
+        open the window, paste, read back, then send and look for its
+        Sent copy, or close-and-save and find the saved draft's id."""
+        tail = ["SENT", *_sent_copy_outcomes()] if send_now else ["SALVAGED", "7"]
         answers = outcomes or [self._SEEDED_META, "PASTED_UNVERIFIED", self._NOTE, *tail]
         scripts: list[str] = []
 
@@ -6519,9 +6523,10 @@ class TestCreateDraft:
         scripts, result = self._run_seeded(
             connector, seed="forward", send_now=True, to=["a@example.com"],
         )
-        assert result == {"draft_id": "", "sent_message_id": ""}
-        assert len(scripts) == 4  # open, paste, read-back, verified send
-        open_s, paste_s, _, send_s = scripts
+        assert result == _SENT
+        # open, paste, read-back, verified send, the Sent look (two)
+        assert len(scripts) == 6
+        open_s, paste_s, _, send_s, _, _ = scripts
         assert 'whose id is "160989"' in open_s
         assert "forward origMsg opening window true" in open_s
         assert "beforeNames" in open_s
@@ -6590,7 +6595,7 @@ class TestCreateDraft:
         )
         if send_now:
             # The forward's Sent copy carries the original's files too.
-            outcomes[-1] = json.dumps(["theirs.pdf", "caller.txt"])
+            outcomes[-1] = _sent_copy_outcomes(["theirs.pdf", "caller.txt"])[1]
         captured = _scripted(connector, outcomes)
         result = connector.create_draft(
             seed="forward", seed_id="160989", to=["a@example.com"],
@@ -6604,8 +6609,9 @@ class TestCreateDraft:
         if body:
             assert "key code 126 using command down" in captured[1]
         if send_now:
+            assert result == _SENT
             assert "click sendBtn" in captured[files_at + 2]
-            assert "name of every mail attachment" in captured[-1]
+            assert "name of every mail attachment of m" in captured[-1]
         else:
             assert "AXCloseButton" in captured[files_at + 2]
 
@@ -7391,7 +7397,8 @@ def _compose_meta(
     before_ids: list[int] | None = None,
 ) -> str:
     """What the composition's first script reports: the window it opened,
-    the subject and recipients Mail holds, and the Drafts ids before."""
+    the subject and recipients Mail holds, and the ids of the mailbox its
+    ending is looked up in (Drafts for a save, Sent for a send) before."""
     return json.dumps({
         "window": window,
         "subject": window if subject is None else subject,
@@ -7400,6 +7407,32 @@ def _compose_meta(
         "bcc": [],
         "before_ids": [5, 6] if before_ids is None else before_ids,
     })
+
+
+# What a send returns when it finds its Sent copy: Mail's id for the copy
+# a well-behaved Mail files beside the two _compose_meta saw, and its
+# RFC Message-ID, bare.
+_SENT = {
+    "draft_id": "",
+    "sent_message_id": "9",
+    "sent_rfc_message_id": "copy-9@example.com",
+}
+
+
+def _sent_copy_outcomes(
+    file_names: list[str] | None = None, *, ids: list[int] | None = None
+) -> list[str]:
+    """What Mail answers to a send's look for its Sent copy: the ids of
+    the Sent messages with its subject (the two it had before and the new
+    one), then that one copy read: its id, Message-ID and files."""
+    return [
+        json.dumps([5, 6, 9] if ids is None else ids),
+        json.dumps({
+            "id": "9",
+            "message_id": "<copy-9@example.com>",
+            "attachment_names": file_names or [],
+        }),
+    ]
 
 
 def _compose_outcomes(
@@ -7415,9 +7448,9 @@ def _compose_outcomes(
     """What a well-behaved Mail answers to the composition, script by
     script: open the window; paste the body and read it back (always on a
     fresh message, on a reply or forward only when there is a body); with
-    files, the file paste and the AX verify; then the verified send and,
-    with files, the Sent copy's attachment names, or the close with Save
-    and the new draft's id."""
+    files, the file paste and the AX verify; then the verified send and
+    the look for its Sent copy, or the close with Save and the new draft's
+    id."""
     outcomes = [_compose_meta(window)]
     if seed == "new" or body:
         snippet, _ = AppleMailConnector._paste_probe_strings(body, plain=plain)
@@ -7425,9 +7458,7 @@ def _compose_outcomes(
     if file_names:
         outcomes += ["PASTED_UNVERIFIED", "ATTACHMENTS_VERIFIED"]
     if send:
-        outcomes.append("SENT")
-        if file_names:
-            outcomes.append(json.dumps(file_names))
+        outcomes += ["SENT", *_sent_copy_outcomes(file_names)]
     else:
         outcomes += ["SALVAGED", draft_id]
     return outcomes
@@ -7453,7 +7484,8 @@ def _run_html_flow(
     subject: str = "Hello",
 ) -> list[str]:
     """Drive the fresh HTML flow with a well-behaved mock and return the
-    captured scripts: [compose, paste, read-back, verified-send]."""
+    captured scripts: [compose, paste, read-back, verified-send, the Sent
+    ids with its subject, its Sent copy read]."""
     captured = _scripted(connector, _compose_outcomes(body, window=subject))
     result = connector._send_html_email(
         to=["test@example.com"],
@@ -7463,17 +7495,18 @@ def _run_html_flow(
         body=body,
         from_account=None,
     )
-    assert result == {"draft_id": "", "sent_message_id": ""}
+    assert result == _SENT
     return captured
 
 
 class TestSendHtmlEmail:
     """Tests for AppleMailConnector._send_html_email (fresh mode).
 
-    A fresh HTML send is the one composition (``_compose``): FOUR
+    A fresh HTML send is the one composition (``_compose``): SIX
     osascript invocations — compose a visible window → verified paste →
     read-back (fresh process — same-process AX reads are stale after a
-    WebKit re-render) → verified send.
+    WebKit re-render) → verified send → the Sent ids with its subject →
+    its Sent copy read.
     """
 
     @pytest.fixture
@@ -7484,8 +7517,8 @@ class TestSendHtmlEmail:
         self, connector: AppleMailConnector
     ) -> None:
         scripts = _run_html_flow(connector)
-        assert len(scripts) == 4
-        compose_s, paste_s, readback_s, send_s = scripts
+        assert len(scripts) == 6
+        compose_s, paste_s, readback_s, send_s, _, _ = scripts
         assert "make new outgoing message" in compose_s
         assert all("open location" not in s for s in scripts)
         # Clipboard-inject landmarks live in the paste script, which
@@ -7635,10 +7668,10 @@ class TestSendHtmlWithAttachments:
     dictionary after the paste, they brought Mail's cite blockquote
     back, measured 2026-09-27).
 
-    Flow is SEVEN osascript invocations: compose → paste → read-back →
+    Flow is EIGHT osascript invocations: compose → paste → read-back →
     file paste → AX attachment verify (the send is NOT attempted unless
-    every file is visible in the compose window) → verified send →
-    the Sent copy's attachment names.
+    every file is visible in the compose window) → verified send → the
+    Sent ids with its subject → its Sent copy read, files and all.
     """
 
     @pytest.fixture
@@ -7652,7 +7685,7 @@ class TestSendHtmlWithAttachments:
         *,
         outcomes_override: dict[int, str] | None = None,
         n_files: int = 1,
-    ) -> tuple[list[str], list[Path], dict[str, str] | None, Exception | None]:
+    ) -> tuple[list[str], list[Path], dict[str, Any] | None, Exception | None]:
         files = []
         for i in range(n_files):
             f = tmp_path / f"att{i}.txt"
@@ -7665,7 +7698,7 @@ class TestSendHtmlWithAttachments:
         for idx, val in (outcomes_override or {}).items():
             outcomes[idx] = val
         captured = _scripted(connector, outcomes)
-        result: dict[str, str] | None = None
+        result: dict[str, Any] | None = None
         err: Exception | None = None
         try:
             result = connector._send_html_email(
@@ -7681,14 +7714,15 @@ class TestSendHtmlWithAttachments:
             err = e
         return captured, files, result, err
 
-    def test_happy_path_seven_scripts(
+    def test_happy_path_eight_scripts(
         self, connector: AppleMailConnector, tmp_path: Path
     ) -> None:
         scripts, files, result, err = self._drive(connector, tmp_path)
         assert err is None
-        assert result == {"draft_id": "", "sent_message_id": ""}
-        assert len(scripts) == 7
-        compose_s, paste_s, readback_s, files_s, verify_s, send_s, count_s = scripts
+        assert result == _SENT
+        assert len(scripts) == 8
+        (compose_s, paste_s, readback_s, files_s, verify_s, send_s,
+         ids_s, copy_s) = scripts
         # Compose: scriptable outgoing message, recipients through the
         # model, no attachment through the dictionary.
         assert "make new outgoing message" in compose_s
@@ -7705,9 +7739,11 @@ class TestSendHtmlWithAttachments:
         # AX verify names the file.
         assert files[0].name in verify_s
         assert "click sendBtn" in send_s
-        # Post-send: the Sent copy's attachments, read back by name.
-        assert "name of every mail attachment" in count_s
-        assert 'sent mailbox whose subject is "Attached"' in count_s
+        # Post-send: the new Sent id with the subject, then that copy's
+        # files, read by its id.
+        assert 'id of every message of sent mailbox whose subject is "Attached"' in ids_s
+        assert 'first message of sent mailbox whose id is "9"' in copy_s
+        assert "name of every mail attachment of m" in copy_s
 
     def test_missing_file_raises_before_applescript(
         self, connector: AppleMailConnector, tmp_path: Path
@@ -7749,13 +7785,14 @@ class TestSendHtmlWithAttachments:
         must say so)."""
         scripts, _, result, err = self._drive(
             connector, tmp_path, n_files=2,
-            outcomes_override={6: json.dumps(["att1.txt"])},
+            outcomes_override={7: _sent_copy_outcomes(["att1.txt"])[1]},
         )
         assert result is None
         assert isinstance(err, MailAppleScriptError)
         assert "WAS sent" in str(err)
         assert "att0.txt" in str(err)
-        assert len(scripts) == 7
+        assert "id 9" in str(err)
+        assert len(scripts) == 8
 
     def test_the_sent_copy_may_carry_more_than_was_pasted(
         self, connector: AppleMailConnector, tmp_path: Path
@@ -7764,10 +7801,10 @@ class TestSendHtmlWithAttachments:
         the caller's: every file pasted must be there, not only those."""
         _, _, result, err = self._drive(
             connector, tmp_path,
-            outcomes_override={6: json.dumps(["theirs.pdf", "att0.txt"])},
+            outcomes_override={7: _sent_copy_outcomes(["theirs.pdf", "att0.txt"])[1]},
         )
         assert err is None
-        assert result == {"draft_id": "", "sent_message_id": ""}
+        assert result == _SENT
 
     def test_ax_verify_accepts_a_file_shown_as_an_image(self) -> None:
         """A compose window shows a PNG inline, as an AXImage described
@@ -7785,6 +7822,217 @@ class TestSendHtmlWithAttachments:
             "((description of el) as text) contains fname"
         ) in script
         assert '"probe.png"' in script
+
+
+def _sent_mailbox(
+    ids: list[list[int]], names: list[str] | None = None
+) -> Callable[[str], str]:
+    """Mail after a send, as the look for its Sent copy sees it: the ids
+    of the Sent messages with its subject, one list a look (the last
+    repeats), and copy 9, read by its id, carrying ``names``."""
+    looks: list[str] = []
+
+    def answer(script: str) -> str:
+        if "whose id is" in script:
+            return _sent_copy_outcomes(names)[1]
+        looks.append(script)
+        return json.dumps(ids[min(len(looks), len(ids)) - 1])
+
+    return answer
+
+
+class TestASendFindsItsSentCopyByIdentity:
+    """After the verified send, a send finds the copy it filed in Sent:
+    the one message in Sent with the window's subject whose id was not
+    there before the window opened (``_compose_meta`` saw 5 and 6). By
+    subject alone, a send whose subject had been used before read the
+    oldest copy of it, reported the file just sent missing from a
+    message that carried it, and was sent again.
+
+    A send that went out ends one of three ways: its copy found and
+    carrying every file pasted (its ids returned), its copy found and
+    lacking one (raised, saying the message WAS sent), or its copy not
+    identified (no id, and one warning saying why)."""
+
+    @pytest.fixture
+    def connector(self) -> AppleMailConnector:
+        return AppleMailConnector(timeout=30)
+
+    @pytest.fixture
+    def sleeps(self, monkeypatch: pytest.MonkeyPatch) -> list[float]:
+        from apple_mail_mcp import mail_connector as mc_mod
+
+        slept: list[float] = []
+        monkeypatch.setattr(mc_mod.time, "sleep", slept.append)
+        return slept
+
+    def _send(
+        self,
+        connector: AppleMailConnector,
+        tmp_path: Path,
+        sent_mailbox: Callable[[str], str],
+        *,
+        files: tuple[str, ...] = (),
+        subject: str = "Same subject",
+    ) -> tuple[list[str], dict[str, Any] | None, Exception | None]:
+        """Send with a well-behaved Mail up to SENT, then ``sent_mailbox``
+        answering the look for the copy; the scripts after SENT, and the
+        result or what was raised."""
+        paths = []
+        for name in files:
+            path = tmp_path / name
+            path.write_text(name)
+            paths.append(path)
+        body = "<p>again probe</p>"
+        until_sent = _compose_outcomes(body, window=subject, file_names=list(files))[:-2]
+        captured: list[str] = []
+
+        def fake_run(script: str) -> str:
+            captured.append(script)
+            if len(captured) <= len(until_sent):
+                return until_sent[len(captured) - 1]
+            return sent_mailbox(script)
+
+        connector._run_applescript = fake_run  # type: ignore[method-assign]
+        try:
+            result = connector._send_html_email(
+                to=["test@example.com"], cc=None, bcc=None, subject=subject,
+                body=body, from_account=None, attachment_paths=paths or None,
+            )
+        except Exception as e:  # noqa: BLE001
+            return captured[len(until_sent):], None, e
+        return captured[len(until_sent):], result, None
+
+    def test_the_copy_is_the_one_id_the_snapshot_did_not_have(
+        self, connector: AppleMailConnector, tmp_path: Path, sleeps: list[float]
+    ) -> None:
+        after, result, err = self._send(
+            connector, tmp_path, _sent_mailbox([[5, 9, 6]])
+        )
+        assert err is None
+        assert result == _SENT
+        assert len(after) == 2
+        assert (
+            'id of every message of sent mailbox whose subject is "Same subject"'
+        ) in after[0]
+        assert 'first message of sent mailbox whose id is "9"' in after[1]
+        assert sleeps == []
+
+    def test_the_files_are_checked_on_that_copy_not_an_older_one(
+        self, connector: AppleMailConnector, tmp_path: Path, sleeps: list[float]
+    ) -> None:
+        """Copy 5 is an earlier send of the same subject with other files:
+        it is never read, so what it carries decides nothing."""
+        after, result, err = self._send(
+            connector, tmp_path, _sent_mailbox([[5, 9]], ["archive.zip"]),
+            files=("archive.zip",),
+        )
+        assert err is None
+        assert result == _SENT
+        assert all('whose id is "5"' not in s for s in after)
+        assert all("first message of sent mailbox whose subject" not in s for s in after)
+
+    def test_a_copy_listed_late_is_waited_for(
+        self, connector: AppleMailConnector, tmp_path: Path, sleeps: list[float]
+    ) -> None:
+        """A subject Sent already held satisfies the verified send before
+        the new copy is listed; the look waits for it."""
+        _, result, err = self._send(
+            connector, tmp_path, _sent_mailbox([[5, 6], [5, 6], [5, 6], [5, 6, 9]])
+        )
+        assert err is None
+        assert result == _SENT
+        assert sleeps == [AppleMailConnector._SENT_APPEAR_INTERVAL_S] * 3
+
+    def test_a_copy_never_listed_is_a_warning_not_an_error(
+        self, connector: AppleMailConnector, tmp_path: Path, sleeps: list[float]
+    ) -> None:
+        """The message was sent: nothing is raised, no id is guessed, and
+        the files are said to be unverified, not missing."""
+        after, result, err = self._send(
+            connector, tmp_path, _sent_mailbox([[5, 6]], ["archive.zip"]),
+            files=("archive.zip",),
+        )
+        assert err is None
+        assert result is not None
+        polls = AppleMailConnector._SENT_APPEAR_POLLS
+        interval = AppleMailConnector._SENT_APPEAR_INTERVAL_S
+        assert sleeps == [interval] * polls
+        assert len(after) == polls + 1
+        assert all("whose id is" not in s for s in after)
+        assert result["sent_message_id"] == ""
+        assert result["sent_rfc_message_id"] == ""
+        assert result["draft_id"] == ""
+        [warning] = result["warnings"]
+        assert "was sent" in warning
+        assert f"within {polls * interval:g}s" in warning
+        assert "unverified" in warning
+        assert "lacks" not in warning
+
+    def test_without_files_the_warning_says_nothing_of_files(
+        self, connector: AppleMailConnector, tmp_path: Path, sleeps: list[float]
+    ) -> None:
+        _, result, _ = self._send(connector, tmp_path, _sent_mailbox([[5, 6]]))
+        assert result is not None
+        [warning] = result["warnings"]
+        assert "file" not in warning
+
+    def test_two_new_copies_are_not_guessed_between(
+        self, connector: AppleMailConnector, tmp_path: Path, sleeps: list[float]
+    ) -> None:
+        """Another send of the same subject since the window opened: which
+        copy is this one's cannot be told by id, and waiting will not
+        tell it either."""
+        after, result, err = self._send(
+            connector, tmp_path, _sent_mailbox([[5, 6, 9, 10]])
+        )
+        assert err is None
+        assert result is not None
+        assert result["sent_message_id"] == ""
+        [warning] = result["warnings"]
+        assert "2 messages" in warning
+        assert len(after) == 1
+        assert sleeps == []
+
+    def test_a_failed_look_is_a_warning_and_the_window_stays_sent(
+        self, connector: AppleMailConnector, tmp_path: Path, sleeps: list[float]
+    ) -> None:
+        ends: list[Any] = []
+        connector._record_window_end = (  # type: ignore[method-assign]
+            lambda window, state: ends.append(state)
+        )
+
+        def busy(script: str) -> str:
+            raise MailAppleScriptError("Mail automation busy")
+
+        _, result, err = self._send(connector, tmp_path, busy)
+        assert err is None
+        assert result is not None
+        assert result["sent_message_id"] == ""
+        [warning] = result["warnings"]
+        assert "Mail automation busy" in warning
+        assert [state.how for state in ends] == ["sent"]
+
+    def test_a_file_missing_from_the_found_copy_raises_that_it_was_sent(
+        self, connector: AppleMailConnector, tmp_path: Path, sleeps: list[float]
+    ) -> None:
+        _, result, err = self._send(
+            connector, tmp_path, _sent_mailbox([[5, 6, 9]], ["other.pdf"]),
+            files=("archive.zip",),
+        )
+        assert result is None
+        assert isinstance(err, MailAppleScriptError)
+        assert "WAS sent" in str(err)
+        assert "archive.zip" in str(err)
+        assert "id 9" in str(err)
+
+    def test_the_subject_is_escaped_in_the_look(
+        self, connector: AppleMailConnector, tmp_path: Path, sleeps: list[float]
+    ) -> None:
+        after, _, _ = self._send(
+            connector, tmp_path, _sent_mailbox([[5, 6, 9]]), subject='Say "hi"'
+        )
+        assert 'whose subject is "Say \\"hi\\""' in after[0]
 
 
 _OVERLONG = SANITIZE_MAX_LENGTH + 1
@@ -7912,9 +8160,13 @@ class TestVerifiedSendPrimitives:
     def connector(self) -> AppleMailConnector:
         return AppleMailConnector(timeout=30)
 
+    # Where the verified send sits among a fresh send's scripts: after
+    # compose, paste and read-back, before the look for its Sent copy.
+    _SEND_AT = 3
+
     def _plain_fresh_scripts(self, connector: AppleMailConnector) -> list[str]:
         """Captured scripts for a fresh plain send through create_draft:
-        [compose, paste, read-back, verified-send]."""
+        [compose, paste, read-back, verified-send, Sent ids, Sent copy]."""
         captured = _scripted(
             connector, _compose_outcomes("x", window="Probe", plain=True)
         )
@@ -7929,7 +8181,7 @@ class TestVerifiedSendPrimitives:
 
     def _html_scripts(self, connector: AppleMailConnector) -> list[str]:
         """Captured scripts for the fresh HTML flow:
-        [compose, paste, read-back, verified-send]."""
+        [compose, paste, read-back, verified-send, Sent ids, Sent copy]."""
         return _run_html_flow(connector)
 
     # -- precondition: send-enabled check, window by name ------------------
@@ -7937,14 +8189,14 @@ class TestVerifiedSendPrimitives:
     def test_plain_fresh_send_checks_send_enabled(
         self, connector: AppleMailConnector
     ) -> None:
-        send_s = self._plain_fresh_scripts(connector)[-1]
+        send_s = self._plain_fresh_scripts(connector)[self._SEND_AT]
         assert "enabled of sendBtn" in send_s
         assert "SEND_DISABLED" in send_s
 
     def test_html_script_checks_send_enabled(
         self, connector: AppleMailConnector
     ) -> None:
-        send_s = self._html_scripts(connector)[-1]
+        send_s = self._html_scripts(connector)[self._SEND_AT]
         assert "enabled of sendBtn" in send_s
         assert "SEND_DISABLED" in send_s
 
@@ -7961,7 +8213,7 @@ class TestVerifiedSendPrimitives:
     def test_plain_fresh_send_verifies_dispatch(
         self, connector: AppleMailConnector
     ) -> None:
-        send_s = self._plain_fresh_scripts(connector)[-1]
+        send_s = self._plain_fresh_scripts(connector)[self._SEND_AT]
         assert "sent mailbox" in send_s
         assert "POSTCONDITION_TIMEOUT" in send_s
         assert "SHEET:" in send_s
@@ -7969,7 +8221,7 @@ class TestVerifiedSendPrimitives:
     def test_html_script_verifies_dispatch(
         self, connector: AppleMailConnector
     ) -> None:
-        send_s = self._html_scripts(connector)[-1]
+        send_s = self._html_scripts(connector)[self._SEND_AT]
         assert "sent mailbox" in send_s
         assert "POSTCONDITION_TIMEOUT" in send_s
         assert "SHEET:" in send_s
@@ -8059,7 +8311,7 @@ class TestVerifiedSendPrimitives:
         self, connector: AppleMailConnector, sentinel: str
     ) -> None:
         outcomes = _compose_outcomes("x", window="Probe", plain=True)
-        _scripted(connector, outcomes[:-1] + [sentinel])
+        _scripted(connector, outcomes[:self._SEND_AT] + [sentinel])
         with pytest.raises(MailAppleScriptError) as exc:
             connector.create_draft(
                 seed="new",
@@ -8081,7 +8333,7 @@ class TestVerifiedSendPrimitives:
         """Verified-send sentinels from the send script surface as errors."""
         body = "<p>Hi there probe</p>"
         outcomes = _compose_outcomes(body, window="Probe")
-        _scripted(connector, outcomes[:-1] + [sentinel])
+        _scripted(connector, outcomes[:self._SEND_AT] + [sentinel])
         with pytest.raises(MailAppleScriptError) as exc:
             connector._send_html_email(
                 to=["test@example.com"],
@@ -8176,7 +8428,9 @@ class TestVerifiedSendPrimitives:
             "the server smtp.example.com. | )"
         )
         outcomes = _compose_outcomes("<p>Hi there probe</p>", window="Probe")
-        _scripted(connector, outcomes[:-1] + ["POSTCONDITION_TIMEOUT:x", sheet])
+        _scripted(
+            connector, outcomes[:self._SEND_AT] + ["POSTCONDITION_TIMEOUT:x", sheet]
+        )
         with pytest.raises(MailAppleScriptError) as exc:
             connector._send_html_email(
                 to=["test@example.com"], cc=None, bcc=None, subject="Probe",
@@ -8294,8 +8548,9 @@ class TestHtmlReplyAndForward:
     ) -> list[str]:
         """Send an HTML reply or forward against a well-behaved Mail and
         return the scripts it ran: open, paste, read-back, then (with
-        files) the file paste and its check, the verified send and (with
-        files) the Sent copy's file names."""
+        files) the file paste and its check, the verified send, and the
+        look for its Sent copy (the ids with its subject, the copy
+        read)."""
         if outcomes is None:
             outcomes = _compose_outcomes(
                 body, window=self._WINDOW[seed], seed=seed,
@@ -8313,7 +8568,7 @@ class TestHtmlReplyAndForward:
             attachment_paths=files,
             **mode,
         )
-        assert result == {"draft_id": "", "sent_message_id": ""}
+        assert result == _SENT
         return captured
 
     def test_a_reply_opens_mails_reply_window_and_keeps_what_mail_derived(
@@ -8322,7 +8577,8 @@ class TestHtmlReplyAndForward:
         """No recipients and no subject given: Mail's own stay, and the
         window's recipients are read from the model, not the UI."""
         scripts = self._send(connector, "reply", to=[])
-        assert len(scripts) == 4  # open, paste, read-back, verified send
+        # open, paste, read-back, verified send, the Sent look (two)
+        assert len(scripts) == 6
         open_s = scripts[0]
         assert 'whose id is "12345"' in open_s
         assert "reply origMsg opening window true" in open_s
@@ -8355,7 +8611,7 @@ class TestHtmlReplyAndForward:
         would take Mail's quote or forwarded message with it. The content
         is never set, and the window's Send button sends."""
         scripts = self._send(connector, seed)
-        _, paste_s, readback_s, send_s = scripts
+        _, paste_s, readback_s, send_s, _, _ = scripts
         assert "key code 126 using command down" in paste_s
         assert "public.html" in paste_s
         assert 'keystroke "a" using command down' not in paste_s
@@ -8381,18 +8637,19 @@ class TestHtmlReplyAndForward:
             self._BODY, window=self._WINDOW[seed], seed=seed,
             file_names=["mine.txt"],
         )
-        outcomes[-1] = json.dumps(["theirs.pdf", "mine.txt"])
+        outcomes[-1] = _sent_copy_outcomes(["theirs.pdf", "mine.txt"])[1]
         scripts = self._send(connector, seed, files=[mine], outcomes=outcomes)
-        assert len(scripts) == 7
-        _, paste_s, _, files_s, verify_s, send_s, names_s = scripts
+        assert len(scripts) == 8
+        _, paste_s, _, files_s, verify_s, send_s, ids_s, copy_s = scripts
         assert "key code 126 using command down" in paste_s
         assert "writeObjects:fileURLs" in files_s
         assert mine.resolve().as_posix() in files_s
         assert "key code 125 using command down" in files_s
         assert '"mine.txt"' in verify_s
         assert "click sendBtn" in send_s
-        assert "name of every mail attachment" in names_s
-        assert f'whose subject is "{self._WINDOW[seed]}"' in names_s
+        assert f'whose subject is "{self._WINDOW[seed]}"' in ids_s
+        assert 'whose id is "9"' in copy_s
+        assert "name of every mail attachment of m" in copy_s
         assert all("make new attachment" not in s for s in scripts)
 
     @pytest.mark.parametrize("seed", ["reply", "forward"])
@@ -8405,7 +8662,7 @@ class TestHtmlReplyAndForward:
             self._BODY, window=self._WINDOW[seed], seed=seed,
             file_names=["mine.txt"],
         )
-        outcomes[-1] = json.dumps(["theirs.pdf"])
+        outcomes[-1] = _sent_copy_outcomes(["theirs.pdf"])[1]
         with pytest.raises(MailAppleScriptError, match="WAS sent"):
             self._send(connector, seed, files=[mine], outcomes=outcomes)
 
@@ -8523,9 +8780,10 @@ class TestHtmlReplyAndForward:
     def test_an_empty_body_leaves_mails_part_as_mail_made_it(
         self, connector: AppleMailConnector, seed: str
     ) -> None:
-        """Nothing is pasted: the window is opened, gated and sent."""
+        """Nothing is pasted: the window is opened, gated and sent, and
+        its Sent copy looked for."""
         scripts = self._send(connector, seed, body="")
-        assert len(scripts) == 2
+        assert len(scripts) == 4
         assert "click sendBtn" in scripts[1]
         assert all('keystroke "v"' not in s for s in scripts)
 

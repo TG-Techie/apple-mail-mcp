@@ -44,6 +44,7 @@ from .mail_readback import (
     SentCopy,
     assert_html_rendered,
     assert_not_quoted,
+    assert_sent,
     bare_message_id,
     compose_window_count,
     header,
@@ -61,7 +62,6 @@ pytestmark = pytest.mark.skipif(
 )
 
 PREFIX = f"{TEST_DRAFT_SUBJECT_PREFIX}loopback-"
-SENT = {"draft_id": "", "sent_message_id": ""}
 
 # The From of a Sent copy that was not the test account, once one test
 # has seen it. The default account is a property of the machine, not of
@@ -196,7 +196,7 @@ def test_fresh_html_arrives_intact(loop: Loopback) -> None:
             body=f"<p>loopback read-back <b>marker-{hexid}</b></p>",
             from_account=None,
         )
-        assert result == SENT
+        assert_sent(result)
         sent, arrival = loop.receive(trash, subject)
 
         loop.assert_delivered(arrival, sent, subject)
@@ -221,7 +221,7 @@ def test_fresh_html_with_cc_and_attachments_arrives_intact(
             body=f"<p>loopback attachments <b>marker-{hexid}</b></p>",
             from_account=None, attachment_paths=files,
         )
-        assert result == SENT
+        assert_sent(result)
         sent, arrival = loop.receive(trash, subject)
 
         loop.assert_delivered(arrival, sent, subject)
@@ -248,7 +248,7 @@ def test_plain_fresh_send_via_draft_path_arrives_intact(loop: Loopback) -> None:
             seed="new", to=[loop.address], subject=subject, body=body,
             send_now=True,
         )
-        assert result == SENT
+        assert_sent(result)
         sent, arrival = loop.receive(trash, subject)
 
         loop.assert_delivered(arrival, sent, subject)
@@ -270,7 +270,7 @@ def test_plain_fresh_send_from_a_named_sender_arrives_from_it(loop: Loopback) ->
             seed="new", to=[loop.address], subject=subject, body=body,
             from_account=loop.account, send_now=True,
         )
-        assert result == SENT
+        assert_sent(result)
         sent, arrival = loop.receive(trash, subject)
 
         loop.assert_delivered(arrival, sent, subject)
@@ -297,7 +297,7 @@ def test_plain_fresh_send_from_a_named_sender_carries_attachments(
             seed="new", to=[loop.address], subject=subject, body=body,
             from_account=loop.account, attachment_paths=files, send_now=True,
         )
-        assert result == SENT
+        assert_sent(result)
         sent, arrival = loop.receive(trash, subject)
 
         loop.assert_delivered(arrival, sent, subject)
@@ -328,7 +328,7 @@ def test_fresh_html_carries_an_image_and_a_text_file(
             body=f"<p>an image and a file <b>marker-{hexid}</b></p>",
             from_account=loop.account, attachment_paths=files,
         )
-        assert result == SENT
+        assert_sent(result)
         sent, arrival = loop.receive(trash, subject)
 
         assert sorted(sent.attachment_names) == ["first.txt", "probe.png"]
@@ -354,7 +354,7 @@ def test_fresh_html_from_a_named_sender_arrives_from_it(loop: Loopback) -> None:
             body=f"<p>named sender <b>marker-{hexid}</b></p><p>two &amp; more</p>",
             from_account=loop.account,
         )
-        assert result == SENT
+        assert_sent(result)
         sent, arrival = loop.receive(trash, subject)
 
         loop.assert_delivered(arrival, sent, subject)
@@ -370,19 +370,19 @@ def test_html_reply_threads_at_the_receiver(loop: Loopback) -> None:
     reply_subject = f"Re: {seed_subject}"
     with MailTrash(loop.connector, loop.account) as trash:
         loop.prepare(trash, seed_subject)
-        assert loop.connector._send_html_email(
+        assert_sent(loop.connector._send_html_email(
             to=[loop.address], cc=None, bcc=None, subject=seed_subject,
             body=f"<p>reply seed <b>seed-marker-{hexid}</b></p>",
             from_account=None,
-        ) == SENT
+        ))
         seed_sent, seed = loop.receive(trash, seed_subject)
 
         loop.prepare(trash, reply_subject)
-        assert loop.connector._send_html_email(
+        assert_sent(loop.connector._send_html_email(
             to=[loop.address], cc=None, bcc=None, subject="",
             body=f"<p><i>reply-marker-{hexid}</i></p>",
             from_account=None, reply_to=seed.mail_id,
-        ) == SENT
+        ))
         reply_sent, reply = loop.receive(trash, reply_subject)
 
         loop.assert_delivered(reply, reply_sent, reply_subject)
@@ -411,20 +411,20 @@ def test_forward_via_draft_path_carries_original_and_attachments(
     files = _two_files(tmp_path, hexid)
     with MailTrash(loop.connector, loop.account) as trash:
         loop.prepare(trash, seed_subject)
-        assert loop.connector._send_html_email(
+        assert_sent(loop.connector._send_html_email(
             to=[loop.address], cc=None, bcc=None, subject=seed_subject,
             body=f"<p>forward seed <b>seed-marker-{hexid}</b></p>",
             from_account=None, attachment_paths=files,
-        ) == SENT
+        ))
         _, seed = loop.receive(trash, seed_subject)
         assert seed.attachment_count == 2, "the seed itself arrived without both files"
 
         trash.windows(forward_subject)
         loop.prepare(trash, forward_subject)
-        assert loop.connector.create_draft(
+        assert_sent(loop.connector.create_draft(
             seed="forward", seed_id=seed.mail_id, to=[loop.address],
             body=f"forward-marker-{hexid}", send_now=True,
-        ) == SENT
+        ))
         assert compose_window_count(loop.connector, forward_subject) == 0, (
             "the send left its compose window open"
         )
@@ -450,19 +450,19 @@ def test_reply_via_draft_path_puts_the_note_above_the_quote(loop: Loopback) -> N
     reply_subject = f"Re: {seed_subject}"
     with MailTrash(loop.connector, loop.account) as trash:
         loop.prepare(trash, seed_subject)
-        assert loop.connector._send_html_email(
+        assert_sent(loop.connector._send_html_email(
             to=[loop.address], cc=None, bcc=None, subject=seed_subject,
             body=f"<p>draft reply seed <b>seed-marker-{hexid}</b></p>",
             from_account=None,
-        ) == SENT
+        ))
         seed_sent, seed = loop.receive(trash, seed_subject)
 
         trash.windows(reply_subject)
         loop.prepare(trash, reply_subject)
-        assert loop.connector.create_draft(
+        assert_sent(loop.connector.create_draft(
             seed="reply", seed_id=seed.mail_id, to=[loop.address],
             body=f"reply-note-{hexid}", send_now=True,
-        ) == SENT
+        ))
         assert compose_window_count(loop.connector, reply_subject) == 0, (
             "the send left its compose window open"
         )
@@ -491,11 +491,11 @@ def test_a_saved_forward_note_sits_above_the_forwarded_message(
     files = _two_files(tmp_path, hexid)
     with MailTrash(loop.connector, loop.account) as trash:
         loop.prepare(trash, seed_subject)
-        assert loop.connector._send_html_email(
+        assert_sent(loop.connector._send_html_email(
             to=[loop.address], cc=None, bcc=None, subject=seed_subject,
             body=f"<p>saved forward seed <b>seed-marker-{hexid}</b></p>",
             from_account=None, attachment_paths=files,
-        ) == SENT
+        ))
         _, seed = loop.receive(trash, seed_subject)
         assert seed.attachment_count == 2, "the seed itself arrived without both files"
 
@@ -545,11 +545,11 @@ def test_forward_without_note_via_tool_lifecycle_carries_original_and_attachment
     files = _two_files(tmp_path, hexid)
     with MailTrash(loop.connector, loop.account) as trash:
         loop.prepare(trash, seed_subject)
-        assert loop.connector._send_html_email(
+        assert_sent(loop.connector._send_html_email(
             to=[loop.address], cc=None, bcc=None, subject=seed_subject,
             body=f"<p>lifecycle seed <b>seed-marker-{hexid}</b></p>",
             from_account=None, attachment_paths=files,
-        ) == SENT
+        ))
         seed_sent, seed = loop.receive(trash, seed_subject)
         assert seed.attachment_count == 2, "the seed itself arrived without both files"
 
@@ -718,11 +718,11 @@ def test_a_reply_draft_with_a_note_and_a_file_goes_out_with_both(
     attached = _two_files(tmp_path, hexid)[0]
     with MailTrash(loop.connector, loop.account) as trash:
         loop.prepare(trash, seed_subject)
-        assert loop.connector._send_html_email(
+        assert_sent(loop.connector._send_html_email(
             to=[loop.address], cc=None, bcc=None, subject=seed_subject,
             body=f"<p>reply with a file seed <b>seed-marker-{hexid}</b></p>",
             from_account=None,
-        ) == SENT
+        ))
         seed_sent = sent_copy(loop.connector, seed_subject)
 
         trash.windows(reply_subject)
@@ -796,21 +796,21 @@ def test_html_forward_carries_the_original_its_files_and_the_callers(
     caller.write_text(f"the caller's file {hexid}\n")
     with MailTrash(loop.connector, loop.account) as trash:
         loop.prepare(trash, seed_subject)
-        assert loop.connector._send_html_email(
+        assert_sent(loop.connector._send_html_email(
             to=[loop.address], cc=None, bcc=None, subject=seed_subject,
             body=f"<p>html forward seed <b>seed-marker-{hexid}</b></p>",
             from_account=None, attachment_paths=files,
-        ) == SENT
+        ))
         seed_sent = sent_copy(loop.connector, seed_subject)
 
         trash.windows(forward_subject)
         loop.prepare(trash, forward_subject)
-        assert loop.connector._send_html_email(
+        assert_sent(loop.connector._send_html_email(
             to=[loop.address], cc=None, bcc=None, subject="",
             body=f"<p>html forward <b>{marker}</b></p>",
             from_account=None, forward_of=seed_sent.mail_id,
             attachment_paths=[caller],
-        ) == SENT
+        ))
         assert compose_window_count(loop.connector, forward_subject) == 0, (
             "the send left its compose window open"
         )
@@ -852,21 +852,21 @@ def test_html_reply_with_a_file_keeps_the_quote(loop: Loopback, tmp_path: Path) 
     caller.write_text(f"the caller's file {hexid}\n")
     with MailTrash(loop.connector, loop.account) as trash:
         loop.prepare(trash, seed_subject)
-        assert loop.connector._send_html_email(
+        assert_sent(loop.connector._send_html_email(
             to=[loop.address], cc=None, bcc=None, subject=seed_subject,
             body=f"<p>html reply seed <b>seed-marker-{hexid}</b></p>",
             from_account=None,
-        ) == SENT
+        ))
         seed_sent = sent_copy(loop.connector, seed_subject)
 
         trash.windows(reply_subject)
         loop.prepare(trash, reply_subject)
-        assert loop.connector._send_html_email(
+        assert_sent(loop.connector._send_html_email(
             to=[loop.address], cc=None, bcc=None, subject="",
             body=f"<p>html reply <b>{marker}</b></p>",
             from_account=None, reply_to=seed_sent.mail_id,
             attachment_paths=[caller],
-        ) == SENT
+        ))
         assert compose_window_count(loop.connector, reply_subject) == 0, (
             "the send left its compose window open"
         )

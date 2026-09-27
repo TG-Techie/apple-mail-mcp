@@ -137,10 +137,11 @@ class TestEveryWindowIsRecordedWithHowItEnded:
         self, connector: AppleMailConnector, ledger: ComposeLedger
     ) -> None:
         outcomes = _compose_outcomes("<p>Hi there probe</p>", window="hi")
+        until_send = outcomes[1:outcomes.index("SENT")]
         with pytest.raises(MailAppleScriptError, match="POSTCONDITION_TIMEOUT"):
             _send(
                 connector,
-                [_meta("hi")] + outcomes[1:-1] + ["POSTCONDITION_TIMEOUT:x", "NO_WINDOW"],
+                [_meta("hi"), *until_send, "POSTCONDITION_TIMEOUT:x", "NO_WINDOW"],
             )
         state = _only_record(ledger).state
         assert isinstance(state, Closed) and state.how == "gone"

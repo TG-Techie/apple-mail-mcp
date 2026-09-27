@@ -55,6 +55,17 @@ def bare_message_id(value: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def assert_sent(result: dict[str, Any]) -> None:
+    """A send's result that names the copy it filed in Sent: no draft,
+    Mail's id for the copy and its RFC Message-ID, and no warning. A
+    result with a warning went out too, but its copy was not identified,
+    and a send-path test asserts that it was."""
+    assert "warnings" not in result, result
+    assert result["draft_id"] == "", result
+    assert str(result["sent_message_id"]).isdigit(), result
+    assert result["sent_rfc_message_id"], result
+
+
 def sent_source_for_subject(connector: AppleMailConnector, subject: str) -> str:
     return connector._run_applescript(
         f'tell application "Mail" to return source of first message of '
