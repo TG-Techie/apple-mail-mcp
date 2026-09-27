@@ -474,6 +474,63 @@ class TestAnHtmlForwardThroughTheProtocol:
         assert kwargs["attachment_paths"] == [mine]
 
 
+# What the connector returns for a send whose Sent copy it found, and for
+# one whose copy it could not identify (the message went out either way).
+_FOUND = {
+    "draft_id": "", "sent_message_id": "161300",
+    "sent_rfc_message_id": "copy@example.com",
+}
+_UNIDENTIFIED = {
+    "draft_id": "", "sent_message_id": "", "sent_rfc_message_id": "",
+    "warnings": [
+        "The message was sent, but its copy in Sent could not be identified: "
+        "no new message with its subject appeared in Sent within 30s."
+    ],
+}
+
+
+class TestASendsResultNamesItsSentCopy:
+    """Through the protocol, both send tools return what the send found
+    of the copy it filed in Sent: its Mail id and Message-ID, or empty
+    ids and the warning saying why, as a success. The recipient is
+    allowlisted by a policy of this class's own, so nothing is put to the
+    user to confirm."""
+
+    @pytest.fixture(autouse=True)
+    def _example_com_allowed(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        policy = tmp_path / "comms.yaml"
+        policy.write_text("email:\n  allowed_outbound:\n    - '*@example.com'\n")
+        monkeypatch.setenv("APPLE_MAIL_MCP_COMMS_CONFIG", str(policy))
+
+    @pytest.mark.parametrize("sent", [_FOUND, _UNIDENTIFIED])
+    async def test_email_send_html(
+        self, mock_mail: MagicMock, sent: dict[str, Any]
+    ) -> None:
+        mock_mail._send_html_email.return_value = dict(sent)
+        result = await server.mcp.call_tool(
+            "email_send_html",
+            {"to": ["a@example.com"], "subject": "s", "body": "<p>b</p>"},
+        )
+        assert result.structured_content == {"success": True, **sent}
+
+    @pytest.mark.parametrize("sent", [_FOUND, _UNIDENTIFIED])
+    async def test_draft_send(
+        self, mock_mail: MagicMock, sent: dict[str, Any]
+    ) -> None:
+        mock_mail.get_draft_state.return_value = {
+            "to": ["a@example.com"], "cc": [], "bcc": [],
+            "subject": "s", "body": "b", "attachment_names": [],
+        }
+        mock_mail.create_draft.return_value = dict(sent)
+        result = await server.mcp.call_tool("draft_send", {"draft_id": "draft-1"})
+        assert result.structured_content == {
+            "success": True, **sent,
+            "details": {"seed_kind": "new", "send_now": True},
+        }
+
+
 class TestDraftUpdateInvocation:
     """draft_update is delete-and-recreate, so it needs three connector
     calls stubbed and does not fit the single-method table above."""

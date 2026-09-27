@@ -49,7 +49,7 @@ so the outbound recipient allowlist policy gate sits on one obvious tool
 
 ```
 draft_create(...)              → {"draft_id": "ABCD"}
-draft_send(draft_id="ABCD")    → {"sent_message_id": ""}
+draft_send(draft_id="ABCD")    → {"sent_message_id": "WXYZ"}
 ```
 
 **With optional refinement (e.g., agent revising before sending):**
@@ -58,8 +58,13 @@ draft_send(draft_id="ABCD")    → {"sent_message_id": ""}
 draft_create(...)              → {"draft_id": "ABCD"}
 draft_update(draft_id="ABCD",  → {"draft_id": "EFGH"}   # id CHANGES
              body="revised")
-draft_send(draft_id="EFGH")    → {"sent_message_id": ""}
+draft_send(draft_id="EFGH")    → {"sent_message_id": "WXYZ"}
 ```
+
+``sent_message_id`` is the Mail id of the copy the send filed in Sent,
+beside its ``sent_rfc_message_id``; both are ``""``, with a
+``warnings`` entry saying why, when that copy could not be identified.
+The message was sent either way.
 
 ``draft_update`` is implemented as recreate-then-delete; the returned id
 is a NEW id, and the old draft is removed only after the new one exists,

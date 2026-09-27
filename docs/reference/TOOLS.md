@@ -922,7 +922,8 @@ Create a draft (fresh, reply, or forward). Does not send; send it with
 }
 ```
 
-`sent_message_id` is reserved for future use.
+`sent_message_id` is always empty here: `draft_create` saves and never
+sends. `draft_send` returns the id of the message it sends.
 
 **Composition:** every draft is composed in a visible compose window,
 so Mail comes to the front for a few seconds of each save: a fresh
@@ -1142,15 +1143,19 @@ read out of the draft first and pasted after everything else.
 {
   "success": true,
   "draft_id": "",
-  "sent_message_id": "",
+  "sent_message_id": "161300",
+  "sent_rfc_message_id": "A1B2C3D4-0000-0000-0000-000000000000@example.com",
   "details": {"seed_kind": "reply", "send_now": true}
 }
 ```
 
-`sent_message_id` is empty: recovering the just-sent message across
-IMAP sync is unreliable. The old draft is removed only after the send
-went out; if that removal fails, the response is a success carrying a
-`warning` naming the draft, which is then still in Drafts.
+`sent_message_id` and `sent_rfc_message_id` name the copy the send
+filed in Sent, found as `email_send_html` finds it (see **The Sent
+copy** there); when it could not be identified both are `""` and a
+`warnings` list says why, and the message was still sent. The old
+draft is removed only after the send went out; if that removal fails,
+the response is a success carrying a `warning` naming the draft, which
+is then still in Drafts.
 
 **Error Codes:**
 
@@ -1175,8 +1180,10 @@ went out; if that removal fails, the response is a success carrying a
 Send an HTML email directly — no draft is saved first. The body is
 composed via clipboard injection into Mail.app's rich-text compose window
 and sent immediately, with **mechanical dispatch verification**: a success
-result means the compose window closed AND a copy exists in the Sent
-mailbox (see `docs/reference/UI_GROUNDING_MAIL_SEND.md`).
+result means the compose window closed AND a message with its subject is
+in the Sent mailbox (see `docs/reference/UI_GROUNDING_MAIL_SEND.md`),
+and the response names the copy this send filed there (see **The Sent
+copy** below).
 
 Three modes:
 
@@ -1221,7 +1228,36 @@ every send path.
 **Returns:**
 
 ```json
-{"success": true, "draft_id": "", "sent_message_id": ""}
+{
+  "success": true,
+  "draft_id": "",
+  "sent_message_id": "161300",
+  "sent_rfc_message_id": "A1B2C3D4-0000-0000-0000-000000000000@example.com"
+}
+```
+
+**The Sent copy:** `sent_message_id` is Mail's id for the copy this send
+filed in Sent (the id `get_messages` takes), and `sent_rfc_message_id`
+its RFC 5322 Message-ID, bracketless as the read tools emit it. The copy
+is found by identity: the ids of the Sent mailbox (every account's) are
+taken before the compose window opens, and the copy is the one message
+in Sent with the window's subject whose id was not among them. The
+subject alone found the oldest message of that subject, so a send under
+a subject used before had its files checked on an earlier message. The
+copy is looked for at once and then every second for 30 s. When it
+cannot be identified (none appeared in that time, more than one new
+message of the subject did, or looking failed), the response is still a
+success, both ids are `""`, and a `warnings` list carries one entry
+saying why and, when files were attached, that they are unverified:
+
+```json
+{
+  "success": true,
+  "draft_id": "",
+  "sent_message_id": "",
+  "sent_rfc_message_id": "",
+  "warnings": ["The message was sent, but its copy in Sent could not be identified: no new message with its subject appeared in Sent within 30s. No id is returned, and the files it was sent with are unverified; look in Sent before sending it again."]
+}
 ```
 
 **Error Codes:**
@@ -1244,10 +1280,11 @@ every send path.
   `PASTE_FAILED:…`, `ATTACH_MISSING:…`) — the error carries the actual
   UI state; the message was NOT sent, with ONE exception: an error
   saying "message WAS sent, but the sent copy lacks [...] of the files
-  attached" means dispatch succeeded and the post-send check that the
-  Sent copy carries every file failed — inspect the Sent copy before
-  resending. A compose window a failure leaves is closed with Save, so
-  the message is in Drafts; the error ends with that outcome. When
+  attached" means dispatch succeeded and the copy this send filed in
+  Sent (named by its id in the error) does not carry every file —
+  inspect that copy before resending. A compose window a failure
+  leaves is closed with Save, so the message is in Drafts; the error
+  ends with that outcome. When
   Mail could not send through the account's server, that outcome also
   carries the text of Mail's send-error sheet ("Cannot send message
   using the server …"). While another window has its name no close is
@@ -1267,9 +1304,9 @@ reply or forward, where an empty body leaves Mail's part as Mail made
 it. Any attachments are pasted after everything else, as files. Each
 must be mechanically visible in the compose window's AX tree before
 Send is clicked (an image shows there inline, as an image, anything
-else as an attachment button), and the Sent-mailbox copy is checked
-after dispatch to carry every file, by name; a forward's carries the
-original's files as well. This is the composition every saved draft
+else as an attachment button), and the copy this send filed in Sent is
+checked after dispatch to carry every file, by name; a forward's carries
+the original's files as well. This is the composition every saved draft
 uses too (see `draft_create`). Read back from a delivered copy, a fresh
 message carries nothing quoted: no `blockquote type="cite"`, which iOS
 Mail draws as a purple bar (docs/research/icloud-draft-resync.md,

@@ -4,7 +4,7 @@ draft_delete, draft_send) — verb-split design.
 The lifecycle:
     draft_create(...) → draft_id
     [draft_update(draft_id, ...) → new draft_id]
-    draft_send(draft_id) → sent_message_id
+    draft_send(draft_id) → sent_message_id, the Sent copy's id
 
 The split exists so the outbound policy gate sits on a single, obvious
 tool — draft_send — and so failed sends leave the draft intact for
@@ -35,6 +35,18 @@ def isolated_drafts(
     """Redirect APPLE_MAIL_MCP_HOME so draft state writes don't bleed
     between tests."""
     monkeypatch.setenv("APPLE_MAIL_MCP_HOME", str(tmp_path))
+
+
+# What the connector returns for a send whose Sent copy it found, and for
+# one whose copy it could not identify.
+_FOUND = {
+    "draft_id": "", "sent_message_id": "161300",
+    "sent_rfc_message_id": "copy@example.com",
+}
+_UNIDENTIFIED = {
+    "draft_id": "", "sent_message_id": "", "sent_rfc_message_id": "",
+    "warnings": ["The message was sent, but its copy in Sent could not be identified"],
+}
 
 
 class TestDraftCreate:
@@ -1348,9 +1360,7 @@ class TestEmailSendHtmlForwards:
 
     @pytest.fixture
     def sent(self, mock_mail: MagicMock) -> MagicMock:
-        mock_mail._send_html_email.return_value = {
-            "draft_id": "", "sent_message_id": ""
-        }
+        mock_mail._send_html_email.return_value = dict(_FOUND)
         return mock_mail
 
     @pytest.mark.asyncio
@@ -1366,7 +1376,7 @@ class TestEmailSendHtmlForwards:
             forward_of="msg-1", to=["alice@example.com"], body="<p>fyi</p>",
             attachment_paths=[str(f)], from_account="Work",
         )
-        assert result == {"success": True, "draft_id": "", "sent_message_id": ""}
+        assert result == {"success": True, **_FOUND}
         kwargs = sent._send_html_email.call_args.kwargs
         assert kwargs["forward_of"] == "msg-1"
         assert kwargs["reply_to"] is None
@@ -1945,3 +1955,61 @@ class TestEachDraftToolAnswersToItsOwnName:
         self._fill_expensive_ops(leave=1)
         assert calls[tool]()["success"] is True
         assert rate_limiter.check("expensive_ops") is False
+
+
+class TestASendReturnsItsSentCopy:
+    """Both send tools hand back what the connector found of the copy the
+    send filed in Sent: its Mail id and Message-ID, or empty ids and the
+    warning saying why it was not identified. A send with a warning is
+    still a success: the message went out."""
+
+    _STATE = {
+        "draft_id": "ABCD", "to": ["alice@example.com"], "cc": [], "bcc": [],
+        "subject": "hi", "body": "x", "in_reply_to": "", "references": "",
+        "attachment_names": [],
+    }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("sent", [_FOUND, _UNIDENTIFIED])
+    async def test_email_send_html(
+        self, isolated_drafts: None, mock_mail: MagicMock, sent: dict[str, Any]
+    ) -> None:
+        from apple_mail_mcp.tools.send import email_send_html
+
+        mock_mail._send_html_email.return_value = dict(sent)
+        result = await email_send_html(
+            to=["alice@example.com"], subject="hi", body="<p>x</p>",
+        )
+        assert result == {"success": True, **sent}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("sent", [_FOUND, _UNIDENTIFIED])
+    async def test_draft_send(
+        self, isolated_drafts: None, mock_mail: MagicMock, sent: dict[str, Any]
+    ) -> None:
+        from apple_mail_mcp.tools.drafts import draft_send
+
+        mock_mail.get_draft_state.return_value = dict(self._STATE)
+        mock_mail.create_draft.return_value = dict(sent)
+        result = await draft_send(draft_id="ABCD")
+        assert result == {
+            "success": True, **sent,
+            "details": {"seed_kind": "new", "send_now": True},
+        }
+
+    @pytest.mark.asyncio
+    async def test_draft_send_keeps_the_old_drafts_warning_apart(
+        self, isolated_drafts: None, mock_mail: MagicMock
+    ) -> None:
+        """The old draft that could not be removed is a ``warning`` of its
+        own, as before; the copy not identified is in ``warnings``."""
+        from apple_mail_mcp.exceptions import MailAppleScriptError
+        from apple_mail_mcp.tools.drafts import draft_send
+
+        mock_mail.get_draft_state.return_value = dict(self._STATE)
+        mock_mail.create_draft.return_value = dict(_UNIDENTIFIED)
+        mock_mail.delete_draft.side_effect = MailAppleScriptError("Mail busy")
+        result = await draft_send(draft_id="ABCD")
+        assert result["success"] is True
+        assert result["warnings"] == _UNIDENTIFIED["warnings"]
+        assert "ABCD" in result["warning"]

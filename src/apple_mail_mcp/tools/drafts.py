@@ -7,14 +7,19 @@ Correct create → send pattern (agents: follow this exactly).
 Minimum lifecycle — 2 calls::
 
     draft_create(...)              → {"draft_id": "ABCD"}
-    draft_send(draft_id="ABCD")    → {"sent_message_id": ""}
+    draft_send(draft_id="ABCD")    → {"sent_message_id": "WXYZ"}
 
 With optional refinement (revise the draft before sending)::
 
     draft_create(...)              → {"draft_id": "ABCD"}
     draft_update(draft_id="ABCD",  → {"draft_id": "EFGH"}   # id CHANGES
                  body="revised")
-    draft_send(draft_id="EFGH")    → {"sent_message_id": ""}
+    draft_send(draft_id="EFGH")    → {"sent_message_id": "WXYZ"}
+
+``sent_message_id`` is the Mail id of the copy the send filed in Sent,
+beside its ``sent_rfc_message_id``. Both are ``""``, with a
+``warnings`` entry saying why, when that copy could not be identified;
+the message was sent either way.
 
 Sending is ALWAYS a separate call. There is no auto-send. The split
 exists so the policy gate (outbound recipient allowlist) sits at a
@@ -274,7 +279,7 @@ def _rebuild_draft(
     listed: list[str],
     carried: list[str],
     **compose: Any,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """Build a saved draft again through the connector's create_draft:
     saved, for draft_update, or sent, for draft_send. Mail forbids
     changing a saved draft, so this is how both act on one. ``compose``
@@ -483,7 +488,7 @@ def draft_create(
         >>> r["draft_id"]
         'ABCD'
         >>> draft_send(draft_id="ABCD")
-        {"success": True, "sent_message_id": ""}
+        {"success": True, "sent_message_id": "161300", ...}
     """
     if refused := check_rate_limit("draft_create", {"subject": subject, "to": to}):
         return refused
@@ -734,9 +739,13 @@ def draft_send(
             to confirm a send the allowlist does not already cover.
 
     Returns:
-        On success: ``{"success": True, "sent_message_id": "",
-        "draft_id": ""}``. ``sent_message_id`` is intentionally empty;
-        recovering the just-sent message across IMAP sync is unreliable.
+        On success: ``{"success": True, "draft_id": "", "sent_message_id":
+        <Mail id>, "sent_rfc_message_id": <Message-ID>}``, the copy the
+        send filed in Sent, which ``get_messages`` reads by that id. When
+        that copy could not be identified (not in Sent within 30 s, say),
+        both ids are ``""`` and ``warnings`` says why; the message was
+        still sent, so look in Sent before sending it again. An old draft
+        that could not be removed is named in ``warning``.
 
         On policy block:
         ``{"success": False, "error": "...", "error_type":
@@ -744,7 +753,7 @@ def draft_send(
 
     Example:
         >>> draft_send(draft_id="EFGH")
-        {"success": True, "sent_message_id": "", "draft_id": ""}
+        {"success": True, "draft_id": "", "sent_message_id": "161300", ...}
     """
     state = server.mail.get_draft_state(draft_id)
     to, cc, bcc = (list(state.get(group) or []) for group in ("to", "cc", "bcc"))
@@ -804,8 +813,7 @@ def draft_send(
     )
     response: dict[str, Any] = {
         "success": True,
-        "draft_id": result.get("draft_id", ""),
-        "sent_message_id": result.get("sent_message_id", ""),
+        **send.sent_fields(result),
         "details": {"seed_kind": source.seed_kind, "send_now": True},
     }
     if warning is not None:

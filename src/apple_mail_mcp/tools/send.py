@@ -144,6 +144,22 @@ def confirm_send(
     return _confirm_from_threadpool(ctx, summary, operation, elicit_extra)
 
 
+def sent_fields(result: dict[str, Any]) -> dict[str, Any]:
+    """What a send tool returns of the connector's result for a send that
+    went out: the Mail id (``sent_message_id``) and bare RFC Message-ID
+    (``sent_rfc_message_id``) of the copy it filed in Sent, and, when
+    that copy could not be identified, both ``""`` and the ``warnings``
+    saying why. ``draft_id`` is ``""``: a send keeps no draft."""
+    fields: dict[str, Any] = {
+        "draft_id": result.get("draft_id", ""),
+        "sent_message_id": result.get("sent_message_id", ""),
+        "sent_rfc_message_id": result.get("sent_rfc_message_id", ""),
+    }
+    if warnings := result.get("warnings"):
+        fields["warnings"] = list(warnings)
+    return fields
+
+
 def _html_send_seed(
     *,
     to: list[str],
@@ -205,8 +221,7 @@ def email_send_html(
 
     Body must be an HTML string. The email is composed via clipboard injection
     into Mail.app's rich-text compose window and sent immediately, with
-    mechanical verification of dispatch (a success result means a Sent-mailbox
-    copy exists).
+    mechanical verification of dispatch: a success result means it went out.
 
     **Fresh mail** (default): ``to`` and ``subject`` are required.
 
@@ -241,8 +256,8 @@ def email_send_html(
             on a reply or forward they go after Mail's quote or forwarded
             message. Files must exist, must not carry executable
             extensions, and must be under 25MB each. Each must be visible
-            in the compose window before Send is clicked, and the
-            Sent-mailbox copy is checked for every file by name.
+            in the compose window before Send is clicked, and the copy
+            this send filed in Sent is checked for every file by name.
         from_account: Mail.app account name or UUID. None uses Mail's
             default. Set as the sender of the message composed, in every
             mode.
@@ -251,7 +266,12 @@ def email_send_html(
             exclusive with ``reply_to``.
 
     Returns:
-        ``{"success": True, "draft_id": "", "sent_message_id": ""}`` on success.
+        ``{"success": True, "draft_id": "", "sent_message_id": <Mail id>,
+        "sent_rfc_message_id": <Message-ID>}``: the copy this send filed
+        in Sent, which ``get_messages`` reads by that id. When that copy
+        could not be identified (not in Sent within 30 s, say), both ids
+        are ``""`` and ``warnings`` says why; the message was still sent,
+        so look in Sent before sending it again.
     """
     cc_list = cc or []
     bcc_list = bcc or []
@@ -306,8 +326,4 @@ def email_send_html(
         },
         "success",
     )
-    return {
-        "success": True,
-        "draft_id": result.get("draft_id", ""),
-        "sent_message_id": result.get("sent_message_id", ""),
-    }
+    return {"success": True, **sent_fields(result)}
