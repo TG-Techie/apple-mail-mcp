@@ -45,6 +45,8 @@ Search for messages matching specified criteria.
 
 On the IMAP path, body search is server-side and sub-second. On the AppleScript fallback, body search is **dramatically slower** — measured 148s for 100 cold-cache messages on a 47k-message INBOX, vs 1s for `subject_contains` on the same slice. This is because Mail.app must read each candidate message's body from disk. To get sub-second body search, run `apple-mail-mcp setup-imap --account <name>` to enable IMAP delegation for that account.
 
+A search the AppleScript path cannot finish within the connector's timeout (60 s by default) answers `error_type: "timeout"`, not `applescript_error`: narrow it (a date bound, a sender, a smaller `limit`) and it may succeed.
+
 When the call commits to the AppleScript path **and** a body/text filter is set, the response includes a `warnings` field describing the cost — see "Warnings" below.
 
 **Warnings field:**
@@ -477,6 +479,10 @@ ones each tool is likely to meet; any tool may answer with any of these:
 - `outbound_disallowed`: A recipient is off the outbound allowlist
 - `allowlist_unavailable`: The outbound allowlist cannot be read, so nothing is sent
 - `applescript_error`: Mail.app or `osascript` failed
+- `timeout`: `osascript` did not finish within the connector's timeout
+  (60 s by default) and was killed. The call was too slow rather than
+  broken, so a narrower one may succeed; what the script had done by
+  the time it was killed is not known.
 - `unknown`: Unexpected error
 
 Refusals answer before any work is done, with their own types:

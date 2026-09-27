@@ -114,6 +114,18 @@ class MailAppleScriptError(MailError):
     pass
 
 
+class MailTimeoutError(MailAppleScriptError):
+    """osascript did not finish within the connector's timeout and was
+    killed, so what the script had done by then is unknown.
+
+    Told apart from a script that failed so a caller can see that the
+    call was too slow rather than broken (a narrower search, a smaller
+    batch, or a longer timeout may succeed). Still a
+    ``MailAppleScriptError``, so every handler of those handles it."""
+
+    pass
+
+
 class MailComposeWindowError(MailAppleScriptError):
     """A composition failed after its compose window opened, and the
     window was salvaged or discarded, or that was tried.

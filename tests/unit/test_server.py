@@ -41,6 +41,7 @@ from apple_mail_mcp.exceptions import (
     MailTemplateInvalidNameError,
     MailTemplateMissingVariableError,
     MailTemplateNotFoundError,
+    MailTimeoutError,
     MailUnsupportedGmailSystemLabelError,
     MailUnsupportedRuleActionError,
     OutboundAllowlistUnavailableError,
@@ -322,6 +323,7 @@ class TestOneErrorTable:
             (MailTemplateMissingVariableError("t"), "missing_template_variable"),
             (MailTemplateError("t"), "template_error"),
             (MailAppleScriptError("a"), "applescript_error"),
+            (MailTimeoutError("Script execution timeout after 60s"), "timeout"),
             (FileNotFoundError("f"), "file_not_found"),
             (FileExistsError("f"), "file_exists"),
             (ValueError("v"), "validation_error"),
@@ -378,6 +380,30 @@ class TestOneErrorTable:
             "success": False,
             "error": "Mail is not running",
             "error_type": "applescript_error",
+        }
+
+    def test_a_script_that_ran_out_of_time_answers_timeout(self) -> None:
+        """From osascript to the response: a script the connector killed
+        at its timeout is ``timeout``, not a script that failed, so a
+        caller can tell "try a narrower call" from "this is broken"."""
+        import subprocess
+
+        from apple_mail_mcp.mail_connector import AppleMailConnector
+
+        connector = AppleMailConnector(timeout=60)
+        with (
+            patch("apple_mail_mcp.server.mail", connector),
+            patch(
+                "subprocess.run",
+                side_effect=subprocess.TimeoutExpired("osascript", 60),
+            ),
+        ):
+            result = list_accounts()
+
+        assert result == {
+            "success": False,
+            "error": "Script execution timeout after 60s",
+            "error_type": "timeout",
         }
 
 

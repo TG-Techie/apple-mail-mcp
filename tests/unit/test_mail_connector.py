@@ -26,6 +26,7 @@ from apple_mail_mcp.exceptions import (
     MailMailboxNotFoundError,
     MailMessageNotFoundError,
     MailOutboundDisallowedError,
+    MailTimeoutError,
 )
 from apple_mail_mcp.mail_connector import AppleMailConnector, _wrap_as_json_script
 from apple_mail_mcp.utils import SANITIZE_MAX_LENGTH
@@ -89,12 +90,33 @@ class TestAppleMailConnector:
     def test_run_applescript_timeout(
         self, mock_run: MagicMock, connector: AppleMailConnector
     ) -> None:
-        """Test timeout handling."""
+        """A script osascript did not finish within the connector's
+        timeout is its own error, told apart from a script that failed,
+        and still a MailAppleScriptError to every handler of those."""
         import subprocess
         mock_run.side_effect = subprocess.TimeoutExpired("cmd", 30)
 
-        with pytest.raises(MailAppleScriptError, match="timeout"):
+        with pytest.raises(MailTimeoutError) as raised:
             connector._run_applescript("test script")
+
+        assert str(raised.value) == (
+            f"Script execution timeout after {connector.timeout}s"
+        )
+        assert isinstance(raised.value, MailAppleScriptError)
+        assert isinstance(raised.value.__cause__, subprocess.TimeoutExpired)
+
+    @patch("subprocess.run")
+    def test_a_failed_script_is_not_a_timeout(
+        self, mock_run: MagicMock, connector: AppleMailConnector
+    ) -> None:
+        mock_run.return_value = MagicMock(
+            returncode=1, stdout="", stderr="execution error: boom (-2700)"
+        )
+
+        with pytest.raises(MailAppleScriptError) as raised:
+            connector._run_applescript("test script")
+
+        assert not isinstance(raised.value, MailTimeoutError)
 
     @patch("subprocess.run")
     def test_run_applescript_curly_apostrophe_still_maps_to_typed_error(

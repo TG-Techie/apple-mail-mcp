@@ -41,6 +41,7 @@ from .exceptions import (
     MailTemplateInvalidNameError,
     MailTemplateMissingVariableError,
     MailTemplateNotFoundError,
+    MailTimeoutError,
     MailUnsupportedGmailSystemLabelError,
     MailUnsupportedRuleActionError,
     OutboundAllowlistUnavailableError,
@@ -236,6 +237,9 @@ _ERROR_TYPES: dict[type[Exception], str] = {
     FileNotFoundError: "file_not_found",
     FileExistsError: "file_exists",
     MailAppleScriptError: "applescript_error",
+    # osascript ran past the connector's timeout and was killed: the call
+    # was too slow, which is not the same as a script that failed.
+    MailTimeoutError: "timeout",
     MailAccountNotFoundError: "account_not_found",
     MailMailboxNotFoundError: "mailbox_not_found",
     MailMailboxNotEmptyError: "mailbox_not_empty",

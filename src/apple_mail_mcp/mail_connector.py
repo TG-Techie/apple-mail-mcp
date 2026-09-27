@@ -57,6 +57,7 @@ from .exceptions import (
     MailOutboundDisallowedError,
     MailRuleChangedError,
     MailRuleNotFoundError,
+    MailTimeoutError,
     MailUnsupportedGmailSystemLabelError,
     MailUnsupportedRuleActionError,
 )
@@ -1402,6 +1403,8 @@ class AppleMailConnector:
 
         Raises:
             MailAppleScriptError: If script execution fails
+            MailTimeoutError: If osascript ran past ``self.timeout`` and
+                was killed (a ``MailAppleScriptError`` too)
             MailAccountNotFoundError: If account not found
             MailMailboxNotFoundError: If mailbox not found
             MailMessageNotFoundError: If message not found
@@ -1443,7 +1446,7 @@ class AppleMailConnector:
             return output
 
         except subprocess.TimeoutExpired as e:
-            raise MailAppleScriptError(f"Script execution timeout after {self.timeout}s") from e
+            raise MailTimeoutError(f"Script execution timeout after {self.timeout}s") from e
         except Exception as e:
             if isinstance(e, (MailAccountNotFoundError, MailMailboxNotFoundError,
                             MailMessageNotFoundError, MailAppleScriptError)):
