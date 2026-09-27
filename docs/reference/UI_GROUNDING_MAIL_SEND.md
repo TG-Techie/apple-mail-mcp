@@ -105,6 +105,20 @@ the window is gone**.
    15×1s idiom).
 3. The source draft is removed from Drafts.
 
+Of these, the verified send (`_as_verified_send_block`) checks only
+the first, with a sheet on the window as the failure it can see.
+Mail closes the window when it takes the message, so the window
+gone is the send's own postcondition. The copy in Sent is a
+separate question, answered after the window is gone and by
+identity (`_find_sent_copy`): the one new message of the subject
+whose id was not in Sent before the window opened. Until
+2026-09-27 the block also polled Sent for a message with the
+subject, and by subject that check could not do its job: for a
+subject Sent already held, any older message satisfied it, and for
+a new subject whose copy took longer than the 15 s poll it would
+report a message that had gone as not sent, which invites a second
+send. The second case is read from the code, not observed.
+
 ## Mechanical read-back recipe for any UI send
 
 ```
@@ -116,13 +130,15 @@ PRECONDITIONS (verify, don't assume):
     read back equals what was written               → else fail with actual value
 ACT:
   - click the Send button (resolved by reference, never `window 1`)
-POSTCONDITIONS (poll up to ~15s):
-  - window with that name no longer exists
-  - message with that subject present in Sent mailbox
+POSTCONDITIONS (poll once a second, up to 15s):
+  - window with that name no longer exists         → SENT
   - if a sheet appeared instead: return its static-text
     contents in the error — never Cancel-and-continue blindly
-Return SENT only when all postconditions hold; anything else is a loud,
-descriptive error and the draft is left recoverable.
+  - still open at 15s, no sheet                    → fail: WINDOW_STILL_OPEN
+Return SENT only when the window is gone with no sheet; anything else
+is a loud, descriptive error, and the window is saved to Drafts so
+the message is left recoverable. Which copy in Sent is the send's is
+looked up afterwards, by identity, never here by subject.
 ```
 
 Screenshot cross-check: the computer-use screenshot of the resting state

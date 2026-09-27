@@ -45,7 +45,7 @@ _FOUND = {
 }
 _UNIDENTIFIED = {
     "draft_id": "", "sent_message_id": "", "sent_rfc_message_id": "",
-    "warnings": ["The message was sent, but its copy in Sent could not be identified"],
+    "warnings": ["Mail accepted the message, but its copy in Sent could not be identified"],
 }
 
 
@@ -1961,7 +1961,7 @@ class TestASendReturnsItsSentCopy:
     """Both send tools hand back what the connector found of the copy the
     send filed in Sent: its Mail id and Message-ID, or empty ids and the
     warning saying why it was not identified. A send with a warning is
-    still a success: the message went out."""
+    still a success: Mail accepted the message."""
 
     _STATE = {
         "draft_id": "ABCD", "to": ["alice@example.com"], "cc": [], "bcc": [],

@@ -475,7 +475,7 @@ class TestAnHtmlForwardThroughTheProtocol:
 
 
 # What the connector returns for a send whose Sent copy it found, and for
-# one whose copy it could not identify (the message went out either way).
+# one whose copy it could not identify (Mail accepted the message either way).
 _FOUND = {
     "draft_id": "", "sent_message_id": "161300",
     "sent_rfc_message_id": "copy@example.com",
@@ -483,7 +483,7 @@ _FOUND = {
 _UNIDENTIFIED = {
     "draft_id": "", "sent_message_id": "", "sent_rfc_message_id": "",
     "warnings": [
-        "The message was sent, but its copy in Sent could not be identified: "
+        "Mail accepted the message, but its copy in Sent could not be identified: "
         "no new message with its subject appeared in Sent within 30s."
     ],
 }

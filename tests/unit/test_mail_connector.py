@@ -6168,8 +6168,8 @@ class TestCreateDraft:
         self, connector: AppleMailConnector
     ) -> None:
         """Every later step addresses the window the compose script
-        reported, not a name guessed from the subject, and the send and
-        the look for its Sent copy go by the subject Mail holds."""
+        reported, not a name guessed from the subject, and the look for
+        its Sent copy goes by the subject Mail holds."""
         outcomes = _compose_outcomes("x", window="the new one", plain=True)
         outcomes[0] = _compose_meta("the new one", subject="hi")
         captured = _scripted(connector, outcomes)
@@ -6181,7 +6181,6 @@ class TestCreateDraft:
             assert 'set composeName to "the new one"' in script or (
                 'window "the new one"' in script
             )
-        assert 'set composeSubject to "hi"' in captured[3]
         assert 'sent mailbox whose subject is "hi"' in captured[4]
 
     def test_new_send_no_compose_window_raises(
@@ -6526,7 +6525,7 @@ class TestCreateDraft:
         assert result == _SENT
         # open, paste, read-back, verified send, the Sent look (two)
         assert len(scripts) == 6
-        open_s, paste_s, _, send_s, _, _ = scripts
+        open_s, paste_s, _, send_s, ids_s, _ = scripts
         assert 'whose id is "160989"' in open_s
         assert "forward origMsg opening window true" in open_s
         assert "beforeNames" in open_s
@@ -6534,7 +6533,8 @@ class TestCreateDraft:
         assert "public.utf8-plain-text" in paste_s
         assert self._NOTE in paste_s
         assert "enabled of sendBtn" in send_s
-        assert 'set composeSubject to "Fwd: Probe"' in send_s
+        assert 'set composeName to "Fwd: Probe"' in send_s
+        assert 'sent mailbox whose subject is "Fwd: Probe"' in ids_s
         assert all("set content of theMessage" not in s for s in scripts)
 
     def test_a_reply_note_is_pasted_above_the_quote(
@@ -7947,8 +7947,10 @@ class TestASendFindsItsSentCopyByIdentity:
     def test_a_copy_never_listed_is_a_warning_not_an_error(
         self, connector: AppleMailConnector, tmp_path: Path, sleeps: list[float]
     ) -> None:
-        """The message was sent: nothing is raised, no id is guessed, and
-        the files are said to be unverified, not missing."""
+        """Mail accepted the message (its window closed after Send, with no
+        sheet): nothing is raised, no id is guessed, the warning says what
+        was seen and what was not, and the files are said to be
+        unverified, not missing."""
         after, result, err = self._send(
             connector, tmp_path, _sent_mailbox([[5, 6]], ["archive.zip"]),
             files=("archive.zip",),
@@ -7964,10 +7966,12 @@ class TestASendFindsItsSentCopyByIdentity:
         assert result["sent_rfc_message_id"] == ""
         assert result["draft_id"] == ""
         [warning] = result["warnings"]
-        assert "was sent" in warning
+        assert "Mail accepted the message" in warning
+        assert "window closed after Send, with no sheet" in warning
         assert f"within {polls * interval:g}s" in warning
         assert "unverified" in warning
         assert "lacks" not in warning
+        assert "Outbox" in warning
 
     def test_without_files_the_warning_says_nothing_of_files(
         self, connector: AppleMailConnector, tmp_path: Path, sleeps: list[float]
@@ -8151,8 +8155,10 @@ class TestVerifiedSendPrimitives:
         `window 1`), existence checked, and `enabled` checked — clicking a
         disabled button is a silent no-op (the 2026-07-20 vanished send).
       - ACT: click by AX reference.
-      - POST: poll until compose window is gone AND the message appears in
-        the sent mailbox; a sheet mid-flight surfaces its static texts.
+      - POST: poll up to 15 s until the compose window is gone (SENT); a
+        sheet mid-flight surfaces its static texts (SHEET:), and a window
+        still open with no sheet is WINDOW_STILL_OPEN. The copy in Sent is
+        not the block's: the send looks for it by identity afterwards.
       - All non-SENT sentinels raise MailAppleScriptError with the detail.
     """
 
@@ -8208,23 +8214,62 @@ class TestVerifiedSendPrimitives:
         for script in self._html_scripts(connector):
             assert "set w to window 1" not in script
 
-    # -- postcondition: window gone + sent copy, sheet surfacing -----------
+    # -- postcondition: the window gone, sheet surfacing --------------------
+
+    @staticmethod
+    def _assert_the_postcondition_is_the_window(send_s: str) -> None:
+        """Gone within 15 s is SENT; a sheet is SHEET:; still open with no
+        sheet is WINDOW_STILL_OPEN. Never a Sent lookup: by subject it
+        was satisfied by any earlier message of the subject, and a copy
+        slower than 15 s would make a message that went read as not sent."""
+        assert "repeat 15 times" in send_s
+        assert 'if not winOpen then\n                    set sendOutcome to "SENT"' in send_s
+        assert '"SHEET:"' in send_s
+        assert '"WINDOW_STILL_OPEN:' in send_s
+        assert "sent mailbox" not in send_s
+        assert "composeSubject" not in send_s
+        assert "POSTCONDITION_TIMEOUT" not in send_s
 
     def test_plain_fresh_send_verifies_dispatch(
         self, connector: AppleMailConnector
     ) -> None:
         send_s = self._plain_fresh_scripts(connector)[self._SEND_AT]
-        assert "sent mailbox" in send_s
-        assert "POSTCONDITION_TIMEOUT" in send_s
-        assert "SHEET:" in send_s
+        self._assert_the_postcondition_is_the_window(send_s)
 
     def test_html_script_verifies_dispatch(
         self, connector: AppleMailConnector
     ) -> None:
         send_s = self._html_scripts(connector)[self._SEND_AT]
-        assert "sent mailbox" in send_s
-        assert "POSTCONDITION_TIMEOUT" in send_s
-        assert "SHEET:" in send_s
+        self._assert_the_postcondition_is_the_window(send_s)
+
+    def test_a_window_still_open_is_not_sent_and_is_saved_to_drafts(
+        self, connector: AppleMailConnector
+    ) -> None:
+        """WINDOW_STILL_OPEN raises, says what was seen, salvages the
+        window to Drafts, and no Sent copy is looked for."""
+        outcomes = _compose_outcomes("x", window="Probe", plain=True)
+        still_open = "WINDOW_STILL_OPEN:no sheet, still open 15s after Send on Probe"
+        captured = _scripted(
+            connector, outcomes[:self._SEND_AT] + [still_open, "SALVAGED"]
+        )
+        with pytest.raises(MailAppleScriptError, match="WINDOW_STILL_OPEN") as exc:
+            connector.create_draft(
+                seed="new", to=["test@example.com"], subject="Probe", body="x",
+                send_now=True,
+            )
+        assert "compose window: SALVAGED" in str(exc.value)
+        assert len(captured) == self._SEND_AT + 2
+        assert 'click button "Save" of first sheet' in captured[-1]
+        assert all("sent mailbox whose subject" not in s for s in captured)
+
+    def test_a_window_gone_goes_on_to_look_for_the_copy(
+        self, connector: AppleMailConnector
+    ) -> None:
+        """SENT from the block is the window gone; whether the copy
+        reached Sent is the look's to find, after it."""
+        scripts = self._plain_fresh_scripts(connector)
+        assert "click sendBtn" in scripts[self._SEND_AT]
+        assert "sent mailbox whose subject is" in scripts[self._SEND_AT + 1]
 
     # -- paste read-back (2026-07-22 raw-<p> regression) -------------------
 
@@ -8305,7 +8350,7 @@ class TestVerifiedSendPrimitives:
     @pytest.mark.parametrize(
         "sentinel",
         ["SEND_DISABLED", "SHEET:Save this message as a draft?",
-         "POSTCONDITION_TIMEOUT:window still open"],
+         "WINDOW_STILL_OPEN:window still open"],
     )
     def test_plain_fresh_sentinels_raise_with_detail(
         self, connector: AppleMailConnector, sentinel: str
@@ -8325,7 +8370,7 @@ class TestVerifiedSendPrimitives:
     @pytest.mark.parametrize(
         "sentinel",
         ["SEND_DISABLED", "SHEET:Save this message as a draft?",
-         "POSTCONDITION_TIMEOUT:window still open"],
+         "WINDOW_STILL_OPEN:window still open"],
     )
     def test_html_sentinels_raise_with_detail(
         self, connector: AppleMailConnector, sentinel: str
@@ -8429,7 +8474,7 @@ class TestVerifiedSendPrimitives:
         )
         outcomes = _compose_outcomes("<p>Hi there probe</p>", window="Probe")
         _scripted(
-            connector, outcomes[:self._SEND_AT] + ["POSTCONDITION_TIMEOUT:x", sheet]
+            connector, outcomes[:self._SEND_AT] + ["WINDOW_STILL_OPEN:x", sheet]
         )
         with pytest.raises(MailAppleScriptError) as exc:
             connector._send_html_email(
@@ -8611,14 +8656,15 @@ class TestHtmlReplyAndForward:
         would take Mail's quote or forwarded message with it. The content
         is never set, and the window's Send button sends."""
         scripts = self._send(connector, seed)
-        _, paste_s, readback_s, send_s, _, _ = scripts
+        _, paste_s, readback_s, send_s, ids_s, _ = scripts
         assert "key code 126 using command down" in paste_s
         assert "public.html" in paste_s
         assert 'keystroke "a" using command down' not in paste_s
         assert "key code 51" not in paste_s
         assert "AXWebArea" in readback_s
         assert "enabled of sendBtn" in send_s
-        assert f'set composeSubject to "{self._WINDOW[seed]}"' in send_s
+        assert f'set composeName to "{self._WINDOW[seed]}"' in send_s
+        assert f'sent mailbox whose subject is "{self._WINDOW[seed]}"' in ids_s
         assert all("set content" not in s for s in scripts)
 
     @pytest.mark.parametrize("seed", ["reply", "forward"])

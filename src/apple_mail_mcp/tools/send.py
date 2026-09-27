@@ -145,8 +145,8 @@ def confirm_send(
 
 
 def sent_fields(result: dict[str, Any]) -> dict[str, Any]:
-    """What a send tool returns of the connector's result for a send that
-    went out: the Mail id (``sent_message_id``) and bare RFC Message-ID
+    """What a send tool returns of the connector's result for a send Mail
+    accepted: the Mail id (``sent_message_id``) and bare RFC Message-ID
     (``sent_rfc_message_id``) of the copy it filed in Sent, and, when
     that copy could not be identified, both ``""`` and the ``warnings``
     saying why. ``draft_id`` is ``""``: a send keeps no draft."""
@@ -221,7 +221,9 @@ def email_send_html(
 
     Body must be an HTML string. The email is composed via clipboard injection
     into Mail.app's rich-text compose window and sent immediately, with
-    mechanical verification of dispatch: a success result means it went out.
+    mechanical verification of dispatch: a success result means Mail
+    accepted the message (its compose window closed after Send, with no
+    sheet), and the ids returned name the copy it filed in Sent.
 
     **Fresh mail** (default): ``to`` and ``subject`` are required.
 
@@ -270,8 +272,9 @@ def email_send_html(
         "sent_rfc_message_id": <Message-ID>}``: the copy this send filed
         in Sent, which ``get_messages`` reads by that id. When that copy
         could not be identified (not in Sent within 30 s, say), both ids
-        are ``""`` and ``warnings`` says why; the message was still sent,
-        so look in Sent before sending it again.
+        are ``""`` and ``warnings`` says why; Mail still accepted the
+        message, so look in Sent and in Mail's Outbox before sending it
+        again.
     """
     cc_list = cc or []
     bcc_list = bcc or []

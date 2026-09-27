@@ -19,7 +19,7 @@ With optional refinement (revise the draft before sending)::
 ``sent_message_id`` is the Mail id of the copy the send filed in Sent,
 beside its ``sent_rfc_message_id``. Both are ``""``, with a
 ``warnings`` entry saying why, when that copy could not be identified;
-the message was sent either way.
+Mail accepted the message either way.
 
 Sending is ALWAYS a separate call. There is no auto-send. The split
 exists so the policy gate (outbound recipient allowlist) sits at a
@@ -743,9 +743,10 @@ def draft_send(
         <Mail id>, "sent_rfc_message_id": <Message-ID>}``, the copy the
         send filed in Sent, which ``get_messages`` reads by that id. When
         that copy could not be identified (not in Sent within 30 s, say),
-        both ids are ``""`` and ``warnings`` says why; the message was
-        still sent, so look in Sent before sending it again. An old draft
-        that could not be removed is named in ``warning``.
+        both ids are ``""`` and ``warnings`` says why; Mail still accepted
+        the message, so look in Sent and in Mail's Outbox before sending
+        it again. An old draft that could not be removed is named in
+        ``warning``.
 
         On policy block:
         ``{"success": False, "error": "...", "error_type":

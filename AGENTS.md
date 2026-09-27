@@ -64,7 +64,7 @@ draft_send(draft_id="EFGH")    → {"sent_message_id": "WXYZ"}
 ``sent_message_id`` is the Mail id of the copy the send filed in Sent,
 beside its ``sent_rfc_message_id``; both are ``""``, with a
 ``warnings`` entry saying why, when that copy could not be identified.
-The message was sent either way.
+Mail accepted the message either way.
 
 ``draft_update`` is implemented as recreate-then-delete; the returned id
 is a NEW id, and the old draft is removed only after the new one exists,

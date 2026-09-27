@@ -1152,10 +1152,10 @@ read out of the draft first and pasted after everything else.
 `sent_message_id` and `sent_rfc_message_id` name the copy the send
 filed in Sent, found as `email_send_html` finds it (see **The Sent
 copy** there); when it could not be identified both are `""` and a
-`warnings` list says why, and the message was still sent. The old
-draft is removed only after the send went out; if that removal fails,
-the response is a success carrying a `warning` naming the draft, which
-is then still in Drafts.
+`warnings` list says why, and Mail still accepted the message. The
+old draft is removed only after Mail accepted the send; if that
+removal fails, the response is a success carrying a `warning` naming
+the draft, which is then still in Drafts.
 
 **Error Codes:**
 
@@ -1180,10 +1180,10 @@ is then still in Drafts.
 Send an HTML email directly — no draft is saved first. The body is
 composed via clipboard injection into Mail.app's rich-text compose window
 and sent immediately, with **mechanical dispatch verification**: a success
-result means the compose window closed AND a message with its subject is
-in the Sent mailbox (see `docs/reference/UI_GROUNDING_MAIL_SEND.md`),
-and the response names the copy this send filed there (see **The Sent
-copy** below).
+result means Mail accepted the message, its compose window closing after
+Send with no sheet on it (see `docs/reference/UI_GROUNDING_MAIL_SEND.md`),
+and the response names the copy this send filed in Sent, found by
+identity (see **The Sent copy** below).
 
 Three modes:
 
@@ -1243,8 +1243,12 @@ is found by identity: the ids of the Sent mailbox (every account's) are
 taken before the compose window opens, and the copy is the one message
 in Sent with the window's subject whose id was not among them. The
 subject alone found the oldest message of that subject, so a send under
-a subject used before had its files checked on an earlier message. The
-copy is looked for at once and then every second for 30 s. When it
+a subject used before had its files checked on an earlier message; and
+the verified send, which once also waited 15 s for a message of the
+subject in Sent, would report a message whose new subject's copy was
+slower than that as not sent, though it had gone. The copy is looked
+for once the window has closed, at once and then every second for
+30 s. When it
 cannot be identified (none appeared in that time, more than one new
 message of the subject did, or looking failed), the response is still a
 success, both ids are `""`, and a `warnings` list carries one entry
@@ -1256,7 +1260,7 @@ saying why and, when files were attached, that they are unverified:
   "draft_id": "",
   "sent_message_id": "",
   "sent_rfc_message_id": "",
-  "warnings": ["The message was sent, but its copy in Sent could not be identified: no new message with its subject appeared in Sent within 30s. No id is returned, and the files it was sent with are unverified; look in Sent before sending it again."]
+  "warnings": ["Mail accepted the message (its compose window closed after Send, with no sheet), but its copy in Sent could not be identified: no new message with its subject appeared in Sent within 30s. No id is returned, and the files it was sent with are unverified; look in Sent and in Mail's Outbox before sending it again."]
 }
 ```
 
@@ -1275,7 +1279,8 @@ saying why and, when files were attached, that they are unverified:
 - `file_not_found` / `validation_error` (attachments): a listed file is
   missing, has a blocked extension, or exceeds 25MB — nothing was sent.
 - `applescript_error`: a mechanical read-back failed
-  (`SEND_DISABLED`, `SHEET:…`, `POSTCONDITION_TIMEOUT:…`,
+  (`SEND_DISABLED`, `SHEET:…`, `WINDOW_STILL_OPEN:…` (the window was
+  still open 15 s after Send was clicked, with no sheet on it),
   `NO_COMPOSE_WINDOW:…`, `COMPOSE_WINDOW_NOT_UNIQUE:…`, `NO_BODY_AREA`,
   `PASTE_FAILED:…`, `ATTACH_MISSING:…`) — the error carries the actual
   UI state; the message was NOT sent, with ONE exception: an error

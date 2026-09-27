@@ -221,7 +221,7 @@ def _compose_window_from_report(report: dict[str, Any]) -> _ComposeWindow:
     )
 
 
-# What a send that went out finds of the copy it filed in Sent. Exactly
+# What a send Mail accepted finds of the copy it filed in Sent. Exactly
 # one of the two: the copy, found by identity, or why none was. With the
 # files pasted, that makes three endings and no others (``_sent_ending``):
 # the copy carries every file, and the send returns its ids; it lacks
@@ -244,8 +244,9 @@ class _SentCopy:
 @dataclass(frozen=True)
 class _SentCopyUnidentified:
     """A send whose copy in Sent could not be told: none appeared in time,
-    more than one did, or looking failed; ``why`` says which. The message
-    went out either way: the verified send saw it go."""
+    more than one did, or looking failed; ``why`` says which. Mail accepted
+    the message either way: the verified send saw its window close after
+    Send with no sheet on it. Nothing after that has been seen of it."""
 
     why: str
 
@@ -253,7 +254,7 @@ class _SentCopyUnidentified:
 def _sent_result(
     copy: _SentCopy | _SentCopyUnidentified, *, files_pasted: bool
 ) -> dict[str, Any]:
-    """What a send that went out returns: the copy's Mail id, which
+    """What a send Mail accepted returns: the copy's Mail id, which
     ``get_messages`` takes, and its RFC Message-ID; or, for a copy not
     identified, no id and one warning saying why, and that the files,
     when there were any, are unverified rather than missing."""
@@ -271,9 +272,10 @@ def _sent_result(
         "sent_message_id": "",
         "sent_rfc_message_id": "",
         "warnings": [
-            f"The message was sent, but its copy in Sent could not be "
-            f"identified: {copy.why}. No id is returned{unverified}; "
-            "look in Sent before sending it again."
+            "Mail accepted the message (its compose window closed after "
+            "Send, with no sheet), but its copy in Sent could not be "
+            f"identified: {copy.why}. No id is returned{unverified}; look "
+            "in Sent and in Mail's Outbox before sending it again."
         ],
     }
 
@@ -793,18 +795,18 @@ class AppleMailConnector:
     _DRAFT_SETTLE_S = 1.0
     # How long a send looks for the copy it filed in Sent once the
     # verified send has seen its window go: one look at once, then 30
-    # more 1 s apart. For a subject Sent did not hold, the verified send
-    # has already seen a copy with it, so the first look finds it; for
-    # one it held, that older copy satisfied the verified send and the
-    # new one may still be coming. 30 s is what the integration suite
-    # allows a Sent copy after a send returns (SENT_COPY_TIMEOUT_S,
+    # more 1 s apart. The verified send has seen no copy, only the window
+    # closing, so the copy may not be filed yet on any look but the last,
+    # whatever the subject. 30 s is what the integration suite allows a
+    # Sent copy after a send returns (SENT_COPY_TIMEOUT_S,
     # tests/integration/mail_readback.py), and every copy it has read
     # arrived within it, a forward with three files among them; the
     # send's grounding saw copies appear "within seconds"
     # (docs/reference/UI_GROUNDING_MAIL_SEND.md). How long the copy of a
     # large attachment takes is unmeasured. The looks are separate
     # scripts, so the Mail lock is free between them, and a copy not seen
-    # in time is a warning, never an error: the message went out.
+    # in time is a warning, never an error: Mail accepted the message when
+    # it closed the window.
     _SENT_APPEAR_POLLS = 30
     _SENT_APPEAR_INTERVAL_S = 1.0
 
@@ -4409,25 +4411,34 @@ class AppleMailConnector:
         read-back (Phase 0 of PLAN-html-reply-send, grounded in
         docs/reference/UI_GROUNDING_MAIL_SEND.md).
 
-        Caller must set two AppleScript variables beforehand:
-          - ``composeName``    — the compose window's exact AX name
-          - ``composeSubject`` — the message subject ("" skips the
-            sent-copy check; Mail names subjectless windows
-            "New Message", which never matches a subject search)
+        Caller must set ``composeName``, the compose window's exact AX
+        name, beforehand.
 
         The fragment sets ``sendOutcome`` to one of:
           "SENT" | "WINDOW_NOT_FOUND:…" | "NO_SEND_BUTTON:…" |
-          "SEND_DISABLED:…" | "SHEET:…" | "POSTCONDITION_TIMEOUT:…"
-        It never returns early, so callers can run cleanup (e.g. clipboard
-        restore) before returning ``sendOutcome``.
+          "SEND_DISABLED:…" | "SHEET:…" | "WINDOW_STILL_OPEN:…"
+        After the click it polls the window, once a second for 15 s: gone
+        is SENT, since Mail closes the window when it takes the message;
+        a sheet on it is SHEET:… with the sheet's text; still open with no
+        sheet at the end is WINDOW_STILL_OPEN:…, not sent, which the
+        caller's salvage saves to Drafts. It never returns early, so
+        callers can run cleanup (e.g. clipboard restore) before returning
+        ``sendOutcome``.
 
-        Why each check exists (all observed live, 2026-07-20):
+        Why each check exists (observed live, 2026-07-20, unless noted):
           - window resolved BY NAME — ``window 1`` may be the viewer;
           - ``enabled`` gate — clicking a disabled Send button is a silent
             no-op (the vanished-send mechanism);
           - sheet surfacing — a mid-send sheet means NOT dispatched; its
             static texts go into the outcome instead of a blind Cancel;
-          - sent-copy poll — window-gone alone does not prove dispatch.
+          - the window gone, and nothing about Sent. This block once also
+            waited for a message with the subject in Sent. For a subject
+            Sent already held, any earlier message satisfied that; for a
+            new one, a copy slower than 15 s would make a message that
+            went read as not sent, inviting a second send. That is read
+            from the code (2026-09-27), not seen happen. Which copy the
+            send filed is looked for afterwards, by identity
+            (``_find_sent_copy``).
         """
         return """
         set sendOutcome to missing value
@@ -4469,7 +4480,6 @@ class AppleMailConnector:
             end if
         end if
         if sendOutcome is missing value then
-            set dispatched to false
             repeat 15 times
                 delay 1
                 set winOpen to false
@@ -4495,22 +4505,12 @@ class AppleMailConnector:
                     exit repeat
                 end if
                 if not winOpen then
-                    if composeSubject is "" then
-                        set dispatched to true
-                    else
-                        tell application "Mail"
-                            if (count of (messages of sent mailbox whose subject is composeSubject)) > 0 then set dispatched to true
-                        end tell
-                    end if
+                    set sendOutcome to "SENT"
+                    exit repeat
                 end if
-                if dispatched then exit repeat
             end repeat
             if sendOutcome is missing value then
-                if dispatched then
-                    set sendOutcome to "SENT"
-                else
-                    set sendOutcome to "POSTCONDITION_TIMEOUT:window-gone/sent-copy not both confirmed within 15s for " & composeName
-                end if
+                set sendOutcome to "WINDOW_STILL_OPEN:no sheet, and still open 15s after Send was clicked on " & composeName
             end if
         end if
         """
@@ -5359,15 +5359,13 @@ end tell
             window.to or None, window.cc or None, window.bcc or None, seed="new"
         )
 
-    def _send_compose_window(self, window_name: str, sent_subject: str) -> None:
+    def _send_compose_window(self, window_name: str) -> None:
         """Run the verified send on the named compose window; on any
         outcome but SENT the window is salvaged to Drafts and the outcome
         raised."""
         win_safe = escape_applescript_string(window_name)
-        subject_safe = escape_applescript_string(sent_subject)
         send_script = (
             f'set composeName to "{win_safe}"\n'
-            f'set composeSubject to "{subject_safe}"\n'
             + self._as_verified_send_block()
             + "\nreturn sendOutcome"
         )
@@ -5470,7 +5468,7 @@ end tell
     def _sent_ending(
         self, window: _ComposeWindow, files: list[Path]
     ) -> dict[str, Any]:
-        """What a send that went out returns, by the copy it filed in
+        """What a send Mail accepted returns, by the copy it filed in
         Sent (``_find_sent_copy``): found, it must carry every file the
         composition pasted, by name, and its ids are returned; not
         identified, no id is returned, with a warning saying why
@@ -5508,8 +5506,8 @@ end tell
         ``_SENT_APPEAR_INTERVAL_S`` for ``_SENT_APPEAR_POLLS`` more looks,
         each its own script. More than one new message with the subject
         (another send of it since the window opened) is not guessed
-        between. Never raises: the message went out, and what fails here
-        is only knowing which copy is its."""
+        between. Never raises: Mail accepted the message, and what fails
+        here is only knowing which copy is its."""
         before = set(before_ids)
         try:
             for look in range(self._SENT_APPEAR_POLLS + 1):
@@ -5866,7 +5864,7 @@ end if
                 window.name, seed=seed, body=body, plain=plain, files=files
             )
             if send_now:
-                self._send_compose_window(window.name, window.subject)
+                self._send_compose_window(window.name)
                 end_window(Closed(how="sent", by="composition", at=time.time()))
                 return self._sent_ending(window, files)
             try:
