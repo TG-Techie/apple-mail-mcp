@@ -4463,6 +4463,52 @@ class TestRecipientFields:
             assert applescript_row[key] == imap_row[key], key
         assert applescript_row["to"] == _RECIPIENT_ROWS["to"]
 
+    @patch("apple_mail_mcp.imap_connector.IMAPClient")
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_the_two_paths_agree_on_a_non_ascii_name(
+        self,
+        mock_run: MagicMock,
+        mock_imap_cls: MagicMock,
+        connector: AppleMailConnector,
+    ) -> None:
+        """The ENVELOPE carries the header's RFC 2047 encoded-words and
+        the IMAP path decodes them. Mail's side here is the decoded
+        text, which is what Mail is expected to hand back; it was not
+        observed live, the test account holding no encoded-word name
+        when this was written."""
+        from datetime import datetime
+
+        from imapclient.response_types import Address, Envelope
+
+        from apple_mail_mcp.imap_connector import ImapConnector
+
+        mock_run.return_value = json.dumps({"messages": [_as_record(
+            to=[{"name": "Jörg Müller", "address": "jorg@example.com"}],
+            cc=[], bcc=[],
+        )], "warnings": []})
+        [applescript_row] = connector._search_messages_applescript(
+            "Gmail", "INBOX"
+        )
+
+        client = MagicMock()
+        mock_imap_cls.return_value = client
+        client.search.return_value = [1]
+        client.fetch.return_value = {1: {b"FLAGS": (), b"ENVELOPE": Envelope(
+            date=datetime(2026, 1, 1), subject=b"Q3",
+            from_=(Address(None, None, b"a", b"example.com"),),
+            sender=None, reply_to=None,
+            to=(Address(
+                b"=?UTF-8?Q?J=C3=B6rg_M=C3=BCller?=", None, b"jorg", b"example.com"
+            ),),
+            cc=None, bcc=None,
+            in_reply_to=None, message_id=b"<m-100@example.com>",
+        )}}
+        [imap_row] = ImapConnector("h", 993, "u@e.com", "pw").search_messages()
+
+        assert applescript_row["to"] == imap_row["to"] == [
+            "Jörg Müller <jorg@example.com>"
+        ]
+
 
 class TestDualEmitRfcMessageId:
     """#148: every read-tool row carries an `rfc_message_id` field

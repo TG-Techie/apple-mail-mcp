@@ -581,6 +581,44 @@ class TestEnvelopeRecipients:
         assert msg["cc"] == []
 
     @patch("apple_mail_mcp.imap_connector.IMAPClient")
+    def test_an_encoded_word_name_is_decoded(self, mock_cls):
+        """The ENVELOPE carries a display name as the header has it, so
+        a non-ASCII name arrives as RFC 2047 encoded-words; Mail hands
+        back the decoded name, and the IMAP row says what Mail says."""
+        _mock_client_returning(mock_cls, _fake_envelope(
+            to=(Address(
+                b"=?UTF-8?Q?J=C3=B6rg_M=C3=BCller?=", None, b"jorg", b"example.com"
+            ),),
+            cc=(Address(
+                b"=?iso-8859-1?q?Andr=E9?= Smith", None, b"andre", b"example.com"
+            ),),
+        ))
+        [msg] = ImapConnector("h", 993, "u@e.com", "pw").search_messages()
+        assert msg["to"] == ["Jörg Müller <jorg@example.com>"]
+        assert msg["cc"] == ["André Smith <andre@example.com>"]
+
+    @patch("apple_mail_mcp.imap_connector.IMAPClient")
+    def test_the_sender_name_is_decoded_too(self, mock_cls):
+        _mock_client_returning(mock_cls, _fake_envelope(
+            sender_name=b"=?UTF-8?B?SsO2cmc=?=",
+        ))
+        [msg] = ImapConnector("h", 993, "u@e.com", "pw").search_messages()
+        assert msg["sender"] == "Jörg <alice@example.com>"
+
+    @pytest.mark.parametrize("raw", [
+        b"=?UTF-8?B?not base64!?=",   # malformed encoded-word
+        b"=?x-unknown?Q?abc?=",       # charset Python does not know
+    ])
+    @patch("apple_mail_mcp.imap_connector.IMAPClient")
+    def test_a_name_that_will_not_decode_is_left_as_written(self, mock_cls, raw):
+        """The header's own text, not a guess and not a failed search."""
+        _mock_client_returning(mock_cls, _fake_envelope(
+            to=(Address(raw, None, b"x", b"example.com"),),
+        ))
+        [msg] = ImapConnector("h", 993, "u@e.com", "pw").search_messages()
+        assert msg["to"] == [f"{raw.decode()} <x@example.com>"]
+
+    @patch("apple_mail_mcp.imap_connector.IMAPClient")
     def test_get_message_row_carries_them(self, mock_cls):
         _mock_client_returning(
             mock_cls, _fake_envelope(to=(_JANE,), cc=(_OPS,))

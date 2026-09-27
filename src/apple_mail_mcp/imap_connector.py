@@ -32,6 +32,8 @@ from dataclasses import dataclass, field
 from datetime import date as _date
 from datetime import datetime as _datetime
 from datetime import timedelta as _timedelta
+from email.errors import HeaderParseError
+from email.header import decode_header, make_header
 from typing import Any, cast
 
 from imapclient import IMAPClient
@@ -328,13 +330,32 @@ def _flatten_one(node: Any, out: set[int]) -> None:
             pass
 
 
+def _decode_display_name(raw: bytes | bytearray | str | None) -> str:
+    """A display name as a reader sees it.
+
+    The ENVELOPE carries the name as the header has it, so a non-ASCII
+    name arrives as RFC 2047 encoded-words (``=?UTF-8?Q?J=C3=B6rg?=``);
+    Mail's ``sender`` and recipient ``name`` are the decoded text, and
+    an IMAP row says what the AppleScript row says. A name that will not
+    decode (a malformed encoded-word, a charset Python does not know) is
+    left as the header wrote it.
+    """
+    text = _decode(raw)
+    if "=?" not in text:
+        return text
+    try:
+        return str(make_header(decode_header(text)))
+    except (HeaderParseError, ValueError, LookupError):
+        return text
+
+
 def _address_parts(address: Address) -> tuple[str, str]:
     """``(display name, address)`` of one ENVELOPE address, for
     ``format_address``."""
     mailbox = _decode(address.mailbox)
     host = _decode(address.host)
     email = f"{mailbox}@{host}" if mailbox and host else mailbox or ""
-    return _decode(address.name), email
+    return _decode_display_name(address.name), email
 
 
 def _format_sender(envelope: Envelope) -> str:
