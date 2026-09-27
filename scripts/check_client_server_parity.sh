@@ -10,8 +10,12 @@ echo "Checking client-server parity..."
 # Extract public methods from connector (exclude __init__, _private)
 CONNECTOR_METHODS=$(grep -E '^\s+def [a-z]' "$CONNECTOR" | grep -v '^\s+def _' | sed 's/.*def \([a-z_]*\)(.*/\1/' | sort)
 
-# Extract @mcp.tool() decorated functions from server
-SERVER_TOOLS=$(grep -A1 '@mcp.tool' "$SERVER" | grep 'def ' | sed 's/.*def \([a-z_]*\)(.*/\1/' | sort)
+# Extract @mcp.tool() decorated functions from server: the def that
+# follows each registration, through any decorators stacked beneath it.
+SERVER_TOOLS=$(awk '
+    /^@mcp\.tool/ { want = 1; next }
+    want && /^(async )?def / { sub(/^(async )?def /, ""); sub(/\(.*/, ""); print; want = 0 }
+' "$SERVER" | sort)
 
 echo ""
 echo "Connector public methods:"

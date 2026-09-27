@@ -131,8 +131,9 @@ search_messages(
 
 **Error Codes:**
 
+- `validation_error`: Malformed date, or neither `account` nor `source` given
 - `account_not_found`: Specified account doesn't exist
-- `not_found`: Mailbox not found
+- `mailbox_not_found`: Mailbox not found
 - `unknown`: Unexpected error occurred
 
 ---
@@ -400,7 +401,7 @@ update_message(
 
 - `validation_error`: Too many IDs, no fields set, or missing `account` for move
 - `account_not_found`: `account` does not match a configured Mail.app account
-- `not_found`: `destination_mailbox` not found on the account
+- `mailbox_not_found`: `destination_mailbox` not found on the account
 - `unknown`: Unexpected error occurred
 
 ---
@@ -439,15 +440,30 @@ All tools return a consistent error format:
 }
 ```
 
-**Common Error Types:**
+Every tool turns a failure into its `error_type` through one table, so a
+failure answers with the same type whichever tool met it, and `error` is
+the failure's own message. The per-tool lists in this document name the
+ones each tool is likely to meet; any tool may answer with any of these:
 
+- `validation_error`: Invalid parameters
 - `account_not_found`: Account doesn't exist
 - `mailbox_not_found`: Mailbox doesn't exist
+- `mailbox_not_empty`: Mailbox still holds messages
 - `message_not_found`: Message doesn't exist or was deleted
-- `validation_error`: Invalid parameters
-- `permission_error`: Insufficient permissions
-- `cancelled`: User cancelled the operation
+- `file_not_found`: A file or directory the call names doesn't exist
+- `file_exists`: A file the call would write is already there
+- `imap_required`, `unsupported_gmail_system_label`: A mailbox operation this account cannot do
+- `rule_not_found`, `rule_changed`, `unsupported_rule_action`: Rules
+- `draft_not_found`, `invalid_draft_id`, `draft_not_settled`, `draft_error`: Drafts
+- `template_not_found`, `template_exists`, `invalid_template_name`, `invalid_template_format`, `missing_template_variable`, `template_error`: Templates
+- `outbound_disallowed`: A recipient is off the outbound allowlist
+- `allowlist_unavailable`: The outbound allowlist cannot be read, so nothing is sent
+- `applescript_error`: Mail.app or `osascript` failed
 - `unknown`: Unexpected error
+
+Refusals answer before any work is done, with their own types:
+`rate_limited`, `safety_violation` (test mode), `confirmation_required`
+and `cancelled` (the confirmation prompt).
 
 ---
 
@@ -591,6 +607,15 @@ save_attachments(
 - Existing files are never replaced unless `overwrite=True`; a collision is
   refused before anything is written (`file_exists`). Attachments that share
   a name within one message are saved as `name.ext`, `name (2).ext`, …
+
+**Error Codes:**
+
+- `directory_not_found` / `invalid_directory`: `save_directory` is missing or is not a directory.
+- `file_exists`: A name is already taken and `overwrite` is false; nothing was written.
+- `file_not_found`: The directory was removed after that check, before the save.
+- `validation_error`: An index the message does not have; nothing was written.
+- `message_not_found`: The message doesn't exist or was deleted.
+- `unknown`: Unexpected error.
 
 ---
 

@@ -4060,9 +4060,13 @@ class TestAppleMailConnector:
     def test_get_thread_anchor_not_found_raises(
         self, mock_run: MagicMock, connector: AppleMailConnector
     ) -> None:
-        """Anchor lookup failure propagates MailMessageNotFoundError."""
-        mock_run.side_effect = MailMessageNotFoundError("Can't get message")
-        with pytest.raises(MailMessageNotFoundError):
+        """Anchor lookup failure propagates MailMessageNotFoundError, and
+        names the id: the script's own error says only "not found", and
+        the tool passes the message through as it is."""
+        mock_run.side_effect = MailMessageNotFoundError(
+            "execution error: Can't get message: not found (-2700)"
+        )
+        with pytest.raises(MailMessageNotFoundError, match="'99999'"):
             connector._get_thread_applescript("99999")
 
     @patch.object(AppleMailConnector, "_run_applescript")
@@ -4583,8 +4587,12 @@ class TestSaveAttachmentsDoesNotOverwriteUnasked:
     ) -> None:
         (tmp_path / "report.pdf").write_bytes(b"mine")
         mock_run.side_effect = [self._enumeration("report.pdf", "other.pdf")]
-        with pytest.raises(FileExistsError, match="report.pdf"):
+        with pytest.raises(FileExistsError, match="report.pdf") as refused:
             connector.save_attachments("12345", tmp_path)
+        # The refusal says what happened and what to do; the tool passes
+        # it through as it is.
+        assert "nothing was written" in str(refused.value)
+        assert "overwrite=True" in str(refused.value)
         assert mock_run.call_count == 1, "pass 2 must not run"
         assert (tmp_path / "report.pdf").read_bytes() == b"mine"
         assert not (tmp_path / "other.pdf").exists(), "nothing is written on a refusal"
@@ -4636,6 +4644,18 @@ class TestSaveAttachmentsRefusesIndicesTheMessageDoesNotHave:
             for n in names
         )
         return f'{{"attachments":[{rows}],"warnings":[]}}'
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    def test_a_message_that_is_not_there_is_named(
+        self, mock_run: MagicMock, connector: AppleMailConnector, tmp_path: Path
+    ) -> None:
+        """The lookup script's error says only "not found"; the id is
+        named here because the tool passes the message through as it is."""
+        mock_run.side_effect = MailMessageNotFoundError(
+            "execution error: Can't get message: not found (-2700)"
+        )
+        with pytest.raises(MailMessageNotFoundError, match="'12345'"):
+            connector.save_attachments("12345", tmp_path)
 
     @patch.object(AppleMailConnector, "_run_applescript")
     def test_an_index_past_the_end_is_refused_by_name(

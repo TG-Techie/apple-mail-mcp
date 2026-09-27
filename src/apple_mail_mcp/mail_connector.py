@@ -1932,7 +1932,11 @@ class AppleMailConnector:
         '''
 
         script = _wrap_as_json_script(tell_body, timeout=self.timeout)
-        result = self._run_applescript(script)
+        try:
+            result = self._run_applescript(script)
+        except MailMessageNotFoundError as e:
+            # The script's error says only "not found"; say which.
+            raise MailMessageNotFoundError(f"Message {message_id!r} not found") from e
         parsed = cast(dict[str, Any], parse_applescript_json(result))
         attachments = cast(
             list[dict[str, Any]], parsed.get("attachments") or []
@@ -2699,7 +2703,11 @@ class AppleMailConnector:
         '''
 
         anchor_script = _wrap_as_json_script(anchor_body, timeout=self.timeout)
-        anchor_raw = self._run_applescript(anchor_script)
+        try:
+            anchor_raw = self._run_applescript(anchor_script)
+        except MailMessageNotFoundError as e:
+            # The script's error says only "not found"; say which.
+            raise MailMessageNotFoundError(f"Message {message_id!r} not found") from e
         raw = cast(dict[str, Any], parse_applescript_json(anchor_raw))
 
         in_reply_to_raw = raw.get("in_reply_to") or ""
@@ -2848,7 +2856,7 @@ class AppleMailConnector:
         so two attachments sharing a name land in two files, and unless
         ``overwrite`` is set every name is checked against the directory
         before anything is written. Raises ``FileExistsError`` naming the
-        taken files.
+        taken files and saying how to replace them.
         """
         names = distinct_filenames([
             safe_attachment_filename(
@@ -2860,7 +2868,10 @@ class AppleMailConnector:
             return names
         taken = [n for n in names if (save_directory / n).exists()]
         if taken:
-            raise FileExistsError("already in the directory: " + ", ".join(taken))
+            raise FileExistsError(
+                "already in the directory: " + ", ".join(taken)
+                + "; nothing was written. Pass overwrite=True to replace it."
+            )
         return names
 
     def save_attachments(

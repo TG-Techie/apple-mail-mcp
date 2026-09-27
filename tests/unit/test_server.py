@@ -22,8 +22,27 @@ from fastmcp.server.elicitation import (
 from apple_mail_mcp.exceptions import (
     MailAccountNotFoundError,
     MailAppleScriptError,
+    MailDraftError,
+    MailDraftInvalidIdError,
+    MailDraftNotFoundError,
+    MailDraftNotSettledError,
+    MailImapRequiredError,
+    MailKeychainError,
+    MailMailboxNotEmptyError,
     MailMailboxNotFoundError,
     MailMessageNotFoundError,
+    MailOutboundDisallowedError,
+    MailRuleChangedError,
+    MailRuleNotFoundError,
+    MailTemplateError,
+    MailTemplateExistsError,
+    MailTemplateInvalidFormatError,
+    MailTemplateInvalidNameError,
+    MailTemplateMissingVariableError,
+    MailTemplateNotFoundError,
+    MailUnsupportedGmailSystemLabelError,
+    MailUnsupportedRuleActionError,
+    OutboundAllowlistUnavailableError,
 )
 from apple_mail_mcp.server import (
     _elicit_confirmation,
@@ -32,6 +51,7 @@ from apple_mail_mcp.server import (
     delete_messages,
     delete_rule,
     delete_template,
+    error_response,
     get_messages,
     get_template,
     get_thread,
@@ -254,6 +274,104 @@ class TestRegisterPoolAtexit:
         registered = mock_atexit.register.call_args.args[0]
         registered()
         pool.close.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# The error table: one mapping from exception to error_type for every tool
+# ---------------------------------------------------------------------------
+
+
+class TestOneErrorTable:
+    """Every tool turns what it raises into a response through one table,
+    so a class answers with the same error_type whichever tool raised it.
+    Before, each tool carried its own ladder, and the ladders disagreed
+    (a missing mailbox was ``not_found`` in two tools and
+    ``mailbox_not_found`` in two others) or stopped short (a class a
+    ladder did not name came back as ``unknown``)."""
+
+    @pytest.mark.parametrize(
+        ("raised", "error_type"),
+        [
+            (OutboundAllowlistUnavailableError("comms config unreadable"),
+             "allowlist_unavailable"),
+            (MailOutboundDisallowedError("off the allowlist"), "outbound_disallowed"),
+            (MailAccountNotFoundError("a"), "account_not_found"),
+            (MailMailboxNotFoundError("m"), "mailbox_not_found"),
+            (MailMailboxNotEmptyError("m"), "mailbox_not_empty"),
+            (MailMessageNotFoundError("m"), "message_not_found"),
+            (MailImapRequiredError("i"), "imap_required"),
+            (MailUnsupportedGmailSystemLabelError("g"), "unsupported_gmail_system_label"),
+            (MailRuleNotFoundError("r"), "rule_not_found"),
+            (MailRuleChangedError(1, "Junk", "News"), "rule_changed"),
+            (MailUnsupportedRuleActionError("r"), "unsupported_rule_action"),
+            (MailDraftNotFoundError("d"), "draft_not_found"),
+            (MailDraftInvalidIdError("d"), "invalid_draft_id"),
+            (MailDraftNotSettledError("d"), "draft_not_settled"),
+            (MailDraftError("d"), "draft_error"),
+            (MailTemplateNotFoundError("t"), "template_not_found"),
+            (MailTemplateExistsError("t"), "template_exists"),
+            (MailTemplateInvalidNameError("t"), "invalid_template_name"),
+            (MailTemplateInvalidFormatError("t"), "invalid_template_format"),
+            (MailTemplateMissingVariableError("t"), "missing_template_variable"),
+            (MailTemplateError("t"), "template_error"),
+            (MailAppleScriptError("a"), "applescript_error"),
+            (FileNotFoundError("f"), "file_not_found"),
+            (FileExistsError("f"), "file_exists"),
+            (ValueError("v"), "validation_error"),
+            (RuntimeError("r"), "unknown"),
+            # A Mail error no tool names is not a known outcome either.
+            (MailKeychainError("k"), "unknown"),
+        ],
+        ids=lambda v: type(v).__name__ if isinstance(v, BaseException) else v,
+    )
+    def test_each_class_answers_with_one_error_type(
+        self, raised: Exception, error_type: str
+    ) -> None:
+        assert error_response("some_tool", raised) == {
+            "success": False,
+            "error": str(raised),
+            "error_type": error_type,
+        }
+
+    def test_a_known_class_is_logged_as_an_error_an_unknown_one_with_its_traceback(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
+        with caplog.at_level(logging.ERROR, logger="apple_mail_mcp.server"):
+            error_response("list_accounts", MailAppleScriptError("Mail quit"))
+            try:
+                raise RuntimeError("boom")
+            except RuntimeError as e:
+                error_response("list_accounts", e)
+        known, unknown = caplog.records
+        assert known.levelno == logging.ERROR and known.exc_info is None
+        assert "list_accounts" in known.getMessage()
+        assert unknown.levelno == logging.ERROR and unknown.exc_info is not None
+
+    @pytest.mark.parametrize(
+        ("tool", "method", "kwargs"),
+        [
+            (list_accounts, "list_accounts", {}),
+            (list_rules, "list_rules", {}),
+            (get_messages, "get_message", {"message_ids": ["1"]}),
+            (get_thread, "get_thread", {"message_id": "1"}),
+            (delete_messages, "delete_messages", {"message_ids": ["1"]}),
+        ],
+        ids=lambda v: getattr(v, "__name__", None) if callable(v) else None,
+    )
+    def test_a_tool_whose_ladder_lacked_the_class_answers_from_the_table(
+        self, mock_mail: MagicMock, tool: Any, method: str, kwargs: dict[str, Any]
+    ) -> None:
+        getattr(mock_mail, method).side_effect = MailAppleScriptError("Mail is not running")
+
+        result = tool(**kwargs)
+
+        assert result == {
+            "success": False,
+            "error": "Mail is not running",
+            "error_type": "applescript_error",
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -756,13 +874,16 @@ class TestListMailboxes:
     def test_account_not_found_maps_to_error_type(
         self, mock_mail: MagicMock, mock_logger: MagicMock
     ) -> None:
-        mock_mail.list_mailboxes.side_effect = MailAccountNotFoundError("nope")
+        mock_mail.list_mailboxes.side_effect = MailAccountNotFoundError(
+            'Can\'t get account "Bogus".'
+        )
 
         result = list_mailboxes("Bogus")
 
         assert result["success"] is False
         assert result["error_type"] == "account_not_found"
-        assert "Bogus" in result["error"]
+        # The connector's message names the account; it is passed through.
+        assert result["error"] == 'Can\'t get account "Bogus".'
         mock_logger.log_operation.assert_not_called()
 
     def test_unexpected_exception_maps_to_unknown(
@@ -851,18 +972,20 @@ class TestSearchMessages:
         assert logged_status == "success"
         assert logged_params["filters"]["sender"] == "alice@example.com"
 
-    def test_account_not_found_maps_to_not_found(
+    def test_account_not_found_maps_to_account_not_found(
         self, mock_mail: MagicMock, mock_logger: MagicMock
     ) -> None:
+        """Was ``not_found``, shared with a missing mailbox; every tool
+        now answers a missing account the same way."""
         mock_mail.search_messages.side_effect = MailAccountNotFoundError("x")
 
         result = search_messages("Bogus")
 
         assert result["success"] is False
-        assert result["error_type"] == "not_found"
+        assert result["error_type"] == "account_not_found"
         mock_logger.log_operation.assert_not_called()
 
-    def test_mailbox_not_found_maps_to_not_found(
+    def test_mailbox_not_found_maps_to_mailbox_not_found(
         self, mock_mail: MagicMock, mock_logger: MagicMock
     ) -> None:
         mock_mail.search_messages.side_effect = MailMailboxNotFoundError("x")
@@ -870,7 +993,7 @@ class TestSearchMessages:
         result = search_messages("Gmail", mailbox="Missing")
 
         assert result["success"] is False
-        assert result["error_type"] == "not_found"
+        assert result["error_type"] == "mailbox_not_found"
 
     def test_advanced_filters_propagate_to_connector(
         self, mock_mail: MagicMock, mock_logger: MagicMock
@@ -1829,7 +1952,7 @@ class TestUpdateMessage:
         assert result["success"] is False
         assert result["error_type"] == "account_not_found"
 
-    def test_mailbox_not_found_maps_to_not_found(
+    def test_mailbox_not_found_maps_to_mailbox_not_found(
         self, mock_mail: MagicMock
     ) -> None:
         mock_mail.update_message.side_effect = MailMailboxNotFoundError("x")
@@ -1839,7 +1962,7 @@ class TestUpdateMessage:
         )
 
         assert result["success"] is False
-        assert result["error_type"] == "not_found"
+        assert result["error_type"] == "mailbox_not_found"
 
     def test_value_error_maps_to_validation_error(
         self, mock_mail: MagicMock
@@ -1967,14 +2090,15 @@ class TestSaveAttachments:
     def test_existing_file_is_a_typed_error(
         self, mock_mail: MagicMock, mock_logger: MagicMock, tmp_path: Any
     ) -> None:
-        mock_mail.save_attachments.side_effect = FileExistsError(
-            "already in the directory: report.pdf"
+        refusal = FileExistsError(
+            "already in the directory: report.pdf; nothing was written. "
+            "Pass overwrite=True to replace it."
         )
+        mock_mail.save_attachments.side_effect = refusal
         result = save_attachments("12345", str(tmp_path))
         assert result["success"] is False
         assert result["error_type"] == "file_exists"
-        assert "report.pdf" in result["error"]
-        assert "overwrite=True" in result["error"]
+        assert result["error"] == str(refusal)
 
     def test_overwrite_is_passed_through(
         self, mock_mail: MagicMock, mock_logger: MagicMock, tmp_path: Any
@@ -2006,6 +2130,20 @@ class TestSaveAttachments:
         assert result["success"] is False
         assert result["error_type"] == "invalid_directory"
         mock_mail.save_attachments.assert_not_called()
+
+    def test_a_directory_gone_before_the_save_is_file_not_found(
+        self, mock_mail: MagicMock, mock_logger: MagicMock, tmp_path: Any
+    ) -> None:
+        """The connector's own existence check can only fire if the
+        directory went away after the tool's; it answers as every other
+        missing file does (was validation_error here alone)."""
+        mock_mail.save_attachments.side_effect = FileNotFoundError(
+            "Save directory does not exist"
+        )
+
+        result = save_attachments("1", str(tmp_path))
+
+        assert result["error_type"] == "file_not_found"
 
     def test_connector_value_error_maps_to_validation_error(
         self, mock_mail: MagicMock, mock_logger: MagicMock, tmp_path: Any
@@ -2091,12 +2229,15 @@ class TestCreateMailbox:
         mock_mail.create_mailbox.assert_not_called()
 
     def test_account_not_found(self, mock_mail: MagicMock) -> None:
-        mock_mail.create_mailbox.side_effect = MailAccountNotFoundError("x")
+        mock_mail.create_mailbox.side_effect = MailAccountNotFoundError(
+            'Can\'t get account "Bogus".'
+        )
 
         result = create_mailbox("Bogus", "Proj")
 
         assert result["success"] is False
         assert result["error_type"] == "account_not_found"
+        assert result["error"] == 'Can\'t get account "Bogus".'
 
     def test_connector_value_error_maps_to_validation_error(
         self, mock_mail: MagicMock
@@ -2258,10 +2399,11 @@ class TestUpdateMailboxTool:
         from apple_mail_mcp.server import update_mailbox
 
         mock_mail.update_mailbox.side_effect = MailAccountNotFoundError(
-            "no account"
+            'Can\'t get account "Bogus".'
         )
         result = update_mailbox(account="Bogus", name="Old", new_name="New")
         assert result["error_type"] == "account_not_found"
+        assert result["error"] == 'Can\'t get account "Bogus".'
 
     def test_connector_value_error_maps_to_validation_error(
         self, mock_mail: MagicMock, mock_logger: MagicMock
@@ -2466,12 +2608,13 @@ class TestDeleteMailboxTool:
         from apple_mail_mcp.server import delete_mailbox
 
         mock_mail.delete_mailbox.side_effect = MailAccountNotFoundError(
-            "no acct"
+            'Can\'t get account "Bogus".'
         )
         result = await delete_mailbox(
             account="Bogus", name="X", ctx=mock_ctx_accept
         )
         assert result["error_type"] == "account_not_found"
+        assert result["error"] == 'Can\'t get account "Bogus".'
 
     @pytest.mark.asyncio
     async def test_unexpected_exception_maps_to_unknown(

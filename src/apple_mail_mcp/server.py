@@ -40,17 +40,22 @@ from .exceptions import (
     MailTemplateNotFoundError,
     MailUnsupportedGmailSystemLabelError,
     MailUnsupportedRuleActionError,
+    OutboundAllowlistUnavailableError,
 )
 from .imap_connector import ImapConnectionPool
 from .mail_connector import AppleMailConnector
 from .outbound_allowlist import (
     all_recipients_allowed,
     assert_forward_targets_allowed,
+    assert_recipients_allowed_for_send,
+    disallowed_recipients,
 )
 from .security import (
     check_rate_limit,
     check_test_mode_safety,
     operation_logger,
+    validate_attachment_size,
+    validate_attachment_type,
     validate_bulk_operation,
     validate_send_operation,
 )
@@ -221,7 +226,86 @@ def _confirm_from_threadpool(
     return anyio.from_thread.run(_elicit_confirmation, ctx, summary, operation, params)
 
 
+# What each exception a tool can raise means to its caller. Looked up
+# along the raised class's MRO, so the most specific entry wins: a draft
+# that is not there is ``draft_not_found``, any other draft failure
+# ``draft_error``. Anything without an entry is ``unknown``.
+_ERROR_TYPES: dict[type[Exception], str] = {
+    ValueError: "validation_error",
+    # One answer for a missing file wherever it is raised: an attachment
+    # a draft or a send was handed, or a save directory that went away
+    # between save_attachments' own check and the connector's.
+    FileNotFoundError: "file_not_found",
+    FileExistsError: "file_exists",
+    MailAppleScriptError: "applescript_error",
+    MailAccountNotFoundError: "account_not_found",
+    MailMailboxNotFoundError: "mailbox_not_found",
+    MailMailboxNotEmptyError: "mailbox_not_empty",
+    MailMessageNotFoundError: "message_not_found",
+    MailImapRequiredError: "imap_required",
+    MailUnsupportedGmailSystemLabelError: "unsupported_gmail_system_label",
+    MailRuleNotFoundError: "rule_not_found",
+    MailRuleChangedError: "rule_changed",
+    MailUnsupportedRuleActionError: "unsupported_rule_action",
+    # Recipients off the outbound allowlist; and, told apart so that "fix
+    # the comms config" is not read as "edit the recipients", the
+    # allowlist itself unreadable (fail closed).
+    MailOutboundDisallowedError: "outbound_disallowed",
+    OutboundAllowlistUnavailableError: "allowlist_unavailable",
+    MailDraftError: "draft_error",
+    MailDraftNotFoundError: "draft_not_found",
+    MailDraftInvalidIdError: "invalid_draft_id",
+    MailDraftNotSettledError: "draft_not_settled",
+    MailTemplateError: "template_error",
+    MailTemplateNotFoundError: "template_not_found",
+    MailTemplateExistsError: "template_exists",
+    MailTemplateInvalidNameError: "invalid_template_name",
+    MailTemplateInvalidFormatError: "invalid_template_format",
+    MailTemplateMissingVariableError: "missing_template_variable",
+}
+
+
+def error_response(operation: str, e: Exception) -> dict[str, Any]:
+    """The response for a tool that ``e`` stopped: the exception's own
+    message, and its ``error_type`` from ``_ERROR_TYPES``. A known class
+    is logged as an error; anything else is ``unknown`` and logged with
+    its traceback."""
+    error_type = next(
+        (_ERROR_TYPES[cls] for cls in type(e).__mro__ if cls in _ERROR_TYPES),
+        None,
+    )
+    if error_type is None:
+        logger.exception("Unexpected error in %s: %s", operation, e)
+        error_type = "unknown"
+    else:
+        logger.error("%s failed (%s): %s", operation, error_type, e)
+    return {"success": False, "error": str(e), "error_type": error_type}
+
+
+def envelope(tool: Callable[_P, dict[str, Any]]) -> Callable[_P, dict[str, Any]]:
+    """Run a tool's body and answer whatever it raises with
+    ``error_response``.
+
+    A body is its gates, its connector call and its success response. A
+    refusal a gate decides on (rate limit, test mode, confirmation,
+    policy) is returned as it is; anything that stops the work is raised
+    and becomes the response here. It sits directly on the ``def``,
+    under the tool registration, so the function fastmcp registers and
+    the one this process calls are the same enveloped function.
+    """
+
+    @functools.wraps(tool)
+    def enveloped(*args: _P.args, **kwargs: _P.kwargs) -> dict[str, Any]:
+        try:
+            return tool(*args, **kwargs)
+        except Exception as e:
+            return error_response(tool.__name__, e)
+
+    return enveloped
+
+
 @mcp.tool()
+@envelope
 def list_accounts() -> dict[str, Any]:
     """
     List all configured email accounts in Apple Mail.
@@ -240,33 +324,15 @@ def list_accounts() -> dict[str, Any]:
              "account_type": "imap", "enabled": True}, ...
         ]}
     """
-    try:
-        rate_err = check_rate_limit("list_accounts", {})
-        if rate_err:
-            return rate_err
-
-        logger.info("Listing accounts")
-
-        accounts = mail.list_accounts()
-
-        operation_logger.log_operation("list_accounts", {}, "success")
-
-        return {
-            "success": True,
-            "accounts": accounts,
-            "count": len(accounts),
-        }
-
-    except Exception as e:
-        logger.error(f"Error listing accounts: {e}")
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": "unknown",
-        }
+    if refused := check_rate_limit("list_accounts", {}):
+        return refused
+    accounts = mail.list_accounts()
+    operation_logger.log_operation("list_accounts", {}, "success")
+    return {"success": True, "accounts": accounts, "count": len(accounts)}
 
 
 @mcp.tool()
+@envelope
 def list_rules() -> dict[str, Any]:
     """
     List all Mail.app rules (read-only).
@@ -286,47 +352,29 @@ def list_rules() -> dict[str, Any]:
             {"name": "News From Apple", "enabled": False}, ...
         ], "count": 2}
     """
-    try:
-        rate_err = check_rate_limit("list_rules", {})
-        if rate_err:
-            return rate_err
-
-        logger.info("Listing rules")
-
-        rules = mail.list_rules()
-
-        operation_logger.log_operation("list_rules", {}, "success")
-
-        return {
-            "success": True,
-            "rules": rules,
-            "count": len(rules),
-        }
-
-    except Exception as e:
-        logger.error(f"Error listing rules: {e}")
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": "unknown",
-        }
+    if refused := check_rate_limit("list_rules", {}):
+        return refused
+    rules = mail.list_rules()
+    operation_logger.log_operation("list_rules", {}, "success")
+    return {"success": True, "rules": rules, "count": len(rules)}
 
 
-def _resolve_rule_name(rule_index: int) -> str | None:
+def _resolve_rule_name(rule_index: int) -> str:
     """Look up a rule's name from its 1-based index via list_rules.
 
-    Used by the rule mutation tools to feed the safety gate. Returns None
-    if the rule doesn't exist (caller surfaces a typed error).
+    Used by the rule mutation tools to feed the safety gate and the
+    confirmation prompt. Raises ``MailRuleNotFoundError`` when there is
+    no rule at the index.
     """
-    rules = mail.list_rules()
-    for r in rules:
+    for r in mail.list_rules():
         if r.get("index") == rule_index:
             return cast(str, r.get("name", ""))
-    return None
+    raise MailRuleNotFoundError(f"No rule at index {rule_index}")
 
 
 @_in_tool_threadpool
 @mcp.tool()
+@envelope
 def delete_rule(
     rule_index: int,
     ctx: Context | None = None,
@@ -347,68 +395,31 @@ def delete_rule(
         After deletion, downstream rule indices shift down by one. Re-call
         list_rules before any further rule operations.
     """
-    try:
-        rate_err = check_rate_limit(
-            "delete_rule", {"rule_index": rule_index}
-        )
-        if rate_err:
-            return rate_err
+    if refused := check_rate_limit("delete_rule", {"rule_index": rule_index}):
+        return refused
+    rule_name = _resolve_rule_name(rule_index)
+    if refused := check_test_mode_safety("delete_rule", rule_name=rule_name):
+        return refused
+    summary = (
+        f"Delete Mail.app rule '{rule_name}' (index {rule_index})? "
+        f"This cannot be undone."
+    )
+    if refused := _confirm_from_threadpool(
+        ctx, summary, "delete_rule", {"rule_index": rule_index}
+    ):
+        return refused
 
-        rule_name = _resolve_rule_name(rule_index)
-        if rule_name is None:
-            return {
-                "success": False,
-                "error": f"No rule at index {rule_index}",
-                "error_type": "rule_not_found",
-            }
-
-        safety_err = check_test_mode_safety(
-            "delete_rule", rule_name=rule_name
-        )
-        if safety_err:
-            return safety_err
-
-        summary = (
-            f"Delete Mail.app rule '{rule_name}' (index {rule_index})? "
-            f"This cannot be undone."
-        )
-        cancel_err = _confirm_from_threadpool(
-            ctx, summary, "delete_rule", {"rule_index": rule_index}
-        )
-        if cancel_err:
-            return cancel_err
-
-        # Bound to what was confirmed: the connector checks the name at
-        # the index inside the same AppleScript call as the delete, so a
-        # rule that moved while the prompt was open is not the one acted
-        # on — nothing is, and the caller is told to re-list.
-        deleted = mail.delete_rule(rule_index, expected_name=rule_name)
-        operation_logger.log_operation(
-            "delete_rule",
-            {"rule_index": rule_index, "deleted_name": deleted},
-            "success",
-        )
-        return {
-            "success": True,
-            "rule_index": rule_index,
-            "deleted_name": deleted,
-        }
-
-    except MailRuleChangedError as e:
-        return {"success": False, "error": str(e), "error_type": "rule_changed"}
-    except MailRuleNotFoundError as e:
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": "rule_not_found",
-        }
-    except Exception as e:
-        logger.error(f"Error in delete_rule: {e}")
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": "unknown",
-        }
+    # Bound to what was confirmed: the connector checks the name at
+    # the index inside the same AppleScript call as the delete, so a
+    # rule that moved while the prompt was open is not the one acted
+    # on — nothing is, and the caller is told to re-list.
+    deleted = mail.delete_rule(rule_index, expected_name=rule_name)
+    operation_logger.log_operation(
+        "delete_rule",
+        {"rule_index": rule_index, "deleted_name": deleted},
+        "success",
+    )
+    return {"success": True, "rule_index": rule_index, "deleted_name": deleted}
 
 
 def _rule_policy_gate(
@@ -422,24 +433,21 @@ def _rule_policy_gate(
     allowlist over those same targets. A forwarding rule is a standing
     send, so it answers with the errors a blocked send gets. The
     connector re-checks the allowlist; this is the fail-fast in front of
-    the confirmation prompt. Returns the first error, or None.
+    the confirmation prompt. Returns the test-mode refusal or None; an
+    allowlist refusal is raised, as the connector's own would be.
     """
     targets: list[str] = list((actions or {}).get("forward_to") or [])
-    safety_err = check_test_mode_safety(
+    if refused := check_test_mode_safety(
         operation, rule_name=rule_name, recipients=targets,
-    )
-    if safety_err:
-        return safety_err
-    if not targets:
-        return None
-    try:
+    ):
+        return refused
+    if targets:
         assert_forward_targets_allowed(targets)
-    except MailOutboundDisallowedError as e:
-        return _outbound_policy_error(operation, e)
     return None
 
 
 @mcp.tool()
+@envelope
 def create_rule(
     name: str,
     conditions: list[dict[str, Any]],
@@ -481,61 +489,35 @@ def create_rule(
     Returns:
         Dictionary with success status, rule_index, and name.
     """
-    try:
-        rate_err = check_rate_limit("create_rule", {"name": name})
-        if rate_err:
-            return rate_err
-
-        gate_err = _rule_policy_gate("create_rule", name, actions)
-        if gate_err:
-            return gate_err
-
-        new_index = mail.create_rule(
-            name=name,
-            conditions=conditions,
-            actions=actions,
-            match_logic=match_logic,
-            enabled=enabled,
-        )
-        operation_logger.log_operation(
-            "create_rule",
-            {
-                "name": name,
-                "rule_index": new_index,
-                "conditions": conditions,
-                "actions": actions,
-                "match_logic": match_logic,
-                "enabled": enabled,
-            },
-            "success",
-        )
-        return {
-            "success": True,
-            "rule_index": new_index,
+    if refused := check_rate_limit("create_rule", {"name": name}):
+        return refused
+    if refused := _rule_policy_gate("create_rule", name, actions):
+        return refused
+    new_index = mail.create_rule(
+        name=name,
+        conditions=conditions,
+        actions=actions,
+        match_logic=match_logic,
+        enabled=enabled,
+    )
+    operation_logger.log_operation(
+        "create_rule",
+        {
             "name": name,
-        }
-
-    except MailOutboundDisallowedError as e:
-        # The connector's own gate; reached only if the pre-check above
-        # and the connector disagree, so it answers the same way.
-        return _outbound_policy_error("create_rule", e)
-    except ValueError as e:
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": "validation_error",
-        }
-    except Exception as e:
-        logger.error(f"Error in create_rule: {e}")
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": "unknown",
-        }
+            "rule_index": new_index,
+            "conditions": conditions,
+            "actions": actions,
+            "match_logic": match_logic,
+            "enabled": enabled,
+        },
+        "success",
+    )
+    return {"success": True, "rule_index": new_index, "name": name}
 
 
 @_in_tool_threadpool
 @mcp.tool()
+@envelope
 def update_rule(
     rule_index: int,
     name: str | None = None,
@@ -575,100 +557,48 @@ def update_rule(
     Returns:
         Dictionary with success status.
     """
-    try:
-        rate_err = check_rate_limit(
-            "update_rule", {"rule_index": rule_index}
+    if refused := check_rate_limit("update_rule", {"rule_index": rule_index}):
+        return refused
+    rule_name = _resolve_rule_name(rule_index)
+    if refused := _rule_policy_gate("update_rule", rule_name, actions):
+        return refused
+    if conditions is not None or actions is not None or match_logic is not None:
+        summary = (
+            f"Update Mail.app rule '{rule_name}' (index {rule_index})? "
+            f"Previous condition/action state cannot be recovered."
         )
-        if rate_err:
-            return rate_err
+        if refused := _confirm_from_threadpool(
+            ctx, summary, "update_rule", {"rule_index": rule_index}
+        ):
+            return refused
 
-        rule_name = _resolve_rule_name(rule_index)
-        if rule_name is None:
-            return {
-                "success": False,
-                "error": f"No rule at index {rule_index}",
-                "error_type": "rule_not_found",
-            }
-
-        gate_err = _rule_policy_gate("update_rule", rule_name, actions)
-        if gate_err:
-            return gate_err
-
-        needs_confirmation = (
-            conditions is not None
-            or actions is not None
-            or match_logic is not None
-        )
-        if needs_confirmation:
-            summary = (
-                f"Update Mail.app rule '{rule_name}' (index {rule_index})? "
-                f"Previous condition/action state cannot be recovered."
-            )
-            cancel_err = _confirm_from_threadpool(
-                ctx, summary, "update_rule", {"rule_index": rule_index}
-            )
-            if cancel_err:
-                return cancel_err
-
-        mail.update_rule(
-            rule_index=rule_index,
-            name=name,
-            enabled=enabled,
-            conditions=conditions,
-            actions=actions,
-            match_logic=match_logic,
-            expected_name=rule_name,
-        )
-        operation_logger.log_operation(
-            "update_rule",
-            {
-                "rule_index": rule_index,
-                "previous_name": rule_name,
-                "name": name,
-                "enabled": enabled,
-                "conditions": conditions,
-                "actions": actions,
-                "match_logic": match_logic,
-            },
-            "success",
-        )
-        return {
-            "success": True,
+    mail.update_rule(
+        rule_index=rule_index,
+        name=name,
+        enabled=enabled,
+        conditions=conditions,
+        actions=actions,
+        match_logic=match_logic,
+        expected_name=rule_name,
+    )
+    operation_logger.log_operation(
+        "update_rule",
+        {
             "rule_index": rule_index,
-        }
-
-    except MailRuleChangedError as e:
-        return {"success": False, "error": str(e), "error_type": "rule_changed"}
-    except MailRuleNotFoundError as e:
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": "rule_not_found",
-        }
-    except MailUnsupportedRuleActionError as e:
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": "unsupported_rule_action",
-        }
-    except MailOutboundDisallowedError as e:
-        return _outbound_policy_error("update_rule", e)
-    except ValueError as e:
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": "validation_error",
-        }
-    except Exception as e:
-        logger.error(f"Error in update_rule: {e}")
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": "unknown",
-        }
+            "previous_name": rule_name,
+            "name": name,
+            "enabled": enabled,
+            "conditions": conditions,
+            "actions": actions,
+            "match_logic": match_logic,
+        },
+        "success",
+    )
+    return {"success": True, "rule_index": rule_index}
 
 
 @mcp.tool()
+@envelope
 def list_mailboxes(account: str) -> dict[str, Any]:
     """
     List all mailboxes for an account.
@@ -685,45 +615,13 @@ def list_mailboxes(account: str) -> dict[str, Any]:
         >>> list_mailboxes("Gmail")
         {"mailboxes": [{"name": "INBOX", "unread_count": 5}, ...]}
     """
-    try:
-        safety_err = check_test_mode_safety("list_mailboxes", account=account)
-        if safety_err:
-            return safety_err
-
-        rate_err = check_rate_limit("list_mailboxes", {"account": account})
-        if rate_err:
-            return rate_err
-
-        logger.info(f"Listing mailboxes for account: {account}")
-
-        mailboxes = mail.list_mailboxes(account)
-
-        operation_logger.log_operation(
-            "list_mailboxes",
-            {"account": account},
-            "success"
-        )
-
-        return {
-            "success": True,
-            "account": account,
-            "mailboxes": mailboxes,
-        }
-
-    except MailAccountNotFoundError as e:
-        logger.error(f"Account not found: {e}")
-        return {
-            "success": False,
-            "error": f"Account '{account}' not found",
-            "error_type": "account_not_found",
-        }
-    except Exception as e:
-        logger.error(f"Error listing mailboxes: {e}")
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": "unknown",
-        }
+    if refused := check_test_mode_safety("list_mailboxes", account=account):
+        return refused
+    if refused := check_rate_limit("list_mailboxes", {"account": account}):
+        return refused
+    mailboxes = mail.list_mailboxes(account)
+    operation_logger.log_operation("list_mailboxes", {"account": account}, "success")
+    return {"success": True, "account": account, "mailboxes": mailboxes}
 
 
 _SELECTED_SENTINEL = "SELECTED"
@@ -885,6 +783,7 @@ def _apply_search_filters(
 
 
 @mcp.tool()
+@envelope
 def search_messages(
     account: str | None = None,
     mailbox: str = "INBOX",
@@ -974,87 +873,41 @@ def search_messages(
         >>> search_messages(source=["12345", "SELECTED"], read_status=False)
         {"success": True, "messages": [...], "count": 3}
     """
-    try:
-        warnings: list[str] = []
-
-        if source is not None:
-            # body/text filters need bodies on the resolved messages so the
-            # post-filter can match content. Force include_content=True for
-            # the per-id fetch when these filters are set.
-            need_body = bool(body_contains or text_contains)
-            resolved = _resolve_id_list_to_messages(
-                source,
-                include_content=need_body,
-                account=account,
-                mailbox=mailbox,
-                include_attachments=include_attachments,
-            )
-            filtered = _apply_search_filters(
-                resolved,
-                sender_contains,
-                subject_contains,
-                read_status,
-                is_flagged,
-                date_from,
-                date_to,
-                has_attachment,
-                limit,
-                body_contains=body_contains,
-                text_contains=text_contains,
-            )
-            operation_logger.log_operation(
-                "search_messages",
-                {
-                    "source": source,
-                    "filters": {
-                        "sender": sender_contains,
-                        "subject": subject_contains,
-                        "read_status": read_status,
-                        "is_flagged": is_flagged,
-                        "date_from": date_from,
-                        "date_to": date_to,
-                        "has_attachment": has_attachment,
-                        "body_contains": body_contains,
-                        "text_contains": text_contains,
-                    },
-                },
-                "success",
-            )
-            response: dict[str, Any] = {
-                "success": True,
-                "account": None,
-                "mailbox": None,
-                "messages": filtered,
-                "count": len(filtered),
-                "limit": limit,
-                "truncated": len(filtered) >= limit,
-            }
-            if warnings:
-                response["warnings"] = warnings
-            return response
-
-        if account is None:
-            return {
-                "success": False,
-                "error": "account is required when source is not provided",
-                "error_type": "validation_error",
-            }
-
-        safety_err = check_test_mode_safety("search_messages", account=account)
-        if safety_err:
-            return safety_err
-
-        rate_err = check_rate_limit("search_messages", {"account": account, "mailbox": mailbox})
-        if rate_err:
-            return rate_err
-
-        logger.info(
-            f"Searching messages in {account}/{mailbox} with filters: "
-            f"sender={sender_contains}, subject={subject_contains}, read={read_status}, "
-            f"flagged={is_flagged}, date_from={date_from}, date_to={date_to}, "
-            f"has_attachment={has_attachment}"
+    warnings: list[str] = []
+    if source is not None:
+        # body/text filters need bodies on the resolved messages so the
+        # post-filter can match content. Force include_content=True for
+        # the per-id fetch when these filters are set.
+        resolved = _resolve_id_list_to_messages(
+            source,
+            include_content=bool(body_contains or text_contains),
+            account=account,
+            mailbox=mailbox,
+            include_attachments=include_attachments,
         )
-
+        messages = _apply_search_filters(
+            resolved,
+            sender_contains,
+            subject_contains,
+            read_status,
+            is_flagged,
+            date_from,
+            date_to,
+            has_attachment,
+            limit,
+            body_contains=body_contains,
+            text_contains=text_contains,
+        )
+        scope: dict[str, Any] = {"source": source}
+    else:
+        if account is None:
+            raise ValueError("account is required when source is not provided")
+        if refused := check_test_mode_safety("search_messages", account=account):
+            return refused
+        if refused := check_rate_limit(
+            "search_messages", {"account": account, "mailbox": mailbox}
+        ):
+            return refused
         messages = mail.search_messages(
             account=account,
             mailbox=mailbox,
@@ -1071,66 +924,40 @@ def search_messages(
             text_contains=text_contains,
             on_warning=warnings.append,
         )
+        scope = {"account": account, "mailbox": mailbox}
 
-        operation_logger.log_operation(
-            "search_messages",
-            {
-                "account": account,
-                "mailbox": mailbox,
-                "filters": {
-                    "sender": sender_contains,
-                    "subject": subject_contains,
-                    "read_status": read_status,
-                    "is_flagged": is_flagged,
-                    "date_from": date_from,
-                    "date_to": date_to,
-                    "has_attachment": has_attachment,
-                    "body_contains": body_contains,
-                    "text_contains": text_contains,
-                },
-            },
-            "success"
-        )
-
-        # count == limit is the one result a caller cannot read on its own:
-        # everything, or the first page of much more. Say which.
-        response = {
-            "success": True,
-            "account": account,
-            "mailbox": mailbox,
-            "messages": messages,
-            "count": len(messages),
-            "limit": limit,
-            "truncated": len(messages) >= limit,
-        }
-        if warnings:
-            response["warnings"] = warnings
-        return response
-
-    except (MailAccountNotFoundError, MailMailboxNotFoundError) as e:
-        logger.error(f"Not found error: {e}")
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": "not_found",
-        }
-    except ValueError as e:
-        logger.error(f"Validation error in search_messages: {e}")
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": "validation_error",
-        }
-    except Exception as e:
-        logger.error(f"Error searching messages: {e}")
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": "unknown",
-        }
+    filters = {
+        "sender": sender_contains,
+        "subject": subject_contains,
+        "read_status": read_status,
+        "is_flagged": is_flagged,
+        "date_from": date_from,
+        "date_to": date_to,
+        "has_attachment": has_attachment,
+        "body_contains": body_contains,
+        "text_contains": text_contains,
+    }
+    operation_logger.log_operation(
+        "search_messages", {**scope, "filters": filters}, "success"
+    )
+    # count == limit is the one result a caller cannot read on its own:
+    # everything, or the first page of much more. Say which.
+    response: dict[str, Any] = {
+        "success": True,
+        "account": scope.get("account"),
+        "mailbox": scope.get("mailbox"),
+        "messages": messages,
+        "count": len(messages),
+        "limit": limit,
+        "truncated": len(messages) >= limit,
+    }
+    if warnings:
+        response["warnings"] = warnings
+    return response
 
 
 @mcp.tool()
+@envelope
 def get_messages(
     message_ids: list[str],
     include_content: bool = True,
@@ -1181,68 +1008,50 @@ def get_messages(
         >>> get_messages(["SELECTED", "12345"])
         {"success": True, "messages": [...], "count": 3}
     """
-    try:
-        rate_err = check_rate_limit(
-            "get_messages", {"count": len(message_ids)}
+    if refused := check_rate_limit("get_messages", {"count": len(message_ids)}):
+        return refused
+    missing_ids: list[str] = []
+    messages = _resolve_id_list_to_messages(
+        message_ids,
+        include_content=include_content,
+        account=account,
+        mailbox=mailbox,
+        headers_only=headers_only,
+        include_attachments=include_attachments,
+        on_missing=missing_ids.append,
+    )
+
+    # NO SILENT ERRORS: surface both kinds of non-fatal degradation at
+    # the response root. (1) Ids that were requested but not located —
+    # the cardinality gap is reported, never dropped quietly. (2)
+    # Per-message attachment-enumeration warnings emitted by the
+    # connector (e.g. inline-image -10000) are lifted to the top level,
+    # mirroring search_messages' top-level ``warnings`` field, while
+    # remaining attributable on each message dict.
+    warnings: list[str] = []
+    if missing_ids:
+        warnings.append(
+            "requested ids not found and dropped from results: "
+            + ", ".join(missing_ids)
         )
-        if rate_err:
-            return rate_err
+    for m in messages:
+        warnings.extend(m.get("warnings", []) or [])
 
-        logger.info(f"Getting messages: {len(message_ids)} ids")
-
-        missing_ids: list[str] = []
-        messages = _resolve_id_list_to_messages(
-            message_ids,
-            include_content=include_content,
-            account=account,
-            mailbox=mailbox,
-            headers_only=headers_only,
-            include_attachments=include_attachments,
-            on_missing=missing_ids.append,
-        )
-
-        # NO SILENT ERRORS: surface both kinds of non-fatal degradation at
-        # the response root. (1) Ids that were requested but not located —
-        # the cardinality gap is reported, never dropped quietly. (2)
-        # Per-message attachment-enumeration warnings emitted by the
-        # connector (e.g. inline-image -10000) are lifted to the top level,
-        # mirroring search_messages' top-level ``warnings`` field, while
-        # remaining attributable on each message dict.
-        warnings: list[str] = []
-        if missing_ids:
-            warnings.append(
-                "requested ids not found and dropped from results: "
-                + ", ".join(missing_ids)
-            )
-        for m in messages:
-            for w in m.get("warnings", []) or []:
-                warnings.append(w)
-
-        operation_logger.log_operation(
-            "get_messages",
-            {"count": len(message_ids)},
-            "success"
-        )
-
-        response: dict[str, Any] = {
-            "success": True,
-            "messages": messages,
-            "count": len(messages),
-        }
-        if warnings:
-            response["warnings"] = warnings
-        return response
-
-    except Exception as e:
-        logger.error(f"Error getting messages: {e}")
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": "unknown",
-        }
+    operation_logger.log_operation(
+        "get_messages", {"count": len(message_ids)}, "success"
+    )
+    response: dict[str, Any] = {
+        "success": True,
+        "messages": messages,
+        "count": len(messages),
+    }
+    if warnings:
+        response["warnings"] = warnings
+    return response
 
 
 @mcp.tool()
+@envelope
 def update_message(
     message_ids: list[str],
     read_status: bool | None = None,
@@ -1304,112 +1113,56 @@ def update_message(
         >>> # Set red flag:
         >>> update_message(["12345"], flag_color="red")
     """
-    try:
-        # Validate at least one field is set (AC #3 from #135).
-        if (
-            read_status is None
-            and flagged is None
-            and flag_color is None
-            and destination_mailbox is None
-        ):
-            return {
-                "success": False,
-                "error": "specify at least one field to update",
-                "error_type": "validation_error",
-            }
+    # Validate at least one field is set (AC #3 from #135).
+    if (
+        read_status is None
+        and flagged is None
+        and flag_color is None
+        and destination_mailbox is None
+    ):
+        raise ValueError("specify at least one field to update")
+    # Test-mode safety: the gate compares a given account against
+    # MAIL_TEST_ACCOUNT and refuses a missing one, since message ids
+    # reach every account.
+    if refused := check_test_mode_safety("update_message", account=account):
+        return refused
+    if refused := check_rate_limit("update_message", {"count": len(message_ids)}):
+        return refused
+    is_valid, error_msg = validate_bulk_operation(len(message_ids), max_items=100)
+    if not is_valid:
+        raise ValueError(error_msg)
 
-        # Test-mode safety: the gate compares a given account against
-        # MAIL_TEST_ACCOUNT and refuses a missing one, since message ids
-        # reach every account.
-        safety_err = check_test_mode_safety("update_message", account=account)
-        if safety_err:
-            return safety_err
-
-        rate_err = check_rate_limit("update_message", {"count": len(message_ids)})
-        if rate_err:
-            return rate_err
-
-        # Validate bulk size
-        is_valid, error_msg = validate_bulk_operation(len(message_ids), max_items=100)
-        if not is_valid:
-            logger.error(f"Validation failed: {error_msg}")
-            return {
-                "success": False,
-                "error": error_msg,
-                "error_type": "validation_error",
-            }
-
-        logger.info(
-            f"Updating {len(message_ids)} messages "
-            f"(read={read_status}, flagged={flagged}, color={flag_color}, "
-            f"dest={destination_mailbox})"
-        )
-
-        count = mail.update_message(
-            message_ids,
-            read_status=read_status,
-            flagged=flagged,
-            flag_color=flag_color,
-            destination_mailbox=destination_mailbox,
-            account=account,
-            source_mailbox=source_mailbox,
-            gmail_mode=gmail_mode,
-        )
-
-        operation_logger.log_operation(
-            "update_message",
-            {
-                "message_ids": message_ids,
-                "requested": len(message_ids),
-                "updated": count,
-                "read_status": read_status,
-                "flagged": flagged,
-                "flag_color": flag_color,
-                "destination_mailbox": destination_mailbox,
-                "account": account,
-                "source_mailbox": source_mailbox,
-                "gmail_mode": gmail_mode,
-            },
-            "success",
-        )
-
-        return {
-            "success": True,
-            "updated": count,
+    count = mail.update_message(
+        message_ids,
+        read_status=read_status,
+        flagged=flagged,
+        flag_color=flag_color,
+        destination_mailbox=destination_mailbox,
+        account=account,
+        source_mailbox=source_mailbox,
+        gmail_mode=gmail_mode,
+    )
+    operation_logger.log_operation(
+        "update_message",
+        {
+            "message_ids": message_ids,
             "requested": len(message_ids),
-        }
-
-    except MailAccountNotFoundError as e:
-        logger.error(f"Account not found: {e}")
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": "account_not_found",
-        }
-    except MailMailboxNotFoundError as e:
-        logger.error(f"Mailbox not found: {e}")
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": "not_found",
-        }
-    except ValueError as e:
-        logger.error(f"Validation error in update_message: {e}")
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": "validation_error",
-        }
-    except Exception as e:
-        logger.error(f"Error updating messages: {e}")
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": "unknown",
-        }
+            "updated": count,
+            "read_status": read_status,
+            "flagged": flagged,
+            "flag_color": flag_color,
+            "destination_mailbox": destination_mailbox,
+            "account": account,
+            "source_mailbox": source_mailbox,
+            "gmail_mode": gmail_mode,
+        },
+        "success",
+    )
+    return {"success": True, "updated": count, "requested": len(message_ids)}
 
 
 @mcp.tool()
+@envelope
 def get_thread(message_id: str) -> dict[str, Any]:
     """
     Return all messages in the thread containing the given message.
@@ -1439,46 +1192,19 @@ def get_thread(message_id: str) -> dict[str, Any]:
         >>> get_thread("12345")
         {"success": True, "thread": [{...}, {...}], "count": 2}
     """
-    try:
-        rate_err = check_rate_limit("get_thread", {"message_id": message_id})
-        if rate_err:
-            return rate_err
-
-        logger.info(f"Getting thread for message: {message_id}")
-
-        warnings: list[str] = []
-        thread = mail.get_thread(message_id, on_warning=warnings.append)
-
-        operation_logger.log_operation(
-            "get_thread", {"message_id": message_id}, "success"
-        )
-
-        response: dict[str, Any] = {
-            "success": True,
-            "thread": thread,
-            "count": len(thread),
-        }
-        if warnings:
-            response["warnings"] = warnings
-        return response
-
-    except MailMessageNotFoundError as e:
-        logger.error(f"Message not found: {e}")
-        return {
-            "success": False,
-            "error": f"Message '{message_id}' not found",
-            "error_type": "message_not_found",
-        }
-    except Exception as e:
-        logger.error(f"Error getting thread: {e}")
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": "unknown",
-        }
+    if refused := check_rate_limit("get_thread", {"message_id": message_id}):
+        return refused
+    warnings: list[str] = []
+    thread = mail.get_thread(message_id, on_warning=warnings.append)
+    operation_logger.log_operation("get_thread", {"message_id": message_id}, "success")
+    response: dict[str, Any] = {"success": True, "thread": thread, "count": len(thread)}
+    if warnings:
+        response["warnings"] = warnings
+    return response
 
 
 @mcp.tool()
+@envelope
 def save_attachments(
     message_id: str,
     save_directory: str,
@@ -1510,94 +1236,49 @@ def save_attachments(
         >>> save_attachments("12345", "/Users/me/Downloads", [0, 2])
         {"success": True, "saved": 2, "directory": "/Users/me/Downloads"}
     """
-    from pathlib import Path
-
-    attachment_indices_or_none: list[int] | None = attachment_indices or None
-    try:
-        rate_err = check_rate_limit("save_attachments", {"message_id": message_id})
-        if rate_err:
-            return rate_err
-
-        save_path = Path(save_directory)
-
-        # Validate directory
-        if not save_path.exists():
-            return {
-                "success": False,
-                "error": f"Directory does not exist: {save_directory}",
-                "error_type": "directory_not_found",
-            }
-
-        if not save_path.is_dir():
-            return {
-                "success": False,
-                "error": f"Path is not a directory: {save_directory}",
-                "error_type": "invalid_directory",
-            }
-
-        logger.info(
-            f"Saving attachments from message {message_id} to {save_directory}"
-        )
-
-        count, warnings = mail.save_attachments(
-            message_id=message_id,
-            save_directory=save_path,
-            attachment_indices=attachment_indices_or_none,
-            overwrite=overwrite,
-        )
-
-        operation_logger.log_operation(
-            "save_attachments",
-            {
-                "message_id": message_id,
-                "directory": save_directory,
-                "indices": attachment_indices_or_none,
-            },
-            "success"
-        )
-
-        # NO SILENT ERRORS: connector returns (count, warnings); lift
-        # warnings to the response when present so a 0-saved result
-        # caused by Mail.app -10000 enumeration is never silent.
-        response: dict[str, Any] = {
-            "success": True,
-            "saved": count,
-            "directory": save_directory,
-        }
-        if warnings:
-            response["warnings"] = warnings
-        return response
-
-    except FileExistsError as e:
+    if refused := check_rate_limit("save_attachments", {"message_id": message_id}):
+        return refused
+    save_path = Path(save_directory)
+    if not save_path.exists():
         return {
             "success": False,
-            "error": f"{e}; nothing was written. Pass overwrite=True to replace it.",
-            "error_type": "file_exists",
+            "error": f"Directory does not exist: {save_directory}",
+            "error_type": "directory_not_found",
         }
-    except (FileNotFoundError, ValueError) as e:
-        logger.error(f"Validation error: {e}")
+    if not save_path.is_dir():
         return {
             "success": False,
-            "error": str(e),
-            "error_type": "validation_error",
+            "error": f"Path is not a directory: {save_directory}",
+            "error_type": "invalid_directory",
         }
-    except MailMessageNotFoundError as e:
-        logger.error(f"Message not found: {e}")
-        return {
-            "success": False,
-            "error": f"Message '{message_id}' not found",
-            "error_type": "message_not_found",
-        }
-    except Exception as e:
-        logger.error(f"Error saving attachments: {e}")
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": "unknown",
-        }
+
+    indices = attachment_indices or None
+    count, warnings = mail.save_attachments(
+        message_id=message_id,
+        save_directory=save_path,
+        attachment_indices=indices,
+        overwrite=overwrite,
+    )
+    operation_logger.log_operation(
+        "save_attachments",
+        {"message_id": message_id, "directory": save_directory, "indices": indices},
+        "success",
+    )
+    # NO SILENT ERRORS: connector returns (count, warnings); lift
+    # warnings to the response when present so a 0-saved result
+    # caused by Mail.app -10000 enumeration is never silent.
+    response: dict[str, Any] = {
+        "success": True,
+        "saved": count,
+        "directory": save_directory,
+    }
+    if warnings:
+        response["warnings"] = warnings
+    return response
 
 
 @mcp.tool()
+@envelope
 def create_mailbox(
     account: str,
     name: str,
@@ -1623,83 +1304,40 @@ def create_mailbox(
             parent_mailbox="Projects"
         )
     """
-    try:
-        safety_err = check_test_mode_safety("create_mailbox", account=account)
-        if safety_err:
-            return safety_err
+    if refused := check_test_mode_safety("create_mailbox", account=account):
+        return refused
+    if not name or not name.strip():
+        raise ValueError("Mailbox name cannot be empty")
+    if refused := check_rate_limit("create_mailbox", {"account": account, "name": name}):
+        return refused
 
-        if not name or not name.strip():
-            return {
-                "success": False,
-                "error": "Mailbox name cannot be empty",
-                "error_type": "validation_error",
-            }
-
-        rate_err = check_rate_limit("create_mailbox", {"account": account, "name": name})
-        if rate_err:
-            return rate_err
-
-        logger.info(f"Creating mailbox '{name}' in account {account}")
-
-        # Create the mailbox
-        success = mail.create_mailbox(
-            account=account,
-            name=name,
-            parent_mailbox=parent_mailbox,
-        )
-
-        operation_logger.log_operation(
-            "create_mailbox",
-            {"account": account, "mailbox": name, "parent": parent_mailbox},
-            "success" if success else "failure",
-        )
-        if not success:
-            return {
-                "success": False,
-                "error": (
-                    f"Mail did not confirm creating mailbox {name!r} in "
-                    f"account {account!r}; check Mail.app before retrying"
-                ),
-                "error_type": "applescript_error",
-            }
-        return {
-            "success": True,
-            "account": account,
-            "mailbox": name,
-            "parent": parent_mailbox,
-        }
-
-    except ValueError as e:
-        logger.error(f"Validation error: {e}")
+    success = mail.create_mailbox(
+        account=account, name=name, parent_mailbox=parent_mailbox,
+    )
+    operation_logger.log_operation(
+        "create_mailbox",
+        {"account": account, "mailbox": name, "parent": parent_mailbox},
+        "success" if success else "failure",
+    )
+    if not success:
         return {
             "success": False,
-            "error": str(e),
-            "error_type": "validation_error",
-        }
-    except MailAccountNotFoundError as e:
-        logger.error(f"Account not found: {e}")
-        return {
-            "success": False,
-            "error": f"Account '{account}' not found",
-            "error_type": "account_not_found",
-        }
-    except MailAppleScriptError as e:
-        logger.error(f"AppleScript error: {e}")
-        return {
-            "success": False,
-            "error": str(e),
+            "error": (
+                f"Mail did not confirm creating mailbox {name!r} in "
+                f"account {account!r}; check Mail.app before retrying"
+            ),
             "error_type": "applescript_error",
         }
-    except Exception as e:
-        logger.error(f"Error creating mailbox: {e}")
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": "unknown",
-        }
+    return {
+        "success": True,
+        "account": account,
+        "mailbox": name,
+        "parent": parent_mailbox,
+    }
 
 
 @mcp.tool()
+@envelope
 def update_mailbox(
     account: str,
     name: str,
@@ -1741,118 +1379,42 @@ def update_mailbox(
         ``{success, account, name, new_name, new_parent}`` on success,
         or structured error response.
     """
-    try:
-        safety_err = check_test_mode_safety("update_mailbox", account=account)
-        if safety_err:
-            return safety_err
+    if refused := check_test_mode_safety("update_mailbox", account=account):
+        return refused
+    if not name or not name.strip():
+        raise ValueError("Mailbox name cannot be empty")
+    if new_name is None and new_parent is None:
+        raise ValueError("At least one of new_name or new_parent is required")
+    if new_name is not None and not new_name.strip():
+        raise ValueError("new_name cannot be empty (pass None to keep current leaf)")
+    params = {
+        "account": account, "name": name,
+        "new_name": new_name, "new_parent": new_parent,
+    }
+    if refused := check_rate_limit("update_mailbox", params):
+        return refused
 
-        if not name or not name.strip():
-            return {
-                "success": False,
-                "error": "Mailbox name cannot be empty",
-                "error_type": "validation_error",
-            }
-        if new_name is None and new_parent is None:
-            return {
-                "success": False,
-                "error": "At least one of new_name or new_parent is required",
-                "error_type": "validation_error",
-            }
-        if new_name is not None and not new_name.strip():
-            return {
-                "success": False,
-                "error": "new_name cannot be empty (pass None to keep current leaf)",
-                "error_type": "validation_error",
-            }
-
-        rate_err = check_rate_limit(
-            "update_mailbox",
-            {"account": account, "name": name, "new_name": new_name,
-             "new_parent": new_parent},
-        )
-        if rate_err:
-            return rate_err
-
-        logger.info(
-            f"Updating mailbox {name!r} in {account}: "
-            f"new_name={new_name!r}, new_parent={new_parent!r}"
-        )
-
-        success = mail.update_mailbox(
-            account=account, name=name,
-            new_name=new_name, new_parent=new_parent,
-        )
-        operation_logger.log_operation(
-            "update_mailbox",
-            {"account": account, "name": name,
-             "new_name": new_name, "new_parent": new_parent},
-            "success" if success else "failure",
-        )
-        if not success:
-            return {
-                "success": False,
-                "error": (
-                    f"Mail did not confirm updating mailbox {name!r} in "
-                    f"account {account!r}; check Mail.app before retrying"
-                ),
-                "error_type": "applescript_error",
-            }
-        return {
-            "success": True,
-            "account": account,
-            "name": name,
-            "new_name": new_name,
-            "new_parent": new_parent,
-        }
-
-    except ValueError as e:
+    success = mail.update_mailbox(
+        account=account, name=name, new_name=new_name, new_parent=new_parent,
+    )
+    operation_logger.log_operation(
+        "update_mailbox", params, "success" if success else "failure",
+    )
+    if not success:
         return {
             "success": False,
-            "error": str(e),
-            "error_type": "validation_error",
-        }
-    except MailImapRequiredError as e:
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": "imap_required",
-        }
-    except MailMailboxNotFoundError as e:
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": "mailbox_not_found",
-        }
-    except MailAccountNotFoundError:
-        return {
-            "success": False,
-            "error": f"Account {account!r} not found",
-            "error_type": "account_not_found",
-        }
-    except MailAppleScriptError as e:
-        logger.error(f"AppleScript error in update_mailbox: {e}")
-        return {
-            "success": False,
-            "error": str(e),
+            "error": (
+                f"Mail did not confirm updating mailbox {name!r} in "
+                f"account {account!r}; check Mail.app before retrying"
+            ),
             "error_type": "applescript_error",
         }
-    except MailUnsupportedGmailSystemLabelError as e:
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": "unsupported_gmail_system_label",
-        }
-    except Exception as e:
-        logger.exception(f"Unexpected error in update_mailbox: {e}")
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": "unknown",
-        }
+    return {"success": True, **params}
 
 
 @_in_tool_threadpool
 @mcp.tool()
+@envelope
 def delete_mailbox(
     account: str,
     name: str,
@@ -1885,104 +1447,39 @@ def delete_mailbox(
     Returns:
         ``{success, account, name, deleted_message_count}`` on success.
     """
-    try:
-        safety_err = check_test_mode_safety("delete_mailbox", account=account)
-        if safety_err:
-            return safety_err
+    if refused := check_test_mode_safety("delete_mailbox", account=account):
+        return refused
+    if not name or not name.strip():
+        raise ValueError("Mailbox name cannot be empty")
+    params = {"account": account, "name": name, "delete_messages": delete_messages}
+    if refused := check_rate_limit("delete_mailbox", params):
+        return refused
+    verb = "delete (cascading messages)" if delete_messages else "delete (refuse if non-empty)"
+    summary = (
+        f"{verb} mailbox?\n\n"
+        f"Account: {account}\n"
+        f"Mailbox: {name}\n\n"
+        f"This is destructive. The mailbox will be removed from the IMAP server."
+    )
+    if refused := _confirm_from_threadpool(ctx, summary, "delete_mailbox", params):
+        return refused
 
-        if not name or not name.strip():
-            return {
-                "success": False,
-                "error": "Mailbox name cannot be empty",
-                "error_type": "validation_error",
-            }
-
-        rate_err = check_rate_limit(
-            "delete_mailbox",
-            {"account": account, "name": name,
-             "delete_messages": delete_messages},
-        )
-        if rate_err:
-            return rate_err
-
-        verb = "delete (cascading messages)" if delete_messages else "delete (refuse if non-empty)"
-        summary = (
-            f"{verb} mailbox?\n\n"
-            f"Account: {account}\n"
-            f"Mailbox: {name}\n\n"
-            f"This is destructive. The mailbox will be removed from the IMAP server."
-        )
-        cancel_err = _confirm_from_threadpool(
-            ctx, summary, "delete_mailbox",
-            {"account": account, "name": name,
-             "delete_messages": delete_messages},
-        )
-        if cancel_err:
-            return cancel_err
-
-        count = mail.delete_mailbox(
-            account=account, name=name, delete_messages=delete_messages
-        )
-        operation_logger.log_operation(
-            "delete_mailbox",
-            {"account": account, "name": name,
-             "delete_messages": delete_messages,
-             "deleted_message_count": count},
-            "success",
-        )
-        return {
-            "success": True,
-            "account": account,
-            "name": name,
-            "deleted_message_count": count,
-        }
-
-    except ValueError as e:
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": "validation_error",
-        }
-    except MailImapRequiredError as e:
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": "imap_required",
-        }
-    except MailMailboxNotEmptyError as e:
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": "mailbox_not_empty",
-        }
-    except MailMailboxNotFoundError as e:
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": "mailbox_not_found",
-        }
-    except MailAccountNotFoundError:
-        return {
-            "success": False,
-            "error": f"Account {account!r} not found",
-            "error_type": "account_not_found",
-        }
-    except MailUnsupportedGmailSystemLabelError as e:
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": "unsupported_gmail_system_label",
-        }
-    except Exception as e:
-        logger.exception(f"Unexpected error in delete_mailbox: {e}")
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": "unknown",
-        }
+    count = mail.delete_mailbox(
+        account=account, name=name, delete_messages=delete_messages
+    )
+    operation_logger.log_operation(
+        "delete_mailbox", {**params, "deleted_message_count": count}, "success",
+    )
+    return {
+        "success": True,
+        "account": account,
+        "name": name,
+        "deleted_message_count": count,
+    }
 
 
 @mcp.tool()
+@envelope
 def delete_messages(
     message_ids: list[str],
     permanent: bool = False,
@@ -2020,92 +1517,53 @@ def delete_messages(
         All deletes are recoverable from Trash; there is currently no
         AppleScript path to bypass it. See issue #111.
     """
-    try:
-        if not message_ids:
-            return {
-                "success": True,
-                "count": 0,
-                "message": "No messages to delete",
-            }
+    if not message_ids:
+        return {"success": True, "count": 0, "message": "No messages to delete"}
+    if refused := check_rate_limit("delete_messages", {"count": len(message_ids)}):
+        return refused
+    if len(message_ids) > 100:
+        raise ValueError(f"Cannot delete {len(message_ids)} messages at once (max: 100)")
+    # Test-mode safety: same rule as update_message; a missing account
+    # is refused under test mode, not skipped.
+    if refused := check_test_mode_safety("delete_messages", account=account):
+        return refused
 
-        rate_err = check_rate_limit("delete_messages", {"count": len(message_ids)})
-        if rate_err:
-            return rate_err
-
-        # Validate bulk operation limit
-        if len(message_ids) > 100:
-            return {
-                "success": False,
-                "error": f"Cannot delete {len(message_ids)} messages at once (max: 100)",
-                "error_type": "validation_error",
-            }
-
-        # Test-mode safety: same rule as update_message; a missing account
-        # is refused under test mode, not skipped.
-        safety_err = check_test_mode_safety("delete_messages", account=account)
-        if safety_err:
-            return safety_err
-
-        logger.info(f"Deleting {len(message_ids)} message(s) to trash")
-
-        # Delete the messages
-        count = mail.delete_messages(
-            message_ids=message_ids,
-            permanent=permanent,
-            skip_bulk_check=False,  # Enforce limit
-            account=account,
-            source_mailbox=source_mailbox,
-        )
-
-        operation_logger.log_operation(
-            "delete_messages",
-            {
-                "message_ids": message_ids,
-                "count": count,
-                "permanent_requested": permanent,
-                "account": account,
-                "source_mailbox": source_mailbox,
-            },
-            "success",
-        )
-        # `permanent` reports what happened, not what was asked: nothing
-        # bypasses Trash (issue #111), and the connector's DeprecationWarning
-        # fires in this process where no MCP client can see it.
-        response: dict[str, Any] = {
-            "success": True,
+    count = mail.delete_messages(
+        message_ids=message_ids,
+        permanent=permanent,
+        skip_bulk_check=False,  # Enforce limit
+        account=account,
+        source_mailbox=source_mailbox,
+    )
+    operation_logger.log_operation(
+        "delete_messages",
+        {
+            "message_ids": message_ids,
             "count": count,
-            "requested": len(message_ids),
-            "permanent": False,
-        }
-        if permanent:
-            response["warning"] = (
-                "permanent=True was asked for, but Mail.app exposes no way "
-                "to bypass Trash; the messages were moved to Trash and are "
-                "recoverable from there until it is emptied (issue #111)."
-            )
-        return response
+            "permanent_requested": permanent,
+            "account": account,
+            "source_mailbox": source_mailbox,
+        },
+        "success",
+    )
+    # `permanent` reports what happened, not what was asked: nothing
+    # bypasses Trash (issue #111), and the connector's DeprecationWarning
+    # fires in this process where no MCP client can see it.
+    response: dict[str, Any] = {
+        "success": True,
+        "count": count,
+        "requested": len(message_ids),
+        "permanent": False,
+    }
+    if permanent:
+        response["warning"] = (
+            "permanent=True was asked for, but Mail.app exposes no way "
+            "to bypass Trash; the messages were moved to Trash and are "
+            "recoverable from there until it is emptied (issue #111)."
+        )
+    return response
 
-    except ValueError as e:
-        logger.error(f"Validation error: {e}")
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": "validation_error",
-        }
-    except MailMessageNotFoundError as e:
-        logger.error(f"Message not found: {e}")
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": "message_not_found",
-        }
-    except Exception as e:
-        logger.error(f"Error deleting messages: {e}")
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": "unknown",
-        }
+
 def _get_template_store() -> TemplateStore:
     """Return the active TemplateStore. Re-resolved per call so the
     APPLE_MAIL_MCP_HOME env var (and test-time monkeypatching) take
@@ -2113,25 +1571,8 @@ def _get_template_store() -> TemplateStore:
     return TemplateStore()
 
 
-def _template_error_response(e: MailTemplateError) -> dict[str, Any]:
-    """Map a template exception to the standard {success, error, error_type}
-    response shape."""
-    if isinstance(e, MailTemplateNotFoundError):
-        et = "template_not_found"
-    elif isinstance(e, MailTemplateExistsError):
-        et = "template_exists"
-    elif isinstance(e, MailTemplateInvalidNameError):
-        et = "invalid_template_name"
-    elif isinstance(e, MailTemplateInvalidFormatError):
-        et = "invalid_template_format"
-    elif isinstance(e, MailTemplateMissingVariableError):
-        et = "missing_template_variable"
-    else:
-        et = "template_error"
-    return {"success": False, "error": str(e), "error_type": et}
-
-
 @mcp.tool()
+@envelope
 def list_templates() -> dict[str, Any]:
     """List all stored email templates.
 
@@ -2143,25 +1584,19 @@ def list_templates() -> dict[str, Any]:
         Dictionary with each template's name and subject (or null if
         no subject header is set).
     """
-    try:
-        rate_err = check_rate_limit("list_templates", {})
-        if rate_err:
-            return rate_err
-        templates = _get_template_store().list()
-        operation_logger.log_operation("list_templates", {}, "success")
-        return {
-            "success": True,
-            "templates": [
-                {"name": t.name, "subject": t.subject} for t in templates
-            ],
-            "count": len(templates),
-        }
-    except Exception as e:
-        logger.error(f"Error in list_templates: {e}")
-        return {"success": False, "error": str(e), "error_type": "unknown"}
+    if refused := check_rate_limit("list_templates", {}):
+        return refused
+    templates = _get_template_store().list()
+    operation_logger.log_operation("list_templates", {}, "success")
+    return {
+        "success": True,
+        "templates": [{"name": t.name, "subject": t.subject} for t in templates],
+        "count": len(templates),
+    }
 
 
 @mcp.tool()
+@envelope
 def get_template(name: str) -> dict[str, Any]:
     """Read a single template by name.
 
@@ -2172,27 +1607,21 @@ def get_template(name: str) -> dict[str, Any]:
         Dictionary with name, subject (may be null), body, and the sorted
         list of placeholder names found in subject + body.
     """
-    try:
-        rate_err = check_rate_limit("get_template", {"name": name})
-        if rate_err:
-            return rate_err
-        t = _get_template_store().get(name)
-        operation_logger.log_operation("get_template", {"name": name}, "success")
-        return {
-            "success": True,
-            "name": t.name,
-            "subject": t.subject,
-            "body": t.body,
-            "placeholders": t.placeholders(),
-        }
-    except MailTemplateError as e:
-        return _template_error_response(e)
-    except Exception as e:
-        logger.error(f"Error in get_template: {e}")
-        return {"success": False, "error": str(e), "error_type": "unknown"}
+    if refused := check_rate_limit("get_template", {"name": name}):
+        return refused
+    t = _get_template_store().get(name)
+    operation_logger.log_operation("get_template", {"name": name}, "success")
+    return {
+        "success": True,
+        "name": t.name,
+        "subject": t.subject,
+        "body": t.body,
+        "placeholders": t.placeholders(),
+    }
 
 
 @mcp.tool()
+@envelope
 def save_template(
     name: str,
     body: str,
@@ -2216,35 +1645,24 @@ def save_template(
     No confirmation prompt: creating is additive, and replacing requires
     the caller to name that intent with `overwrite=True`.
     """
-    try:
-        rate_err = check_rate_limit("save_template", {"name": name})
-        if rate_err:
-            return rate_err
-        if not isinstance(body, str) or not body.strip():
-            return {
-                "success": False,
-                "error": "body must be a non-empty string",
-                "error_type": "validation_error",
-            }
-        # Normalize body to end with a newline so on-disk files stay tidy.
-        normalized_body = body if body.endswith("\n") else body + "\n"
-        template = Template(
-            name=name, subject=subject, body=normalized_body
-        )
-        created = _get_template_store().save(template, overwrite=overwrite)
-        operation_logger.log_operation(
-            "save_template", {"name": name, "created": created}, "success"
-        )
-        return {"success": True, "name": name, "created": created}
-    except MailTemplateError as e:
-        return _template_error_response(e)
-    except Exception as e:
-        logger.error(f"Error in save_template: {e}")
-        return {"success": False, "error": str(e), "error_type": "unknown"}
+    if refused := check_rate_limit("save_template", {"name": name}):
+        return refused
+    if not isinstance(body, str) or not body.strip():
+        raise ValueError("body must be a non-empty string")
+    # Normalize body to end with a newline so on-disk files stay tidy.
+    normalized_body = body if body.endswith("\n") else body + "\n"
+    template = Template(name=name, subject=subject, body=normalized_body)
+    created = _get_template_store().save(template, overwrite=overwrite)
+    operation_logger.log_operation(
+        "save_template", {"name": name, "created": created}, "success"
+    )
+    return {"success": True, "name": name, "created": created}
 
 
+@_in_tool_threadpool
 @mcp.tool()
-async def delete_template(
+@envelope
+def delete_template(
     name: str, ctx: Context | None = None
 ) -> dict[str, Any]:
     """Delete a template by name.
@@ -2258,37 +1676,26 @@ async def delete_template(
     Returns:
         Dictionary with success status and the deleted template's name.
     """
-    try:
-        rate_err = check_rate_limit("delete_template", {"name": name})
-        if rate_err:
-            return rate_err
-        # Verify it exists before asking the user — saves them a useless
-        # confirmation prompt for a non-existent name.
-        _get_template_store().get(name)
-
-        summary = (
-            f"Delete email template '{name}'? "
-            f"This removes the file at ~/.apple_mail_mcp/templates/{name}.md."
-        )
-        cancel_err = await _elicit_confirmation(
-            ctx, summary, "delete_template", {"name": name}
-        )
-        if cancel_err:
-            return cancel_err
-
-        _get_template_store().delete(name)
-        operation_logger.log_operation(
-            "delete_template", {"name": name}, "success"
-        )
-        return {"success": True, "name": name}
-    except MailTemplateError as e:
-        return _template_error_response(e)
-    except Exception as e:
-        logger.error(f"Error in delete_template: {e}")
-        return {"success": False, "error": str(e), "error_type": "unknown"}
+    if refused := check_rate_limit("delete_template", {"name": name}):
+        return refused
+    # Verify it exists before asking the user — saves them a useless
+    # confirmation prompt for a non-existent name.
+    _get_template_store().get(name)
+    summary = (
+        f"Delete email template '{name}'? "
+        f"This removes the file at ~/.apple_mail_mcp/templates/{name}.md."
+    )
+    if refused := _confirm_from_threadpool(
+        ctx, summary, "delete_template", {"name": name}
+    ):
+        return refused
+    _get_template_store().delete(name)
+    operation_logger.log_operation("delete_template", {"name": name}, "success")
+    return {"success": True, "name": name}
 
 
 @mcp.tool()
+@envelope
 def render_template(
     name: str,
     message_id: str | None = None,
@@ -2315,36 +1722,21 @@ def render_template(
         Dictionary with the rendered subject (may be null), body, and
         the merged variable dict that was used.
     """
-    try:
-        rate_err = check_rate_limit("render_template", {"name": name})
-        if rate_err:
-            return rate_err
-        template = _get_template_store().get(name)
-        auto_vars = mail.auto_template_vars(message_id)
-        merged: dict[str, str] = {**auto_vars, **(vars or {})}
-        rendered = template.render(merged)
-        operation_logger.log_operation(
-            "render_template",
-            {"name": name, "message_id": message_id},
-            "success",
-        )
-        return {
-            "success": True,
-            "subject": rendered["subject"],
-            "body": rendered["body"],
-            "used_vars": merged,
-        }
-    except MailTemplateError as e:
-        return _template_error_response(e)
-    except MailMessageNotFoundError as e:
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": "message_not_found",
-        }
-    except Exception as e:
-        logger.error(f"Error in render_template: {e}")
-        return {"success": False, "error": str(e), "error_type": "unknown"}
+    if refused := check_rate_limit("render_template", {"name": name}):
+        return refused
+    template = _get_template_store().get(name)
+    auto_vars = mail.auto_template_vars(message_id)
+    merged: dict[str, str] = {**auto_vars, **(vars or {})}
+    rendered = template.render(merged)
+    operation_logger.log_operation(
+        "render_template", {"name": name, "message_id": message_id}, "success",
+    )
+    return {
+        "success": True,
+        "subject": rendered["subject"],
+        "body": rendered["body"],
+        "used_vars": merged,
+    }
 
 
 def _get_draft_state_store() -> DraftStateStore:
@@ -2352,69 +1744,6 @@ def _get_draft_state_store() -> DraftStateStore:
     APPLE_MAIL_MCP_HOME env var (and test-time monkeypatching) take
     effect at use time, not import time. Mirrors _get_template_store."""
     return DraftStateStore()
-
-
-def _draft_error_response(e: MailDraftError) -> dict[str, Any]:
-    """Map a draft exception to {success, error, error_type}."""
-    if isinstance(e, MailDraftNotFoundError):
-        et = "draft_not_found"
-    elif isinstance(e, MailDraftInvalidIdError):
-        et = "invalid_draft_id"
-    elif isinstance(e, MailDraftNotSettledError):
-        et = "draft_not_settled"
-    else:
-        et = "draft_error"
-    return {"success": False, "error": str(e), "error_type": et}
-
-
-def _outbound_policy_error(
-    op: str, e: MailOutboundDisallowedError
-) -> dict[str, Any]:
-    """Map an outbound-allowlist refusal to a response dict. Shared by
-    every tool behind the allowlist — the send paths and the forwarding
-    rules — so a blocked forward answers exactly as a blocked send does."""
-    from .exceptions import OutboundAllowlistUnavailableError
-
-    if isinstance(e, OutboundAllowlistUnavailableError):
-        # The policy itself is unreadable — FAIL CLOSED, distinct
-        # error_type so "fix comms.yaml" is not confused with "edit
-        # recipients".
-        logger.error(f"Outbound allowlist unavailable during {op}: {e}")
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": "allowlist_unavailable",
-        }
-    # Policy gate — recipients off the outbound allowlist.
-    logger.warning(f"Outbound allowlist blocked {op}: {e}")
-    return {
-        "success": False,
-        "error": str(e),
-        "error_type": "outbound_disallowed",
-    }
-
-
-def _draft_action_error(op: str, e: Exception) -> dict[str, Any] | None:
-    """Map a catchable draft-action exception to a response dict.
-
-    Returns None if the exception isn't one we model here (caller should
-    fall through to a generic ``unknown`` mapping). Centralizing this
-    keeps the per-tool exception handling small enough to stay under
-    the cyclomatic-complexity threshold."""
-    if isinstance(e, MailOutboundDisallowedError):
-        return _outbound_policy_error(op, e)
-    if isinstance(e, MailMessageNotFoundError):
-        return {"success": False, "error": str(e), "error_type": "message_not_found"}
-    if isinstance(e, MailAccountNotFoundError):
-        return {"success": False, "error": str(e), "error_type": "account_not_found"}
-    if isinstance(e, FileNotFoundError):
-        return {"success": False, "error": str(e), "error_type": "file_not_found"}
-    if isinstance(e, MailDraftError):
-        return _draft_error_response(e)
-    if isinstance(e, MailAppleScriptError):
-        logger.error(f"AppleScript error in {op}: {e}")
-        return {"success": False, "error": str(e), "error_type": "applescript_error"}
-    return None
 
 
 def _resolve_draft_seed(
@@ -2539,55 +1868,35 @@ def _update_draft_preflight(
     if guard_err:
         return guard_err
     if attachment_paths:
-        return _validate_attachment_files(attachment_paths)
+        _validate_attachment_files(attachment_paths)
     return None
 
 
-def _validate_attachment_files(
-    attachment_paths: list[str],
-) -> dict[str, Any] | None:
+def _validate_attachment_files(attachment_paths: list[str]) -> None:
     """Validate files the caller asks to attach, before anything is composed.
 
     Checks per the security checklist: file exists, extension not in the
-    executable blocklist, size within the 25MB cap. Returns an error
-    response dict, or None when all files pass. Every path that takes
-    attachment paths from the caller runs this — email_send_html,
-    create_draft and update_draft alike — so a draft cannot carry what a
-    send would refuse. Attachments update_draft carries over from the
-    existing draft are Mail's state, not caller input, and are not
-    re-checked here.
+    executable blocklist, size within the 25MB cap. Raises
+    ``FileNotFoundError`` or ``ValueError`` on the first file that fails.
+    Every path that takes attachment paths from the caller runs this —
+    email_send_html, create_draft and update_draft alike — so a draft
+    cannot carry what a send would refuse. Attachments update_draft
+    carries over from the existing draft are Mail's state, not caller
+    input, and are not re-checked here.
     """
-    from pathlib import Path as _P
-
-    from .security import validate_attachment_size, validate_attachment_type
-
     for raw in attachment_paths:
-        path = _P(raw)
+        path = Path(raw)
         if not path.is_file():
-            return {
-                "success": False,
-                "error": f"attachment not found: {raw}",
-                "error_type": "file_not_found",
-            }
+            raise FileNotFoundError(f"attachment not found: {raw}")
         if not validate_attachment_type(path.name):
-            return {
-                "success": False,
-                "error": (
-                    f"attachment type not allowed: {path.name} "
-                    "(executable extensions are blocked)"
-                ),
-                "error_type": "validation_error",
-            }
+            raise ValueError(
+                f"attachment type not allowed: {path.name} "
+                "(executable extensions are blocked)"
+            )
         if not validate_attachment_size(path.stat().st_size):
-            return {
-                "success": False,
-                "error": (
-                    f"attachment too large: {path.name} exceeds the "
-                    "25MB limit"
-                ),
-                "error_type": "validation_error",
-            }
-    return None
+            raise ValueError(
+                f"attachment too large: {path.name} exceeds the 25MB limit"
+            )
 
 
 def _resolve_draft_attachments(
@@ -2674,7 +1983,7 @@ def _maybe_apply_template(
     """If template_name is set, load it and merge into (subject, body).
     Caller-supplied values override the rendered output. Pass-through
     when template_name is None. Raises MailTemplateError on bad
-    templates — caller wraps in try/except + _template_error_response. (#191)
+    templates. (#191)
     """
     if not template_name:
         return subject, body
@@ -2857,8 +2166,7 @@ def _resolve_update_subject_body(
     Differs from create_draft's `_maybe_apply_template`: update treats
     `body=""` as a deliberate clear (preserved through the chain), while
     create treats `not body` as "fall through to template". Raises
-    MailTemplateError on bad templates — caller wraps in try/except +
-    `_template_error_response`. (#192)
+    MailTemplateError on bad templates. (#192)
     """
     merged_subject = subject
     merged_body = body
@@ -3019,6 +2327,7 @@ def _gate_update_draft_accounts(
 
 
 @_in_tool_threadpool
+@envelope
 def create_draft(
     reply_to: str | None = None,
     forward_of: str | None = None,
@@ -3094,126 +2403,82 @@ def create_draft(
     cc_or_none: list[str] | None = cc or None
     bcc_or_none: list[str] | None = bcc or None
     attachment_paths_or_none: list[str] | None = attachment_paths or None
-    try:
-        # ----------------------------------------------------------------
-        # Param-shape validation
-        # ----------------------------------------------------------------
-        if reply_to and forward_of:
-            return {
-                "success": False,
-                "error": "reply_to and forward_of are mutually exclusive",
-                "error_type": "validation_error",
-            }
-        if template_vars and not template_name:
-            return {
-                "success": False,
-                "error": "template_vars requires template_name",
-                "error_type": "validation_error",
-            }
+    if reply_to and forward_of:
+        raise ValueError("reply_to and forward_of are mutually exclusive")
+    if template_vars and not template_name:
+        raise ValueError("template_vars requires template_name")
 
-        # A named sender is an account this call writes into (the draft
-        # lands in its Drafts, or the mail goes out under it); in test
-        # mode it must be the test account. The send gates below see the
-        # recipients separately.
-        safety_err = check_test_mode_safety("create_draft", account=from_account)
-        if safety_err:
-            return safety_err
+    # A named sender is an account this call writes into (the draft
+    # lands in its Drafts, or the mail goes out under it); in test
+    # mode it must be the test account. The send gates below see the
+    # recipients separately.
+    if refused := check_test_mode_safety("create_draft", account=from_account):
+        return refused
 
-        seed_kind, seed_id = _resolve_create_draft_seed(reply_to, forward_of)
-
-        # ----------------------------------------------------------------
-        # Template resolution (#191: pulled out to _maybe_apply_template).
-        # ----------------------------------------------------------------
-        try:
-            subject, body = _maybe_apply_template(
-                template_name, template_vars, seed_id, subject, body,
-            )
-        except MailTemplateError as e:
-            return _template_error_response(e)
-
-        # Fresh-seed required-field validation (after template rendering
-        # so a template can supply subject/body).
-        fresh_err = _validate_fresh_seed_fields(seed_kind, to_or_none, subject)
-        if fresh_err:
-            return fresh_err
-
-        if attachment_paths_or_none:
-            attach_err = _validate_attachment_files(attachment_paths_or_none)
-            if attach_err:
-                return attach_err
-
-        # ----------------------------------------------------------------
-        # Send-only checks (drafts are local — no rate limit / safety).
-        # #191: gate chain pulled out to _run_send_now_gates.
-        # ----------------------------------------------------------------
-        if send_now:
-            gate_err = _gate_create_draft_send(
-                seed_kind=seed_kind, to=to_or_none, cc=cc_or_none,
-                bcc=bcc_or_none, subject=subject, body=body,
-                from_account=from_account,
-                attachment_paths=attachment_paths_or_none, ctx=ctx,
-            )
-            if gate_err:
-                return gate_err
-
-        # ----------------------------------------------------------------
-        # Connector call
-        # ----------------------------------------------------------------
-        attachment_path_objs = (
-            [Path(p) for p in attachment_paths_or_none]
-            if attachment_paths_or_none is not None
-            else None
-        )
-        result = mail.create_draft(
-            seed=seed_kind,
-            seed_id=seed_id,
-            to=to_or_none,
-            cc=cc_or_none,
-            bcc=bcc_or_none,
-            subject=subject,
-            body=body,
-            attachment_paths=attachment_path_objs,
-            reply_all=reply_all,
+    seed_kind, seed_id = _resolve_create_draft_seed(reply_to, forward_of)
+    subject, body = _maybe_apply_template(
+        template_name, template_vars, seed_id, subject, body,
+    )
+    # Fresh-seed required-field validation (after template rendering
+    # so a template can supply subject/body).
+    if refused := _validate_fresh_seed_fields(seed_kind, to_or_none, subject):
+        return refused
+    if attachment_paths_or_none:
+        _validate_attachment_files(attachment_paths_or_none)
+    if send_now:
+        if refused := _gate_create_draft_send(
+            seed_kind=seed_kind, to=to_or_none, cc=cc_or_none,
+            bcc=bcc_or_none, subject=subject, body=body,
             from_account=from_account,
-            send_now=send_now,
-        )
-        draft_id = result.get("draft_id", "")
+            attachment_paths=attachment_paths_or_none, ctx=ctx,
+        ):
+            return refused
 
-        _persist_draft_seed(
-            draft_id, seed_kind, seed_id, reply_all, send_now,
-        )
-
-        operation_logger.log_operation(
-            "create_draft",
-            {
-                "seed_kind": seed_kind,
-                "seed_id": seed_id,
-                "send_now": send_now,
-                "draft_id": draft_id,
-                "to": to_or_none,
-                "cc": cc_or_none,
-                "bcc": bcc_or_none,
-                "subject": subject,
-                "from_account": from_account,
-            },
-            "success",
-        )
-        return {
-            "success": True,
+    attachment_path_objs = (
+        [Path(p) for p in attachment_paths_or_none]
+        if attachment_paths_or_none is not None
+        else None
+    )
+    result = mail.create_draft(
+        seed=seed_kind,
+        seed_id=seed_id,
+        to=to_or_none,
+        cc=cc_or_none,
+        bcc=bcc_or_none,
+        subject=subject,
+        body=body,
+        attachment_paths=attachment_path_objs,
+        reply_all=reply_all,
+        from_account=from_account,
+        send_now=send_now,
+    )
+    draft_id = result.get("draft_id", "")
+    _persist_draft_seed(draft_id, seed_kind, seed_id, reply_all, send_now)
+    operation_logger.log_operation(
+        "create_draft",
+        {
+            "seed_kind": seed_kind,
+            "seed_id": seed_id,
+            "send_now": send_now,
             "draft_id": draft_id,
-            "sent_message_id": result.get("sent_message_id", ""),
-            "details": {"seed_kind": seed_kind, "send_now": send_now},
-        }
-
-    except Exception as e:
-        handled = _draft_action_error("create_draft", e)
-        if handled is not None:
-            return handled
-        logger.exception(f"Unexpected error in create_draft: {e}")
-        return {"success": False, "error": str(e), "error_type": "unknown"}
+            "to": to_or_none,
+            "cc": cc_or_none,
+            "bcc": bcc_or_none,
+            "subject": subject,
+            "from_account": from_account,
+        },
+        "success",
+    )
+    return {
+        "success": True,
+        "draft_id": draft_id,
+        "sent_message_id": result.get("sent_message_id", ""),
+        "details": {"seed_kind": seed_kind, "send_now": send_now},
+    }
 
 
 @_in_tool_threadpool
+@envelope
 def update_draft(
     draft_id: str,
     to: list[str] | None = None,
@@ -3278,68 +2543,42 @@ def update_draft(
     Returns:
         ``{"success": True, "draft_id": "<NEW>", "sent_message_id": ""}``.
     """
-    tempdir: tempfile.TemporaryDirectory[str] | None = None
+    if template_vars and not template_name:
+        raise ValueError("template_vars requires template_name")
+    state = mail.get_draft_state(draft_id)
+
+    # A draft id names a draft in any account; the state read says
+    # which, and the update must stay in the test account.
+    draft_account = cast(str, state.get("account") or "") or None
+    if refused := _gate_update_draft_accounts(draft_account, from_account):
+        return refused
+
+    store = _get_draft_state_store()
+    seed_kind, seed_id, reply_all = _resolve_draft_seed(draft_id, state, store)
+    if refused := _update_draft_preflight(
+        send_now, seed_kind,
+        from_account=from_account,
+        attachment_paths=attachment_paths,
+        existing_names=state.get("attachment_names", []) or [],
+    ):
+        return refused
+    final_subject, final_body = _resolve_update_subject_body(
+        subject, body, template_name, template_vars, seed_id, state,
+    )
+    final_to, final_cc, final_bcc = _merge_draft_recipients(to, cc, bcc, state)
+    final_from = _resolve_update_sender(from_account, state, seed_kind, send_now)
+
+    final_attachments, tempdir = _resolve_draft_attachments(
+        draft_id, attachment_paths, state.get("attachment_names", []) or []
+    )
     try:
-        if template_vars and not template_name:
-            return {
-                "success": False,
-                "error": "template_vars requires template_name",
-                "error_type": "validation_error",
-            }
-
-        try:
-            state = mail.get_draft_state(draft_id)
-        except MailDraftError as e:
-            return _draft_error_response(e)
-
-        # A draft id names a draft in any account; the state read says
-        # which, and the update must stay in the test account.
-        draft_account = cast(str, state.get("account") or "") or None
-        safety_err = _gate_update_draft_accounts(draft_account, from_account)
-        if safety_err:
-            return safety_err
-
-        store = _get_draft_state_store()
-        seed_kind, seed_id, reply_all = _resolve_draft_seed(
-            draft_id, state, store
-        )
-
-        preflight_err = _update_draft_preflight(
-            send_now, seed_kind,
-            from_account=from_account,
-            attachment_paths=attachment_paths,
-            existing_names=state.get("attachment_names", []) or [],
-        )
-        if preflight_err:
-            return preflight_err
-
-        try:
-            final_subject, final_body = _resolve_update_subject_body(
-                subject, body, template_name, template_vars, seed_id, state,
-            )
-        except MailTemplateError as e:
-            return _template_error_response(e)
-
-        final_to, final_cc, final_bcc = _merge_draft_recipients(
-            to, cc, bcc, state,
-        )
-        final_from = _resolve_update_sender(
-            from_account, state, seed_kind, send_now,
-        )
-
-        # tempdir (if any) is cleaned up in the finally block.
-        final_attachments, tempdir = _resolve_draft_attachments(
-            draft_id, attachment_paths, state.get("attachment_names", []) or []
-        )
-
         if send_now:
-            gate_err = _gate_update_draft_send(
+            if refused := _gate_update_draft_send(
                 seed_kind=seed_kind, draft_id=draft_id, account=draft_account,
                 to=final_to, cc=final_cc, bcc=final_bcc,
                 subject=final_subject, body=final_body or "", ctx=ctx,
-            )
-            if gate_err:
-                return gate_err
+            ):
+                return refused
 
         # Recreate, then retire. The old draft is the only copy the caller
         # holds an id for, so nothing is removed until the new message
@@ -3357,54 +2596,41 @@ def update_draft(
             from_account=final_from,
             send_now=send_now,
         )
-        new_draft_id = result.get("draft_id", "")
-
-        _persist_draft_seed(
-            new_draft_id, seed_kind, seed_id, reply_all, send_now,
-        )
-        warning = _retire_old_draft(
-            draft_id, store, new_draft_id=new_draft_id, sent=send_now,
-        )
-
-        operation_logger.log_operation(
-            "update_draft",
-            {
-                "old_draft_id": draft_id,
-                "new_draft_id": new_draft_id,
-                "old_draft_removed": warning is None,
-                "send_now": send_now,
-                "to": final_to,
-                "cc": final_cc,
-                "bcc": final_bcc,
-                "subject": final_subject,
-                "from_account": final_from,
-            },
-            "success",
-        )
-        response: dict[str, Any] = {
-            "success": True,
-            "draft_id": new_draft_id,
-            "sent_message_id": result.get("sent_message_id", ""),
-            "details": {"seed_kind": seed_kind, "send_now": send_now},
-        }
-        if warning is not None:
-            response["warning"] = warning
-        return response
-
-    except Exception as e:
-        handled = _draft_action_error("update_draft", e)
-        if handled is not None:
-            return handled
-        logger.exception(f"Unexpected error in update_draft: {e}")
-        return {"success": False, "error": str(e), "error_type": "unknown"}
     finally:
         if tempdir is not None:
-            try:
-                tempdir.cleanup()
-            except Exception:
-                pass
+            tempdir.cleanup()
+    new_draft_id = result.get("draft_id", "")
+    _persist_draft_seed(new_draft_id, seed_kind, seed_id, reply_all, send_now)
+    warning = _retire_old_draft(
+        draft_id, store, new_draft_id=new_draft_id, sent=send_now,
+    )
+    operation_logger.log_operation(
+        "update_draft",
+        {
+            "old_draft_id": draft_id,
+            "new_draft_id": new_draft_id,
+            "old_draft_removed": warning is None,
+            "send_now": send_now,
+            "to": final_to,
+            "cc": final_cc,
+            "bcc": final_bcc,
+            "subject": final_subject,
+            "from_account": final_from,
+        },
+        "success",
+    )
+    response: dict[str, Any] = {
+        "success": True,
+        "draft_id": new_draft_id,
+        "sent_message_id": result.get("sent_message_id", ""),
+        "details": {"seed_kind": seed_kind, "send_now": send_now},
+    }
+    if warning is not None:
+        response["warning"] = warning
+    return response
 
 
+@envelope
 def delete_draft(draft_id: str) -> dict[str, Any]:
     """Internal: delete (move to Trash) an existing draft.
 
@@ -3423,34 +2649,20 @@ def delete_draft(draft_id: str) -> dict[str, Any]:
         ``{"success": True}`` on a clean delete; an error response if
         no draft with that id exists.
     """
-    try:
-        # A draft id names a draft in any account; read which before
-        # acting, so test mode can keep the delete in the test account.
-        state = mail.get_draft_state(draft_id)
-        safety_err = check_test_mode_safety(
-            "delete_draft", account=cast(str, state.get("account") or "") or None,
-        )
-        if safety_err:
-            return safety_err
-        mail.delete_draft(draft_id)
-        _get_draft_state_store().delete(draft_id)
-        operation_logger.log_operation(
-            "delete_draft", {"draft_id": draft_id, "account": state.get("account")},
-            "success",
-        )
-        return {"success": True, "draft_id": draft_id}
-    except MailDraftError as e:
-        return _draft_error_response(e)
-    except MailAppleScriptError as e:
-        logger.error(f"AppleScript error in delete_draft: {e}")
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": "applescript_error",
-        }
-    except Exception as e:
-        logger.exception(f"Unexpected error in delete_draft: {e}")
-        return {"success": False, "error": str(e), "error_type": "unknown"}
+    # A draft id names a draft in any account; read which before
+    # acting, so test mode can keep the delete in the test account.
+    state = mail.get_draft_state(draft_id)
+    if refused := check_test_mode_safety(
+        "delete_draft", account=cast(str, state.get("account") or "") or None,
+    ):
+        return refused
+    mail.delete_draft(draft_id)
+    _get_draft_state_store().delete(draft_id)
+    operation_logger.log_operation(
+        "delete_draft", {"draft_id": draft_id, "account": state.get("account")},
+        "success",
+    )
+    return {"success": True, "draft_id": draft_id}
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -3710,18 +2922,8 @@ def _draft_send_refusal(draft_id: str) -> dict[str, Any] | None:
     """
     try:
         state = mail.get_draft_state(draft_id)
-    except MailDraftError as e:
-        return _draft_error_response(e)
-    except MailAppleScriptError as e:
-        logger.error(f"AppleScript error reading draft for draft_send: {e}")
-        return {
-            "success": False,
-            "error": str(e),
-            "error_type": "applescript_error",
-        }
-
-    from .exceptions import OutboundAllowlistUnavailableError
-    from .outbound_allowlist import disallowed_recipients
+    except Exception as e:
+        return error_response("draft_send", e)
 
     all_r = (
         list(state.get("to") or [])
@@ -3799,7 +3001,7 @@ def _validate_html_send_content(
             "error_type": "attachments_unsupported",
         }
     if attachment_paths:
-        return _validate_attachment_files(attachment_paths)
+        _validate_attachment_files(attachment_paths)
     return None
 
 
@@ -3846,8 +3048,6 @@ def _validate_html_send_request(
         return content_err
 
     # Hard allowlist policy gate — same as draft_send.
-    from .exceptions import OutboundAllowlistUnavailableError
-    from .outbound_allowlist import disallowed_recipients
     try:
         bad = disallowed_recipients(all_recipients)
     except OutboundAllowlistUnavailableError as e:
@@ -3878,22 +3078,14 @@ def _validate_html_send_request(
             "error_type": "validation_error",
         }
 
-    from .outbound_allowlist import assert_recipients_allowed_for_send
     if all_recipients:
-        try:
-            assert_recipients_allowed_for_send(
-                to, cc_list or None, bcc_list or None
-            )
-        except Exception as e:
-            handled = _draft_action_error("email_send_html", e)
-            if handled is not None:
-                return handled
-            return {"success": False, "error": str(e), "error_type": "unknown"}
+        assert_recipients_allowed_for_send(to, cc_list or None, bcc_list or None)
     return None
 
 
 @_in_tool_threadpool
 @mcp.tool()
+@envelope
 def email_send_html(
     to: list[str] = [],  # noqa: B006 — coerced below
     subject: str = "",
@@ -3959,19 +3151,17 @@ def email_send_html(
     attachment_paths = attachment_paths or []
     all_recipients = list(to) + list(cc_list) + list(bcc_list)
 
-    err = _validate_html_send_request(
+    if refused := _validate_html_send_request(
         to=to, cc_list=cc_list, bcc_list=bcc_list, subject=subject,
         reply_to=reply_to, from_account=from_account,
         attachment_paths=attachment_paths, all_recipients=all_recipients,
-    )
-    if err:
-        return err
-
+    ):
+        return refused
     summary = _build_draft_send_summary(
         "reply" if reply_to is not None else "new",
         to, cc_list or None, bcc_list or None, subject, body,
     )
-    gate_err = _run_send_now_gates(
+    if refused := _run_send_now_gates(
         operation="email_send_html",
         ctx=ctx,
         recipients=all_recipients,
@@ -3979,44 +3169,36 @@ def email_send_html(
         summary=summary,
         elicit_extra={"subject": subject, "to": to},
         account=from_account,
-    )
-    if gate_err:
-        return gate_err
+    ):
+        return refused
 
-    try:
-        result = mail._send_html_email(
-            to=to,
-            cc=cc_list or None,
-            bcc=bcc_list or None,
-            subject=subject,
-            body=body,
-            from_account=from_account,
-            reply_to=reply_to,
-            attachment_paths=[Path(a) for a in attachment_paths] or None,
-        )
-        operation_logger.log_operation(
-            "email_send_html",
-            {
-                "to": to,
-                "cc": cc_list,
-                "bcc": bcc_list,
-                "subject": subject,
-                "from_account": from_account,
-                "reply_to": reply_to,
-            },
-            "success",
-        )
-        return {
-            "success": True,
-            "draft_id": result.get("draft_id", ""),
-            "sent_message_id": result.get("sent_message_id", ""),
-        }
-    except Exception as e:
-        handled = _draft_action_error("email_send_html", e)
-        if handled is not None:
-            return handled
-        logger.exception(f"Unexpected error in email_send_html: {e}")
-        return {"success": False, "error": str(e), "error_type": "unknown"}
+    result = mail._send_html_email(
+        to=to,
+        cc=cc_list or None,
+        bcc=bcc_list or None,
+        subject=subject,
+        body=body,
+        from_account=from_account,
+        reply_to=reply_to,
+        attachment_paths=[Path(a) for a in attachment_paths] or None,
+    )
+    operation_logger.log_operation(
+        "email_send_html",
+        {
+            "to": to,
+            "cc": cc_list,
+            "bcc": bcc_list,
+            "subject": subject,
+            "from_account": from_account,
+            "reply_to": reply_to,
+        },
+        "success",
+    )
+    return {
+        "success": True,
+        "draft_id": result.get("draft_id", ""),
+        "sent_message_id": result.get("sent_message_id", ""),
+    }
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
