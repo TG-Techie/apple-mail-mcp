@@ -23,6 +23,18 @@ def _reset_rate_limiter() -> None:
 
 
 @pytest.fixture(autouse=True)
+def _test_account_is_its_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unit tests do not drive Mail. The test-mode gate looks up the test
+    account's UUID with osascript; here the account is known by its name
+    alone. The tests of that lookup override this fixture and mock
+    subprocess.run instead."""
+    monkeypatch.setattr(
+        "apple_mail_mcp.security._get_test_account_identifiers",
+        lambda name: frozenset({name}),
+    )
+
+
+@pytest.fixture(autouse=True)
 def _allowlist_test_domains(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

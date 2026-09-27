@@ -1451,9 +1451,6 @@ class TestANamedSenderIsConfinedInTestMode:
 
     @pytest.fixture
     def test_mode(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from apple_mail_mcp.security import _get_test_account_identifiers
-
-        _get_test_account_identifiers.cache_clear()
         monkeypatch.setenv("MAIL_TEST_MODE", "true")
         monkeypatch.setenv("MAIL_TEST_ACCOUNT", "TestAccount")
 
@@ -1545,9 +1542,6 @@ class TestADraftIdReachesEveryAccountInTestMode:
 
     @pytest.fixture
     def test_mode(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from apple_mail_mcp.security import _get_test_account_identifiers
-
-        _get_test_account_identifiers.cache_clear()
         monkeypatch.setenv("MAIL_TEST_MODE", "true")
         monkeypatch.setenv("MAIL_TEST_ACCOUNT", "TestAccount")
 
@@ -1659,11 +1653,6 @@ class TestEachDraftToolAnswersToItsOwnName:
     def test_mode(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("MAIL_TEST_MODE", "true")
         monkeypatch.setenv("MAIL_TEST_ACCOUNT", "TestAccount")
-        # The test account's identifiers are its name alone: no osascript.
-        monkeypatch.setattr(
-            "apple_mail_mcp.security._get_test_account_identifiers",
-            lambda name: frozenset({name}),
-        )
 
     @staticmethod
     def _logged() -> list[tuple[str, str]]:
