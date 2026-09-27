@@ -51,6 +51,29 @@ Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_
 }
 ```
 
+## Running as a fleet daemon
+
+Where many agent sessions share one Mail, the server can instead run as one
+resident daemon, with a thin stdio proxy per session. The stdio entry above is
+unchanged, and a client that runs its own server needs neither.
+
+- `mail-serve` is the daemon. It serves the tools over streamable HTTP on
+  `127.0.0.1:41108`, loopback only (`--port` to change it; 41108 is
+  provisional). It runs under pm2, declared in control-pane's
+  `ecosystem.config.cjs`, which launches it from this repo as
+  `uv run --project <this repo> mail-serve`.
+- `pm2 restart mail-serve` is a deploy. A session already connected through
+  its proxy reaches the new daemon on its next call; changed instructions
+  reach a session when it next starts.
+- `mail-proxy` is what a session launches:
+  `uv run --project /Users/agent-access/AgentAccessEnv/mcp/apple-mail-mcp mail-proxy`.
+  It takes no arguments and declares nothing of its own. Every listing and
+  call, confirmation prompts included, is forwarded to the daemon, and the
+  daemon's instructions are fetched when the proxy starts.
+  `APPLE_MAIL_SERVER_URL` points it at a daemon elsewhere.
+- Registering `mail-proxy` in a session's MCP configuration is the operator's
+  edit.
+
 ## Permissions
 
 On first run, macOS will prompt for Automation access. Grant permission in:

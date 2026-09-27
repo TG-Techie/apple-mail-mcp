@@ -22,7 +22,12 @@ make coverage              # Coverage report
 ./scripts/check_version_sync.sh        # Version consistency across files
 ```
 
-**Running the server:** `uv run python -m apple_mail_mcp.server` or via Claude Desktop config.
+**Running the server:** `uv run python -m apple_mail_mcp.server` (stdio) or via Claude Desktop config. As a fleet daemon (README, "Running as a fleet daemon"):
+
+```bash
+uv run mail-serve          # Resident daemon under pm2: HTTP on 127.0.0.1:41108 (--port to change)
+uv run mail-proxy          # What a session launches: stdio proxy to the daemon (APPLE_MAIL_SERVER_URL overrides)
+```
 
 ## API Surface (25 MCP tools)
 
