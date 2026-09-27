@@ -480,8 +480,8 @@ class TestDraftsLifecycleIntegration:
             # Subject auto-prefixed by Mail.
             assert state["subject"].startswith("Re:"), \
                 f"expected Re: prefix; got {state['subject']!r}"
-            # User body replaces Mail's auto-quote (per design tradeoff:
-            # auto-quote isn't readable from outgoing-msg-ref before save).
+            # The caller's text goes above Mail's quote, which stays;
+            # test_loopback.py checks the order on delivered mail.
             assert "ZZZ-AMM-INTEG-REPLY-BODY" in state["body"]
         finally:
             connector.delete_draft(draft_id)

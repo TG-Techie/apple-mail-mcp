@@ -3968,8 +3968,16 @@ class AppleMailConnector:
         seed_id_safe: str | None,
         reply_all: bool,
         subject_safe: str | None,
+        open_window: bool = False,
     ) -> str:
         """Per-seed AppleScript fragment that produces ``theMessage``.
+
+        ``open_window`` opens a reply or forward in a visible compose
+        window, the only way to add text above what Mail wrote: its
+        content is not readable before send, and any edit to it through
+        the dictionary replaces the quote or forwarded message and drops
+        a forward's attachments (measured 2026-09-26, see
+        ``_compose_note_above_seed``).
 
         The reply/forward branches share the cross-account ``whose id
         is "{seed_id_safe}"`` lookup pattern, differing only in the
@@ -4010,7 +4018,7 @@ class AppleMailConnector:
                 if origMsg is not missing value then exit repeat
             end repeat
             if origMsg is missing value then error "SEED_NOT_FOUND"
-            set theMessage to {verb} origMsg opening window false
+            set theMessage to {verb} origMsg opening window {"true" if open_window else "false"}
         """
 
     @staticmethod
@@ -4145,6 +4153,58 @@ class AppleMailConnector:
             end if
         end if
         """
+
+    @staticmethod
+    def _as_new_compose_window_block() -> str:
+        """AppleScript fragment: name the compose window a reply or
+        forward verb just opened, by comparing Mail's window names before
+        and after it, counting each name. A name already open does not
+        hide a new window of the same name: a draft saved through the
+        dictionary leaves its window behind
+        (docs/research/icloud-draft-resync.md, Observation 5), and a plain
+        set difference then saw no new window at all (2026-09-26).
+
+        Needs ``beforeNames`` (System Events' ``name of windows`` of Mail)
+        set before the verb; sets ``newName``. Errors NO_COMPOSE_WINDOW
+        when no window appeared within 5 s, and
+        COMPOSE_WINDOW_NOT_UNIQUE when the new window shares its name
+        with one already open: every later step (paste, read-back,
+        verified send, discard, save) addresses the window by name, so it
+        could act on the other one. That window is left open, not closed,
+        since which of the two is the new one cannot be told by name.
+        """
+        return """
+-- Identify the new compose window by comparing counted names (bounded poll).
+set newName to ""
+set sameNamed to 0
+repeat 10 times
+    delay 0.5
+    tell application "System Events"
+        tell application process "Mail"
+            set afterNames to name of windows
+        end tell
+    end tell
+    repeat with n in afterNames
+        set nm to (n as text)
+        set afterCount to 0
+        repeat with m in afterNames
+            if (m as text) is nm then set afterCount to afterCount + 1
+        end repeat
+        set beforeCount to 0
+        repeat with m in beforeNames
+            if (m as text) is nm then set beforeCount to beforeCount + 1
+        end repeat
+        if afterCount > beforeCount then
+            set newName to nm
+            set sameNamed to afterCount
+            exit repeat
+        end if
+    end repeat
+    if newName is not "" then exit repeat
+end repeat
+if newName is "" then error "NO_COMPOSE_WINDOW: no compose window appeared within 5 s"
+if sameNamed > 1 then error "COMPOSE_WINDOW_NOT_UNIQUE: Mail opened a compose window named " & newName & " while another window of that name was open, so it cannot be addressed safely and was left open; close the other window of that name and retry"
+"""
 
     @staticmethod
     def _as_discard_compose_block(win_name_var: str) -> str:
@@ -4329,8 +4389,8 @@ class AppleMailConnector:
         )
 
     @staticmethod
-    def _paste_probe_strings(body: str) -> tuple[str, str]:
-        """Compute the paste read-back probes for an HTML body.
+    def _paste_probe_strings(body: str, plain: bool = False) -> tuple[str, str]:
+        """Compute the paste read-back probes for a body.
 
         Returns ``(snippet, raw_marker)``:
           - ``snippet``: first chunk of the TAG-STRIPPED text content —
@@ -4341,7 +4401,12 @@ class AppleMailConnector:
             with a tag — if this appears LITERALLY in the WebArea, the
             paste degraded to plain text (the 2026-07-21 raw-``<p>``
             regression; see docs/reference/UI_GROUNDING_MAIL_SEND.md).
+
+        A ``plain`` body is its own text: the snippet is the text itself
+        and there is no raw marker, since angle brackets in it are text.
         """
+        if plain:
+            return " ".join(body.split())[:24].strip(), ""
         text = re.sub(r"<[^>]+>", " ", body)
         text = " ".join(text.split())
         snippet = text[:24].strip()
@@ -4355,9 +4420,11 @@ class AppleMailConnector:
         body: str,
         place_above_existing: bool,
         undo_first: bool,
+        plain: bool = False,
     ) -> str:
         """Full osascript source: verified HTML paste into the named
-        compose window (2026-07-22 raw-``<p>`` regression fixes):
+        compose window (2026-07-22 raw-``<p>`` regression fixes), or a
+        plain-text paste when ``plain``:
 
           1. readiness — poll until the body WebArea EXISTS (window-name
              alone races WebKit initialization);
@@ -4397,12 +4464,13 @@ class AppleMailConnector:
             if undo_first
             else ""
         )
+        flavor = "public.utf8-plain-text" if plain else "public.html"
         return f"""
 use framework "AppKit"
 use framework "Foundation"
 use scripting additions
 
-set theHTML to "{body_safe}"
+set theBody to "{body_safe}"
 set composeName to "{win_safe}"
 
 set pb to current application's NSPasteboard's generalPasteboard()
@@ -4415,10 +4483,10 @@ repeat with t in savedTypes
     end if
 end repeat
 
-set htmlNSString to current application's NSString's stringWithString:theHTML
-set htmlData to htmlNSString's dataUsingEncoding:(current application's NSUTF8StringEncoding)
+set bodyNSString to current application's NSString's stringWithString:theBody
+set bodyData to bodyNSString's dataUsingEncoding:(current application's NSUTF8StringEncoding)
 pb's clearContents()
-pb's setData:htmlData forType:"public.html"
+pb's setData:bodyData forType:"{flavor}"
 
 try
     tell application "Mail" to activate
@@ -4670,24 +4738,7 @@ tell application "Mail"
     if origMsg is missing value then error "SEED_NOT_FOUND"
     set replyMsg to reply origMsg opening window true
 end tell
--- Identify the new compose window by set-diff (bounded poll).
-set newName to ""
-repeat 10 times
-    delay 0.5
-    tell application "System Events"
-        tell application process "Mail"
-            set afterNames to name of windows
-        end tell
-    end tell
-    repeat with n in afterNames
-        if beforeNames does not contain (n as text) then
-            set newName to (n as text)
-            exit repeat
-        end if
-    end repeat
-    if newName is not "" then exit repeat
-end repeat
-if newName is "" then error "NO_REPLY_WINDOW"
+{self._as_new_compose_window_block()}
 tell application "Mail"
     {to_over}
     {cc_over}
@@ -4713,24 +4764,9 @@ end tell
         resolved_cc = [str(a) for a in (meta.get("cc") or [])]
         resolved_bcc = [str(a) for a in (meta.get("bcc") or [])]
 
-        # HARD POLICY GATE on the post-override recipients read back from
-        # the model. No exceptions. On failure: discard (verified), raise.
-        try:
-            assert_recipients_allowed_for_send(
-                resolved_to or None,
-                resolved_cc or None,
-                resolved_bcc or None,
-                seed="new",
-            )
-        except MailOutboundDisallowedError:
-            win_safe = escape_applescript_string(win_name)
-            self._run_applescript(
-                f'set discardName to "{win_safe}"\n'
-                + self._as_discard_compose_block("discardName")
-                + "\nreturn discardOutcome"
-            )
-            raise
-
+        self._gate_compose_recipients(
+            win_name, resolved_to, resolved_cc, resolved_bcc
+        )
         return self._inject_html_and_send(
             window_name=win_name,
             sent_subject=derived_subject,
@@ -4760,7 +4796,27 @@ end tell
         then a loud PASTE_FAILED. The compose window is left intact on
         failure for recovery.
         """
-        snippet, raw_marker = self._paste_probe_strings(body)
+        self._paste_verified(
+            window_name=window_name,
+            body=body,
+            place_above_existing=place_above_existing,
+        )
+        return self._send_compose_window(window_name, sent_subject)
+
+    def _paste_verified(
+        self,
+        *,
+        window_name: str,
+        body: str,
+        place_above_existing: bool,
+        plain: bool = False,
+    ) -> None:
+        """Paste ``body`` into the named compose window and read it back
+        from a fresh process: HTML by default, plain text when ``plain``.
+        One undo-and-retry; on a second failure the window is salvaged to
+        Drafts and ``MailAppleScriptError`` names what the read-back saw.
+        """
+        snippet, raw_marker = self._paste_probe_strings(body, plain=plain)
 
         for attempt in (1, 2):
             paste_result = self._run_applescript(
@@ -4769,6 +4825,7 @@ end tell
                     body=body,
                     place_above_existing=place_above_existing,
                     undo_first=(attempt == 2),
+                    plain=plain,
                 )
             ).strip()
             if paste_result != "PASTED_UNVERIFIED":
@@ -4786,7 +4843,7 @@ end tell
             arrived = (not snippet) or (snippet in seen_norm)
             degraded = bool(raw_norm) and raw_norm in seen_norm
             if arrived and not degraded:
-                break
+                return
             if attempt == 2:
                 salvage = self._salvage_compose_to_draft(window_name)
                 raise MailAppleScriptError(
@@ -4795,6 +4852,35 @@ end tell
                     f"(compose window: {salvage})"
                 )
 
+    def _gate_compose_recipients(
+        self,
+        window_name: str,
+        to: list[str],
+        cc: list[str],
+        bcc: list[str],
+    ) -> None:
+        """HARD POLICY GATE on the recipients an open compose window will
+        send to, as read back from the outgoing-message model after every
+        override. No exceptions. On failure the window is discarded
+        (verified) and ``MailOutboundDisallowedError`` raised, before
+        anything is pasted or sent."""
+        try:
+            assert_recipients_allowed_for_send(
+                to or None, cc or None, bcc or None, seed="new"
+            )
+        except MailOutboundDisallowedError:
+            win_safe = escape_applescript_string(window_name)
+            self._run_applescript(
+                f'set discardName to "{win_safe}"\n'
+                + self._as_discard_compose_block("discardName")
+                + "\nreturn discardOutcome"
+            )
+            raise
+
+    def _send_compose_window(self, window_name: str, sent_subject: str) -> dict[str, str]:
+        """Run the verified send on the named compose window; on any
+        outcome but SENT the window is salvaged to Drafts and the outcome
+        raised."""
         win_safe = escape_applescript_string(window_name)
         subject_safe = escape_applescript_string(sent_subject)
         send_script = (
@@ -5193,8 +5279,13 @@ end if
             subject: Subject. For ``seed="new"`` this is required by the
                 caller. For reply/forward, ``None`` keeps Mail's
                 auto-derived ``Re:``/``Fwd:`` prefix; non-None overrides.
-            body: Body text. For reply/forward, prepended above the
-                auto-quoted original (``body + "\\n\\n" + auto-content``).
+            body: Body text. For reply/forward, a non-empty body goes
+                above what Mail wrote, which stays: the quoted original,
+                or the forwarded message with its header block and every
+                attachment Mail carried. It is pasted as plain text in a
+                visible compose window (``_compose_note_above_seed``), so
+                Mail comes to the front for a few seconds. An empty body
+                leaves Mail's quote or forward exactly as Mail made it.
             attachment_paths: List of file paths. Each must exist.
             reply_all: For ``seed="reply"`` only — use ``reply to all``.
             from_account: Mail.app account name or UUID; ``None`` uses
@@ -5248,78 +5339,50 @@ end if
         # internal id before the `whose id is` lookup below. (#205)
         seed_id = self._maybe_resolve_rfc_seed_id(seed, seed_id)
 
-        # Escape user inputs.
-        body_safe = escape_applescript_string(sanitize_input(body))
-        subject_safe = (
-            escape_applescript_string(sanitize_input(subject))
-            if subject is not None
-            else None
-        )
         seed_id_safe = (
             escape_applescript_string(sanitize_input(seed_id))
             if seed_id is not None
             else None
         )
+        headers_block = self._draft_headers_block(
+            seed=seed,
+            to=to,
+            cc=cc,
+            bcc=bcc,
+            subject=subject,
+            attachment_paths=attachment_paths,
+            from_account=from_account,
+        )
 
-        # Sender clause. Apply the SECURITY_CHECKLIST two-step idiom
-        # (sanitize_input then escape_applescript_string) even though the
-        # resolver pulls from Mail.app's own account list — the convention
-        # exists so we don't have to risk-assess each site individually,
-        # and the Display-Name <email> form from #158 broadened what
-        # characters can appear here. (#173)
-        sender_clause = ""
-        if from_account is not None:
-            sender_email = self._resolve_account_to_sender(from_account)
-            sender_safe = escape_applescript_string(sanitize_input(sender_email))
-            sender_clause = f'set sender of theMessage to "{sender_safe}"'
-
-        # Recipient blocks: AppleScript fragments that, when included,
-        # clear and re-populate that recipient group on `theMessage`.
-        def _recipient_block(kind: str, addrs: list[str] | None) -> str:
-            if addrs is None:
-                return ""  # keep auto-derived
-            list_str = ", ".join(
-                f'"{escape_applescript_string(a)}"' for a in addrs
+        # A note on a reply or forward goes ABOVE what Mail wrote, which
+        # only a visible compose window allows (_compose_note_above_seed).
+        # With no note, Mail's quote or forwarded message is left exactly
+        # as Mail made it, by the dictionary path below.
+        if seed != "new" and body:
+            return self._compose_note_above_seed(
+                seed=seed,
+                seed_id=seed_id,
+                seed_id_safe=seed_id_safe,
+                reply_all=reply_all,
+                headers_block=headers_block,
+                body=body,
+                send_now=send_now,
             )
-            return f"""
-                delete (every {kind} recipient of theMessage)
-                repeat with addr in {{{list_str}}}
-                    make new {kind} recipient at end of {kind} recipients of theMessage with properties {{address:addr}}
-                end repeat
-            """
 
-        to_block = _recipient_block("to", to)
-        cc_block = _recipient_block("cc", cc)
-        bcc_block = _recipient_block("bcc", bcc)
-
-        attachment_block = self._build_attachment_block(attachment_paths)
-
-        # Subject override (reply/forward only — for new, subject is set
-        # via `make new outgoing message ... properties`).
-        subject_override = ""
-        if seed != "new" and subject is not None:
-            subject_override = f'set subject of theMessage to "{subject_safe}"'
-
-        # Body handling differs by seed:
-        #
-        # - new: body baked into `make new outgoing message` properties.
-        # - reply/forward: Mail.app's auto-quoted content is NOT readable
-        #   from `content of d` until AFTER save (where the draft becomes
-        #   immutable), so true prepending is impossible. Tradeoff:
-        #     * non-empty body  -> override Mail's auto-content with user
-        #       body (loses inline quote but preserves threading headers).
-        #     * empty body      -> leave Mail's auto-content alone (the
-        #       quoted-reply default the user gets in Mail.app).
-        # For "new", body_block always sets content (body may be empty string;
-        # that's intentional — we never want content: in the creation
-        # properties, see _build_creation_block docstring).
-        # For reply/forward: non-empty body overrides Mail's auto-quoted
-        # content; empty body leaves the auto-quote intact.
-        if seed == "new" or body:
-            body_block = f'set content of theMessage to "{body_safe}"'
-        else:
-            body_block = ""
-
+        # A fresh message's body is set here, never in the creation
+        # properties (see _build_creation_block); it may be empty. A reply
+        # or forward reaching this point has no body, and its content is
+        # not touched: any edit to it replaces what Mail wrote.
+        body_block = (
+            f'set content of theMessage to "{escape_applescript_string(sanitize_input(body))}"'
+            if seed == "new"
+            else ""
+        )
+        subject_safe = (
+            escape_applescript_string(sanitize_input(subject))
+            if subject is not None
+            else None
+        )
         creation_block = self._build_creation_block(
             seed, seed_id_safe, reply_all, subject_safe,
         )
@@ -5375,20 +5438,35 @@ end if
 
             {creation_block}
 
-            {subject_override}
             {body_block}
-            {to_block}
-            {cc_block}
-            {bcc_block}
-            {attachment_block}
-            {sender_clause}
+            {headers_block}
 
             {terminal_block}
         end tell
         """
 
+        result = self._run_seeded_script(script, seed_id)
+
+        if send_now:
+            return {"draft_id": "", "sent_message_id": ""}
+        if not result:
+            raise self._draft_not_settled()
+        return {"draft_id": result, "sent_message_id": ""}
+
+    def _draft_not_settled(self) -> MailDraftNotSettledError:
+        return MailDraftNotSettledError(
+            "Mail accepted the save but the new draft did not appear "
+            "in Drafts within "
+            f"{self._DRAFT_APPEAR_POLLS * self._DRAFT_APPEAR_INTERVAL_S:g}s, "
+            "so there is no id to return; look for it in Mail.app "
+            "before saving again. Nothing was sent."
+        )
+
+    def _run_seeded_script(self, script: str, seed_id: str | None) -> str:
+        """Run a create_draft script, mapping its SEED_NOT_FOUND to
+        ``MailMessageNotFoundError``."""
         try:
-            result = self._run_applescript(script).strip()
+            return self._run_applescript(script).strip()
         except MailAppleScriptError as e:
             if "SEED_NOT_FOUND" in str(e):
                 raise MailMessageNotFoundError(
@@ -5396,17 +5474,200 @@ end if
                 ) from e
             raise
 
+    @staticmethod
+    def _recipient_override_block(kind: str, addrs: list[str] | None) -> str:
+        """AppleScript that clears and re-populates one recipient group of
+        ``theMessage``: None keeps what Mail derived (``""``), ``[]``
+        clears it, a list replaces it."""
+        if addrs is None:
+            return ""
+        list_str = ", ".join(f'"{escape_applescript_string(a)}"' for a in addrs)
+        return f"""
+                delete (every {kind} recipient of theMessage)
+                repeat with addr in {{{list_str}}}
+                    make new {kind} recipient at end of {kind} recipients of theMessage with properties {{address:addr}}
+                end repeat
+            """
+
+    def _draft_headers_block(
+        self,
+        *,
+        seed: str,
+        to: list[str] | None,
+        cc: list[str] | None,
+        bcc: list[str] | None,
+        subject: str | None,
+        attachment_paths: list[Path] | None,
+        from_account: str | None,
+    ) -> str:
+        """AppleScript for everything create_draft applies to
+        ``theMessage`` besides its body: the subject override (reply and
+        forward; a fresh message gets its subject at creation), each
+        recipient group, the attachments, and the sender, set LAST — set
+        before the content and recipients, the first saved copy of a
+        draft carried no recipients (docs/research/icloud-draft-resync.md,
+        Observation 6)."""
+        parts = []
+        if seed != "new" and subject is not None:
+            subject_safe = escape_applescript_string(sanitize_input(subject))
+            parts.append(f'set subject of theMessage to "{subject_safe}"')
+        for kind, addrs in (("to", to), ("cc", cc), ("bcc", bcc)):
+            parts.append(self._recipient_override_block(kind, addrs))
+        parts.append(self._build_attachment_block(attachment_paths))
+        # The SECURITY_CHECKLIST two-step idiom (sanitize_input then
+        # escape_applescript_string) applies even though the resolver
+        # pulls from Mail.app's own account list — the convention exists
+        # so we don't have to risk-assess each site individually, and the
+        # Display-Name <email> form from #158 broadened what characters
+        # can appear here. (#173)
+        if from_account is not None:
+            sender_email = self._resolve_account_to_sender(from_account)
+            sender_safe = escape_applescript_string(sanitize_input(sender_email))
+            parts.append(f'set sender of theMessage to "{sender_safe}"')
+        return "\n".join(part for part in parts if part)
+
+    def _compose_note_above_seed(
+        self,
+        *,
+        seed: str,
+        seed_id: str | None,
+        seed_id_safe: str | None,
+        reply_all: bool,
+        headers_block: str,
+        body: str,
+        send_now: bool,
+    ) -> dict[str, str]:
+        """A reply or forward carrying the caller's text ABOVE what Mail
+        wrote: the quoted original, or the forwarded message with its
+        header block and every attachment Mail carried.
+
+        Measured through the loopback read-back (tests/integration/
+        test_loopback.py) on 2026-09-26. Mail's reply or forward opened
+        without a window exposes no content before it is sent: ``content``
+        reads empty, with 0 paragraphs and 0 attachments. Every edit of
+        that content through the dictionary replaced what Mail wrote, as
+        delivered: ``set content`` to the note lost the forwarded header
+        block and both attachments and put the original's text above the
+        note; ``make new paragraph at before paragraph 1`` did the same.
+        With no edit, the forward arrived whole.
+
+        So the message is opened in a VISIBLE compose window, its headers
+        are applied through the dictionary (header-only, content never
+        touched), and the caller's text is pasted as plain text at the top
+        (the HTML reply path's paste, cmd+up first) and read back from a
+        fresh process. Then the window is sent through the verified send,
+        or closed with Save and the new draft's id found. On a send, the
+        recipients read back from the window pass the allowlist gate
+        before anything is pasted; off-list, the window is discarded.
+        """
+        opened = self._open_seeded_compose(
+            seed=seed,
+            seed_id=seed_id,
+            seed_id_safe=seed_id_safe,
+            reply_all=reply_all,
+            headers_block=headers_block,
+            snapshot_drafts=not send_now,
+        )
+        window = str(opened["window"])
+        subject = str(opened["subject"])
         if send_now:
-            return {"draft_id": "", "sent_message_id": ""}
-        if not result:
-            raise MailDraftNotSettledError(
-                "Mail accepted the save but the new draft did not appear "
-                "in Drafts within "
-                f"{self._DRAFT_APPEAR_POLLS * self._DRAFT_APPEAR_INTERVAL_S:g}s, "
-                "so there is no id to return; look for it in Mail.app "
-                "before saving again. Nothing was sent."
+            self._gate_compose_recipients(
+                window,
+                [str(a) for a in opened.get("to") or []],
+                [str(a) for a in opened.get("cc") or []],
+                [str(a) for a in opened.get("bcc") or []],
             )
-        return {"draft_id": result, "sent_message_id": ""}
+        self._paste_verified(
+            window_name=window, body=body, place_above_existing=True, plain=True,
+        )
+        if send_now:
+            return self._send_compose_window(window, subject)
+        before_ids = [int(i) for i in opened.get("before_ids") or []]
+        draft_id = self._save_compose_window_as_draft(window, subject, before_ids)
+        return {"draft_id": draft_id, "sent_message_id": ""}
+
+    def _open_seeded_compose(
+        self,
+        *,
+        seed: str,
+        seed_id: str | None,
+        seed_id_safe: str | None,
+        reply_all: bool,
+        headers_block: str,
+        snapshot_drafts: bool,
+    ) -> dict[str, Any]:
+        """Open Mail's reply or forward of the seed in a visible compose
+        window, apply ``headers_block``, and read back what the window
+        holds: its name (found by window-set diff, never guessed), subject
+        and recipients, and — when ``snapshot_drafts`` — the Drafts ids
+        that existed before, so a later save can find its own."""
+        creation_block = self._build_creation_block(
+            seed, seed_id_safe, reply_all, None, open_window=True,
+        )
+        snapshot = (
+            "set beforeIds to (id of every message of drafts mailbox)"
+            if snapshot_drafts
+            else "set beforeIds to {}"
+        )
+        script_body = f"""
+tell application "System Events"
+    tell application process "Mail"
+        set beforeNames to name of windows
+    end tell
+end tell
+tell application "Mail"
+    activate
+    {snapshot}
+    {creation_block}
+end tell
+{self._as_new_compose_window_block()}
+tell application "Mail"
+    {headers_block}
+    set toAddrs to address of to recipients of theMessage
+    if toAddrs is missing value then set toAddrs to {{}}
+    set ccAddrs to address of cc recipients of theMessage
+    if ccAddrs is missing value then set ccAddrs to {{}}
+    set bccAddrs to address of bcc recipients of theMessage
+    if bccAddrs is missing value then set bccAddrs to {{}}
+    set resultData to {{|window|:newName, |subject|:(subject of theMessage as text), |to|:toAddrs, |cc|:ccAddrs, |bcc|:bccAddrs, |before_ids|:beforeIds}}
+end tell
+"""
+        raw = self._run_seeded_script(
+            _wrap_as_json_script(script_body, timeout=self.timeout), seed_id
+        )
+        return cast(dict[str, Any], parse_applescript_json(raw))
+
+    def _save_compose_window_as_draft(
+        self, window: str, subject: str, before_ids: list[int]
+    ) -> str:
+        """Close the compose window with Save, then find the draft it
+        became: the Drafts entry with ``subject`` that was not among
+        ``before_ids``, polled for and then given the settle time a new
+        draft needs before Mail acts on it."""
+        outcome = self._salvage_compose_to_draft(window)
+        if outcome != "SALVAGED":
+            raise MailAppleScriptError(f"draft save: {outcome}")
+        ids = ", ".join(str(i) for i in before_ids)
+        subject_safe = escape_applescript_string(subject)
+        result = self._run_applescript(f"""
+tell application "Mail"
+    set beforeIds to {{{ids}}}
+    set newDraftId to ""
+    repeat with attempt from 1 to {self._DRAFT_APPEAR_POLLS}
+        delay {self._DRAFT_APPEAR_INTERVAL_S}
+        repeat with m in (messages of drafts mailbox whose subject is "{subject_safe}")
+            set candId to id of m
+            if candId is not in beforeIds then set newDraftId to (candId as text)
+        end repeat
+        if newDraftId is not "" then exit repeat
+    end repeat
+    if newDraftId is not "" then delay {self._DRAFT_SETTLE_S}
+    return newDraftId
+end tell
+""").strip()
+        if not result:
+            raise self._draft_not_settled()
+        return result
 
     def extract_draft_attachments(
         self,

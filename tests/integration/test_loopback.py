@@ -38,6 +38,7 @@ from .mail_readback import (
     SentCopy,
     assert_html_rendered,
     bare_message_id,
+    compose_window_count,
     header,
     html_part,
     sent_copy,
@@ -262,15 +263,161 @@ def test_forward_via_draft_path_carries_original_and_attachments(
         _, seed = loop.receive(trash, seed_subject)
         assert seed.attachment_count == 2, "the seed itself arrived without both files"
 
+        trash.windows(forward_subject)
         loop.prepare(trash, forward_subject)
         assert loop.connector.create_draft(
             seed="forward", seed_id=seed.mail_id, to=[loop.address],
             body=f"forward-marker-{hexid}", send_now=True,
         ) == SENT
+        assert compose_window_count(loop.connector, forward_subject) == 0, (
+            "the send left its compose window open"
+        )
         forward_sent, forward = loop.receive(trash, forward_subject)
 
         loop.assert_delivered(forward, forward_sent, forward_subject)
-        assert f"forward-marker-{hexid}" in forward.content
+        note_at = forward.content.find(f"forward-marker-{hexid}")
+        block_at = forward.content.find("Begin forwarded message")
+        assert note_at >= 0, "the forward's own text did not arrive"
+        assert block_at >= 0, "Mail's forwarded-message block did not arrive"
+        assert note_at < block_at, "the note is below the forwarded message"
+        assert seed_subject in forward.content
+        assert loop.account_address in forward.content
+        assert sorted(forward.attachment_names) == sorted(seed.attachment_names)
+        assert forward.attachment_count == 2
+
+
+def test_reply_via_draft_path_puts_the_note_above_the_quote(loop: Loopback) -> None:
+    """``create_draft(seed="reply", body=...)``: the caller's text goes
+    above the quoted original, which stays."""
+    hexid = _hex()
+    seed_subject = f"{PREFIX}draft-reply-seed-{hexid}"
+    reply_subject = f"Re: {seed_subject}"
+    with MailTrash(loop.connector, loop.account) as trash:
+        loop.prepare(trash, seed_subject)
+        assert loop.connector._send_html_email(
+            to=[loop.address], cc=None, bcc=None, subject=seed_subject,
+            body=f"<p>draft reply seed <b>seed-marker-{hexid}</b></p>",
+            from_account=None,
+        ) == SENT
+        seed_sent, seed = loop.receive(trash, seed_subject)
+
+        trash.windows(reply_subject)
+        loop.prepare(trash, reply_subject)
+        assert loop.connector.create_draft(
+            seed="reply", seed_id=seed.mail_id, to=[loop.address],
+            body=f"reply-note-{hexid}", send_now=True,
+        ) == SENT
+        assert compose_window_count(loop.connector, reply_subject) == 0, (
+            "the send left its compose window open"
+        )
+        reply_sent, reply = loop.receive(trash, reply_subject)
+
+        loop.assert_delivered(reply, reply_sent, reply_subject)
+        in_reply_to = bare_message_id(header(reply.headers, "In-Reply-To") or "")
+        assert in_reply_to == seed_sent.rfc_message_id
+        note_at = reply.content.find(f"reply-note-{hexid}")
+        quoted_at = reply.content.find(f"seed-marker-{hexid}")
+        assert note_at >= 0, "the reply's own text did not arrive"
+        assert quoted_at >= 0, "the quoted original did not arrive"
+        assert note_at < quoted_at, "the note is below the quote"
+
+
+def test_a_saved_forward_note_sits_above_the_forwarded_message(
+    loop: Loopback, tmp_path: Path
+) -> None:
+    """``create_draft(seed="forward", body=..., send_now=False)``: the saved
+    draft holds the note above Mail's forwarded-message block, keeps both
+    of the original's files, and leaves no compose window open. Nothing
+    is sent; the seed is the only send."""
+    hexid = _hex()
+    seed_subject = f"{PREFIX}saved-forward-seed-{hexid}"
+    forward_subject = f"Fwd: {seed_subject}"
+    files = _two_files(tmp_path, hexid)
+    with MailTrash(loop.connector, loop.account) as trash:
+        loop.prepare(trash, seed_subject)
+        assert loop.connector._send_html_email(
+            to=[loop.address], cc=None, bcc=None, subject=seed_subject,
+            body=f"<p>saved forward seed <b>seed-marker-{hexid}</b></p>",
+            from_account=None, attachment_paths=files,
+        ) == SENT
+        _, seed = loop.receive(trash, seed_subject)
+        assert seed.attachment_count == 2, "the seed itself arrived without both files"
+
+        trash.windows(forward_subject)
+        trash.drafts(forward_subject)
+        created = loop.connector.create_draft(
+            seed="forward", seed_id=seed.mail_id, to=[loop.address],
+            body=f"saved-note-{hexid}", send_now=False,
+        )
+        assert created["draft_id"], created
+        assert compose_window_count(loop.connector, forward_subject) == 0, (
+            "the save left its compose window open"
+        )
+        state = loop.connector.get_draft_state(created["draft_id"])
+
+        assert state["subject"] == forward_subject
+        assert [a.lower() for a in state["to"]] == [loop.address.lower()]
+        note_at = state["body"].find(f"saved-note-{hexid}")
+        block_at = state["body"].find("Begin forwarded message")
+        assert note_at >= 0, "the note is not in the saved draft"
+        assert block_at >= 0, "Mail's forwarded-message block is not in the saved draft"
+        assert note_at < block_at, "the note is below the forwarded message"
+        assert state["body"].count(f"seed-marker-{hexid}") == 1
+        assert sorted(state["attachment_names"]) == sorted(seed.attachment_names)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "draft_send recreates from the read-back content; fixed by the "
+        "draft-layer rework in server.py"
+    ),
+)
+def test_forward_without_note_via_tool_lifecycle_carries_original_and_attachments(
+    loop: Loopback, tmp_path: Path
+) -> None:
+    """``draft_create(forward_of=...)`` then ``draft_send``, no note: what
+    the recipient gets is the forwarded message, whole.
+
+    Observed 2026-09-26. Before the connector's note-above-seed fix, the
+    recreate pasted the saved draft's text over Mail's forward: both
+    files arrived, but the original's text arrived twice, once unquoted on
+    top and once inside a cite blockquote, with Mail's forward formatting
+    gone. After it, the recreate carries that text as a note, which opens
+    a compose window named like the one the dictionary save left open,
+    and draft_send refuses with COMPOSE_WINDOW_NOT_UNIQUE."""
+    from apple_mail_mcp import server
+
+    hexid = _hex()
+    seed_subject = f"{PREFIX}lifecycle-forward-seed-{hexid}"
+    forward_subject = f"Fwd: {seed_subject}"
+    files = _two_files(tmp_path, hexid)
+    with MailTrash(loop.connector, loop.account) as trash:
+        loop.prepare(trash, seed_subject)
+        assert loop.connector._send_html_email(
+            to=[loop.address], cc=None, bcc=None, subject=seed_subject,
+            body=f"<p>lifecycle seed <b>seed-marker-{hexid}</b></p>",
+            from_account=None, attachment_paths=files,
+        ) == SENT
+        seed_sent, seed = loop.receive(trash, seed_subject)
+        assert seed.attachment_count == 2, "the seed itself arrived without both files"
+
+        trash.windows(forward_subject)
+        trash.drafts(forward_subject)
+        loop.prepare(trash, forward_subject)
+        created = asyncio.run(
+            server.draft_create(forward_of=seed.mail_id, to=[loop.address])
+        )
+        assert created["success"] is True, created
+        result = asyncio.run(server.draft_send(draft_id=created["draft_id"]))
+        assert result["success"] is True, result
+        forward_sent, forward = loop.receive(trash, forward_subject)
+
+        loop.assert_delivered(forward, forward_sent, forward_subject)
+        assert seed_sent.rfc_message_id in (header(forward.headers, "References") or "")
+        assert forward.content.count(f"seed-marker-{hexid}") == 1, (
+            "the original's text arrived more than once"
+        )
         assert "Begin forwarded message" in forward.content
         assert seed_subject in forward.content
         assert loop.account_address in forward.content

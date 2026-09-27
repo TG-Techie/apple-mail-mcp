@@ -5787,7 +5787,7 @@ class TestCreateDraft:
         connector.create_draft(
             seed="reply",
             seed_id="160989",
-            body="thanks",
+            body="",
         )
         script = mock_run.call_args[0][0]
         # cc/bcc not specified → no clear-and-add block for them.
@@ -5806,7 +5806,7 @@ class TestCreateDraft:
             seed="reply",
             seed_id="160989",
             cc=[],
-            body="x",
+            body="",
         )
         script = mock_run.call_args[0][0]
         assert "delete (every cc recipient" in script
@@ -5823,7 +5823,7 @@ class TestCreateDraft:
         connector.create_draft(
             seed="reply",
             seed_id="160989",
-            body="thanks",
+            body="",
         )
         script = mock_run.call_args[0][0]
         assert "reply origMsg opening window false" in script
@@ -5838,26 +5838,10 @@ class TestCreateDraft:
             seed="reply",
             seed_id="160989",
             reply_all=True,
-            body="thanks",
+            body="",
         )
         script = mock_run.call_args[0][0]
         assert "reply to all origMsg opening window false" in script
-
-    @patch.object(AppleMailConnector, "_run_applescript")
-    def test_reply_body_overrides_auto_content(
-        self, mock_run: MagicMock, connector: AppleMailConnector
-    ) -> None:
-        """Mail.app's auto-quoted reply content is not readable before
-        save, so a user-supplied body replaces (not prepends)
-        the auto-quote. Matches existing reply_to_message behavior."""
-        mock_run.return_value = "1"
-        connector.create_draft(
-            seed="reply",
-            seed_id="160989",
-            body="thanks",
-        )
-        script = mock_run.call_args[0][0]
-        assert 'set content of theMessage to "thanks"' in script
 
     @patch.object(AppleMailConnector, "_run_applescript")
     def test_reply_no_body_no_content_override(
@@ -5878,7 +5862,7 @@ class TestCreateDraft:
             seed="reply",
             seed_id="160989",
             subject="custom subject",
-            body="x",
+            body="",
         )
         script = mock_run.call_args[0][0]
         assert 'set subject of theMessage to "custom subject"' in script
@@ -5896,10 +5880,239 @@ class TestCreateDraft:
             seed="forward",
             seed_id="160989",
             to=["x@example.com"],
-            body="fyi",
+            body="",
         )
         script = mock_run.call_args[0][0]
         assert "forward origMsg opening window false" in script
+
+    # ------------------------------------------------------------------
+    # A note on a reply or forward goes above what Mail wrote
+    # ------------------------------------------------------------------
+
+    _SEEDED_META = (
+        '{"window": "Fwd: Probe", "subject": "Fwd: Probe", '
+        '"to": ["a@example.com"], "cc": [], "bcc": [], "before_ids": [5, 6]}'
+    )
+    _NOTE = "a note for you"
+
+    def _run_seeded(
+        self,
+        connector: AppleMailConnector,
+        *,
+        seed: str,
+        send_now: bool,
+        outcomes: list[str] | None = None,
+        **kwargs: Any,
+    ) -> tuple[list[str], dict[str, str]]:
+        """Run create_draft with a note, answering each script in turn:
+        open the window, paste, read back, then send, or close-and-save
+        and find the saved draft's id."""
+        tail = ["SENT"] if send_now else ["SALVAGED", "7"]
+        answers = outcomes or [self._SEEDED_META, "PASTED_UNVERIFIED", self._NOTE, *tail]
+        scripts: list[str] = []
+
+        def fake_run(script: str) -> str:
+            scripts.append(script)
+            return answers[min(len(scripts) - 1, len(answers) - 1)]
+
+        connector._run_applescript = fake_run  # type: ignore[method-assign]
+        result = connector.create_draft(
+            seed=seed, seed_id="160989", body=self._NOTE, send_now=send_now,
+            **kwargs,
+        )
+        return scripts, result
+
+    def test_a_forward_note_is_pasted_above_the_forwarded_message(
+        self, connector: AppleMailConnector
+    ) -> None:
+        """Setting the content of Mail's forward replaced the forwarded
+        message and dropped its attachments (read back through the
+        loopback, 2026-09-26). The note is pasted above it instead, in a
+        visible compose window, and the content is never set."""
+        scripts, result = self._run_seeded(
+            connector, seed="forward", send_now=True, to=["a@example.com"],
+        )
+        assert result == {"draft_id": "", "sent_message_id": ""}
+        assert len(scripts) == 4  # open, paste, read-back, verified send
+        open_s, paste_s, _, send_s = scripts
+        assert 'whose id is "160989"' in open_s
+        assert "forward origMsg opening window true" in open_s
+        assert "beforeNames" in open_s
+        assert "key code 126 using command down" in paste_s
+        assert "public.utf8-plain-text" in paste_s
+        assert self._NOTE in paste_s
+        assert "enabled of sendBtn" in send_s
+        assert 'set composeSubject to "Fwd: Probe"' in send_s
+        assert all("set content of theMessage" not in s for s in scripts)
+
+    def test_a_reply_note_is_pasted_above_the_quote(
+        self, connector: AppleMailConnector
+    ) -> None:
+        scripts, _ = self._run_seeded(
+            connector, seed="reply", send_now=True, to=["a@example.com"],
+            subject="custom subject",
+        )
+        open_s = scripts[0]
+        assert "reply origMsg opening window true" in open_s
+        assert "delete (every to recipient of theMessage)" in open_s
+        assert 'set subject of theMessage to "custom subject"' in open_s
+        assert "key code 126 using command down" in scripts[1]
+        assert all("set content of theMessage" not in s for s in scripts)
+
+    def test_a_reply_all_note_opens_a_reply_all_window(
+        self, connector: AppleMailConnector
+    ) -> None:
+        scripts, _ = self._run_seeded(
+            connector, seed="reply", send_now=True, reply_all=True,
+            to=["a@example.com"], cc=[],
+        )
+        assert "reply to all origMsg opening window true" in scripts[0]
+
+    def test_a_saved_note_is_saved_from_its_window(
+        self, connector: AppleMailConnector
+    ) -> None:
+        """Without send_now the window is closed with Save, and the new
+        draft is found among the Drafts that were not there before."""
+        scripts, result = self._run_seeded(
+            connector, seed="reply", send_now=False,
+        )
+        assert result == {"draft_id": "7", "sent_message_id": ""}
+        assert len(scripts) == 5  # open, paste, read-back, save, find id
+        assert "id of every message of drafts mailbox" in scripts[0]
+        assert "AXCloseButton" in scripts[3]
+        assert "{5, 6}" in scripts[4]
+        assert 'whose subject is "Fwd: Probe"' in scripts[4]
+        assert all("enabled of sendBtn" not in s for s in scripts)
+
+    def test_an_off_list_recipient_read_back_discards_the_window(
+        self, connector: AppleMailConnector
+    ) -> None:
+        """The window is gated on the recipients Mail will actually send
+        to, read back from the model, before anything is pasted."""
+        from apple_mail_mcp.exceptions import MailOutboundDisallowedError
+
+        meta = (
+            '{"window": "Fwd: Probe", "subject": "Fwd: Probe", '
+            '"to": ["evil@other.com"], "cc": [], "bcc": [], "before_ids": []}'
+        )
+        with pytest.raises(MailOutboundDisallowedError, match="evil@other.com"):
+            self._run_seeded(
+                connector, seed="forward", send_now=True,
+                to=["a@example.com"], outcomes=[meta, "DISCARDED"],
+            )
+
+    def test_an_off_list_read_back_pastes_and_sends_nothing(
+        self, connector: AppleMailConnector
+    ) -> None:
+        from apple_mail_mcp.exceptions import MailOutboundDisallowedError
+
+        meta = (
+            '{"window": "Fwd: Probe", "subject": "Fwd: Probe", '
+            '"to": ["evil@other.com"], "cc": [], "bcc": [], "before_ids": []}'
+        )
+        scripts: list[str] = []
+        answers = [meta, "DISCARDED"]
+
+        def fake_run(script: str) -> str:
+            scripts.append(script)
+            return answers[min(len(scripts) - 1, 1)]
+
+        connector._run_applescript = fake_run  # type: ignore[method-assign]
+        with pytest.raises(MailOutboundDisallowedError):
+            connector.create_draft(
+                seed="forward", seed_id="160989", to=["a@example.com"],
+                body=self._NOTE, send_now=True,
+            )
+        assert len(scripts) == 2
+        assert "AXCloseButton" in scripts[1]
+        assert all('keystroke "v"' not in s for s in scripts)
+
+    def test_a_window_that_will_not_close_fails_the_save_loudly(
+        self, connector: AppleMailConnector
+    ) -> None:
+        with pytest.raises(MailAppleScriptError, match="window still open"):
+            self._run_seeded(
+                connector, seed="reply", send_now=False,
+                outcomes=[
+                    self._SEEDED_META, "PASTED_UNVERIFIED", self._NOTE,
+                    "SALVAGE_FAILED:window still open",
+                ],
+            )
+
+    def test_a_saved_note_that_never_appears_in_drafts_is_not_settled(
+        self, connector: AppleMailConnector
+    ) -> None:
+        from apple_mail_mcp.exceptions import MailDraftNotSettledError
+
+        with pytest.raises(MailDraftNotSettledError):
+            self._run_seeded(
+                connector, seed="reply", send_now=False,
+                outcomes=[
+                    self._SEEDED_META, "PASTED_UNVERIFIED", self._NOTE,
+                    "SALVAGED", "",
+                ],
+            )
+
+    def test_a_seed_that_is_gone_is_message_not_found_on_the_window_path(
+        self, connector: AppleMailConnector
+    ) -> None:
+        def fake_run(script: str) -> str:
+            raise MailAppleScriptError("execution error: SEED_NOT_FOUND (-2700)")
+
+        connector._run_applescript = fake_run  # type: ignore[method-assign]
+        with pytest.raises(MailMessageNotFoundError):
+            connector.create_draft(
+                seed="forward", seed_id="160989", to=["a@example.com"],
+                body=self._NOTE,
+            )
+
+    def test_the_new_window_is_found_even_when_its_name_is_already_open(
+        self, connector: AppleMailConnector
+    ) -> None:
+        """A draft saved through the dictionary leaves a window of the
+        same name open (docs/research/icloud-draft-resync.md, Obs. 5), so
+        a name-set diff saw no new window. Names are counted instead, and
+        a new window whose name is not unique is refused before anything
+        is pasted or sent: every later step addresses it by name."""
+        scripts, _ = self._run_seeded(
+            connector, seed="forward", send_now=True, to=["a@example.com"],
+        )
+        open_s = scripts[0]
+        assert "afterCount > beforeCount" in open_s
+        assert "COMPOSE_WINDOW_NOT_UNIQUE" in open_s
+
+    def test_a_new_window_that_shares_its_name_stops_everything(
+        self, connector: AppleMailConnector
+    ) -> None:
+        scripts: list[str] = []
+
+        def fake_run(script: str) -> str:
+            scripts.append(script)
+            raise MailAppleScriptError(
+                "execution error: COMPOSE_WINDOW_NOT_UNIQUE: Fwd: Probe (-2700)"
+            )
+
+        connector._run_applescript = fake_run  # type: ignore[method-assign]
+        with pytest.raises(MailAppleScriptError, match="COMPOSE_WINDOW_NOT_UNIQUE"):
+            connector.create_draft(
+                seed="forward", seed_id="160989", to=["a@example.com"],
+                body=self._NOTE, send_now=True,
+            )
+        assert len(scripts) == 1
+
+    def test_plain_paste_probes_look_for_the_text_itself(self) -> None:
+        """A plain note is read back as the text it is. Angle brackets in
+        it are text, not a sign the paste degraded to raw source."""
+        snippet, raw = AppleMailConnector._paste_probe_strings(
+            "<see> the  attached & more", plain=True
+        )
+        assert snippet == "<see> the attached & mor"
+        assert raw == ""
+        html_snippet, html_raw = AppleMailConnector._paste_probe_strings(
+            "<p>hi <b>there</b></p>"
+        )
+        assert html_snippet == "hi there"
+        assert html_raw == "<p>hi <b>there</"
 
     # ------------------------------------------------------------------
     # Seed lookup error mapping
@@ -5936,7 +6149,7 @@ class TestCreateDraft:
         connector.create_draft(
             seed="reply",
             seed_id="abc-123@example.com",  # RFC form (contains '@')
-            body="thanks",
+            body="",
         )
         mock_resolve.assert_called_once_with("abc-123@example.com")
         script = mock_run.call_args[0][0]
@@ -5959,7 +6172,7 @@ class TestCreateDraft:
             seed="forward",
             seed_id="abc-123@example.com",
             to=["x@example.com"],
-            body="fyi",
+            body="",
         )
         mock_resolve.assert_called_once_with("abc-123@example.com")
         script = mock_run.call_args[0][0]
@@ -5980,7 +6193,7 @@ class TestCreateDraft:
         connector.create_draft(
             seed="reply",
             seed_id="160989",  # internal id form, no '@'
-            body="thanks",
+            body="",
         )
         mock_resolve.assert_not_called()
         script = mock_run.call_args[0][0]
@@ -7233,6 +7446,10 @@ class TestSendHtmlReply:
         assert "reply origMsg opening window true" in script_a
         # Window identified by set-diff, not by guessed subject.
         assert "beforeNames" in script_a
+        # Names are counted, and a new window whose name is already open
+        # is refused: every later step addresses it by name.
+        assert "afterCount > beforeCount" in script_a
+        assert "COMPOSE_WINDOW_NOT_UNIQUE" in script_a
         # Recipients read from the outgoing-message model, not UI pills.
         assert "address of to recipients" in script_a
 

@@ -861,7 +861,7 @@ Create a draft (fresh, reply, or forward). Optionally send immediately.
 | `cc` | array[string] | No | None | CC recipients (same semantics as `to` for reply/forward). |
 | `bcc` | array[string] | No | None | BCC recipients. |
 | `subject` | string | When fresh | None | Subject. For reply/forward, `None` keeps Mail's `Re:`/`Fwd:` prefix. |
-| `body` | string | No | "" | Body text. For reply/forward, a non-empty body **replaces** Mail's auto-quoted content (the auto-quote isn't readable from AppleScript before save). Empty body leaves Mail's auto-quote intact. |
+| `body` | string | No | "" | Body text. For reply/forward, a non-empty body goes **above** what Mail wrote, which stays: the quoted original, or the forwarded message with its header block and every attachment Mail carried. It is pasted as plain text in a visible compose window, so Mail comes to the front for a few seconds. An empty body leaves Mail's quote or forward exactly as Mail made it. |
 | `attachment_paths` | array[string] | No | None | List of file paths to attach. Each must exist, must not carry an executable extension (`.exe`, `.sh`, …), and must be under 25MB — the same checks as `email_send_html`. |
 | `reply_all` | boolean | No | False | For `reply_to` only — use `reply to all`. |
 | `template_name` | string | No | None | Optional template to render for `subject` + `body`. Caller-supplied `subject`/`body` override the rendered output. |

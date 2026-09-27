@@ -3064,9 +3064,10 @@ def create_draft(
             a populated list replaces.
         subject: Subject. Required when both seeds are None. For
             reply/forward, ``None`` keeps Mail's ``Re:``/``Fwd:`` prefix.
-        body: Body text. For reply/forward, a non-empty body REPLACES
-            Mail's auto-quoted content; an empty body leaves the
-            auto-quote intact (matches Mail.app's default reply behavior).
+        body: Body text. For reply/forward, a non-empty body goes above
+            what Mail wrote, which stays: the quoted original, or the
+            forwarded message with its header block and attachments. An
+            empty body leaves Mail's quote or forward as Mail made it.
         attachment_paths: List of file paths to attach. Each must exist,
             must not carry an executable extension, and must be under
             25MB — the same checks as a send.
@@ -3526,8 +3527,9 @@ async def draft_create(
             Mail's auto-derived recipients; populated list replaces.
         subject: Subject line. Required for fresh drafts; optional for
             reply/forward (None keeps Mail's auto-derived prefix).
-        body: Body text. For reply/forward, replaces Mail's auto-quoted
-            content if non-empty.
+        body: Body text. For reply/forward, a non-empty body goes above
+            Mail's quoted original or forwarded message, which stays with
+            its header block and attachments.
         attachment_paths: File paths to attach. Each must exist, must
             not carry an executable extension, and must be under 25MB.
         reply_all: For ``reply_to`` only — use Mail's reply-all logic.

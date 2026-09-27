@@ -325,6 +325,34 @@ def trash_drafts(connector: AppleMailConnector, subject: str) -> None:
     _await_gone(connector, ref, f"A draft of {subject!r}")
 
 
+def compose_window_count(connector: AppleMailConnector, name: str) -> int:
+    """How many of Mail's windows are named ``name``. A compose window is
+    named after its subject."""
+    out = connector._run_applescript(
+        'tell application "System Events" to tell application process "Mail" '
+        f"to return (count of (windows whose name is {_quoted(name)})) as text"
+    )
+    return int(out.strip())
+
+
+def discard_compose_windows(connector: AppleMailConnector, name: str) -> None:
+    """Close every Mail window named ``name`` without saving, through the
+    connector's discard (close button, then Don't Save on the sheet), and
+    read back that none is left. Once per window: the discard addresses
+    the first window of the name, so its own read-back reports a failure
+    while another of the same name remains; only the final count counts.
+    """
+    for _ in range(compose_window_count(connector, name)):
+        connector._run_applescript(
+            f"set discardName to {_quoted(name)}\n"
+            + connector._as_discard_compose_block("discardName")
+            + "\nreturn discardOutcome"
+        )
+    remaining = compose_window_count(connector, name)
+    if remaining:
+        raise AssertionError(f"{remaining} windows named {name!r} are still open")
+
+
 class MailTrash:
     """Everything one test sent and received, moved to Trash when it ends.
 
@@ -332,7 +360,9 @@ class MailTrash:
     test body, which makes the moves a ``finally``. Register each piece as
     soon as it can exist: a subject before its send (a send that raises
     may still have filed a Sent copy), an arrival once found, a draft
-    subject before the draft is saved. On exit every piece is attempted
+    subject before the draft is saved, and the name of any compose window
+    a path under test may leave open. On exit windows are discarded
+    first, then every other piece is moved to Trash; each is attempted
     even if another fails, and the failures are raised together, so a
     test that passed but left mail behind does not pass.
     """
@@ -343,6 +373,7 @@ class MailTrash:
         self._sent: list[str] = []
         self._arrivals: list[Arrival] = []
         self._drafts: list[str] = []
+        self._windows: list[str] = []
 
     def __enter__(self) -> MailTrash:
         return self
@@ -359,8 +390,14 @@ class MailTrash:
         self._drafts.append(subject)
         return subject
 
+    def windows(self, name: str) -> str:
+        self._windows.append(name)
+        return name
+
     def _trash_one(self, kind: str, item: Any) -> None:
-        if kind == "arrival":
+        if kind == "windows":
+            discard_compose_windows(self._connector, item)
+        elif kind == "arrival":
             trash_arrival(self._connector, self._account, item)
         elif kind == "sent":
             trash_sent_copy(self._connector, item)
@@ -374,7 +411,8 @@ class MailTrash:
         tb: TracebackType | None,
     ) -> None:
         pieces: list[tuple[str, Any]] = (
-            [("arrival", a) for a in self._arrivals]
+            [("windows", w) for w in self._windows]
+            + [("arrival", a) for a in self._arrivals]
             + [("sent", s) for s in self._sent]
             + [("drafts", s) for s in self._drafts]
         )
