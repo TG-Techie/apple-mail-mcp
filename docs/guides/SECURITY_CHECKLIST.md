@@ -39,7 +39,7 @@ This rejects `..`, slashes, dots, spaces, control characters, and oversized leng
 
 ## Rate limiting
 
-Every MCP tool wrapper in [`tools/`](../../src/apple_mail_mcp/tools/) must call [`check_rate_limit`](../../src/apple_mail_mcp/security.py#L180) as its first action and return immediately if the call is rate-limited. The tool name must be registered in [`OPERATION_TIERS`](../../src/apple_mail_mcp/security.py#L122) under one of three tiers:
+Every MCP tool wrapper in [`tools/`](../../src/apple_mail_mcp/tools/) must call [`check_rate_limit`](../../src/apple_mail_mcp/security.py#L198) as its first action and return immediately if the call is rate-limited. The tool name must be registered in [`OPERATION_TIERS`](../../src/apple_mail_mcp/security.py#L136) under one of three tiers:
 
 | Tier | Cap | Use for |
 |------|-----|---------|
@@ -51,7 +51,7 @@ There's a unit test in [`test_security.py`](../../tests/unit/test_security.py) (
 
 ## Audit logging
 
-Every server-side tool wrapper must call [`operation_logger.log_operation`](../../src/apple_mail_mcp/security.py#L25) on its success path with its own tool name as the operation, the params it received, and a status string. Failure paths log via the per-`error_type` return shape; the audit log captures the successful actions.
+Every server-side tool wrapper must call [`operation_logger.log_operation`](../../src/apple_mail_mcp/security.py#L55) on its success path with its own tool name as the operation, the params it received, and a status string. Failure paths log via the per-`error_type` return shape; the audit log captures the successful actions.
 
 This produces a record of what the server actually did — useful for debugging, for confirming that destructive operations were preceded by elicitation, and for users who want to inspect what an LLM caused to happen on their behalf. Each entry is kept in memory for the process and appended as one JSON line to `audit.jsonl` under the data home (`APPLE_MAIL_MCP_HOME`, default `~/.apple_mail_mcp`); the file is the record that outlives the process, since every agent session runs its own server. Send-path entries carry the recipients, subject and `from_account` as asked, never the body; entries for the other mutations carry what identifies the thing acted on and what was done to it (the message ids and the destination of a move, the conditions and actions of a rule, the counts asked for and achieved), so the file can answer what the server did to the user's mail without the session that did it. The file rolls over at `AUDIT_ROTATE_BYTES` with one previous generation kept, so it is bounded on disk. A log that cannot be written is reported as a warning and the operation it records still stands. The file is personal data at rest — see "User Data on Disk" in `AGENTS.md` for how it is handled.
 

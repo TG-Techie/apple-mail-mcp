@@ -24,7 +24,6 @@ from apple_mail_mcp.security import (
     operation_logger,
     rate_limiter,
     validate_bulk_operation,
-    validate_send_operation,
 )
 
 
@@ -145,40 +144,6 @@ class TestOperationLogIsDurable:
             logger.log_operation("list_accounts", {}, "success")
         assert logger.get_recent_operations(limit=1)[0]["operation"] == "list_accounts"
         assert any("audit log" in r.getMessage() for r in caplog.records)
-
-
-class TestValidateSendOperation:
-    """Tests for validate_send_operation."""
-
-    def test_valid_single_recipient(self) -> None:
-        is_valid, error = validate_send_operation(["user@example.com"])
-        assert is_valid is True
-        assert error == ""
-
-    def test_valid_multiple_recipients(self) -> None:
-        is_valid, error = validate_send_operation(
-            to=["user1@example.com"],
-            cc=["user2@example.com"],
-            bcc=["user3@example.com"]
-        )
-        assert is_valid is True
-        assert error == ""
-
-    def test_no_recipients(self) -> None:
-        is_valid, error = validate_send_operation([])
-        assert is_valid is False
-        assert "required" in error.lower()
-
-    def test_invalid_email(self) -> None:
-        is_valid, error = validate_send_operation(["invalid-email"])
-        assert is_valid is False
-        assert "invalid" in error.lower()
-
-    def test_too_many_recipients(self) -> None:
-        recipients = [f"user{i}@example.com" for i in range(150)]
-        is_valid, error = validate_send_operation(recipients)
-        assert is_valid is False
-        assert "too many" in error.lower()
 
 
 class TestValidateBulkOperation:

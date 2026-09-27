@@ -13,8 +13,6 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from .utils import validate_email
-
 logger = logging.getLogger(__name__)
 
 
@@ -105,40 +103,6 @@ class OperationLogger:
 
 # Global operation logger instance
 operation_logger = OperationLogger()
-
-
-
-def validate_send_operation(
-    to: list[str], cc: list[str] | None = None, bcc: list[str] | None = None
-) -> tuple[bool, str]:
-    """
-    Validate email sending operation.
-
-    Args:
-        to: List of To recipients
-        cc: List of CC recipients
-        bcc: List of BCC recipients
-
-    Returns:
-        Tuple of (is_valid, error_message)
-    """
-    # Check for recipients
-    if not to:
-        return False, "At least one 'to' recipient is required"
-
-    # Validate all email addresses
-    all_recipients = to + (cc or []) + (bcc or [])
-    invalid_emails = [email for email in all_recipients if not validate_email(email)]
-
-    if invalid_emails:
-        return False, f"Invalid email addresses: {', '.join(invalid_emails)}"
-
-    # Check for reasonable limits (prevent spam)
-    max_recipients = 100
-    if len(all_recipients) > max_recipients:
-        return False, f"Too many recipients (max: {max_recipients})"
-
-    return True, ""
 
 
 def validate_bulk_operation(item_count: int, max_items: int = 100) -> tuple[bool, str]:
