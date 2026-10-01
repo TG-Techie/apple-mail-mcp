@@ -2,9 +2,7 @@
 AppleScript-based connector for Apple Mail.
 """
 
-import fcntl
 import logging
-import os
 import re
 import subprocess
 import time
@@ -21,6 +19,7 @@ from typing import IO, Any, Literal, cast
 
 from imapclient.exceptions import IMAPClientError, LoginError
 
+from . import mail_lock
 from .compose_ledger import (
     Closed,
     Closer,
@@ -1653,48 +1652,23 @@ class AppleMailConnector:
                 raise
             raise MailAppleScriptError(f"Unexpected error: {str(e)}") from e
         finally:
-            try:
-                fcntl.flock(lock_fh, fcntl.LOCK_UN)
-            finally:
-                lock_fh.close()
+            mail_lock.release(lock_fh)
 
     def _acquire_mail_lock(self) -> IO[str]:
-        """Acquire the cross-process Mail automation lock (2026-07-23).
-
-        Several callers can drive Mail at once (the resident daemon on
-        behalf of many sessions, any stdio server beside it, a test
-        run); without serialization, concurrent AppleScript against
-        Mail.app collides into AppleEvent timeouts (-1712) and invalid
-        connections (-609) that surface as inscrutable failures for the
-        OTHER agent. A file lock under ``APPLE_MAIL_MCP_HOME`` (default
-        ``~/.apple_mail_mcp``) queues callers instead; a caller that
-        cannot acquire it within ``lock_timeout`` gets a clear "busy"
-        error naming the condition — before any osascript runs.
-        """
-        home_override = os.environ.get("APPLE_MAIL_MCP_HOME")
-        lock_dir = (
-            Path(home_override).expanduser()
-            if home_override
-            else Path.home() / ".apple_mail_mcp"
-        )
-        lock_dir.mkdir(parents=True, exist_ok=True)
-        fh = open(lock_dir / "mail_automation.lock", "w")  # noqa: SIM115 — held past scope, released in _run_applescript's finally
-        deadline = time.monotonic() + self.lock_timeout
-        while True:
-            try:
-                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                return fh
-            except OSError:
-                if time.monotonic() >= deadline:
-                    fh.close()
-                    raise MailAppleScriptError(
-                        f"Mail automation busy: another process held the "
-                        f"Mail lock for over {self.lock_timeout:.0f}s "
-                        f"({lock_dir / 'mail_automation.lock'}). Retry "
-                        f"shortly; concurrent Mail automation is "
-                        f"serialized to prevent AppleEvent collisions."
-                    ) from None
-                time.sleep(0.25)
+        """Take the cross-process Mail automation lock (``mail_lock``),
+        waiting up to ``lock_timeout``. A caller that cannot have it in
+        time gets a clear "busy" error naming the condition, before any
+        osascript runs."""
+        fh = mail_lock.acquire(self.lock_timeout)
+        if fh is None:
+            raise MailAppleScriptError(
+                f"Mail automation busy: another process held the "
+                f"Mail lock for over {self.lock_timeout:.0f}s "
+                f"({mail_lock.lock_path()}). Retry "
+                f"shortly; concurrent Mail automation is "
+                f"serialized to prevent AppleEvent collisions."
+            )
+        return fh
 
     def list_accounts(self) -> list[dict[str, Any]]:
         """List all mail accounts.

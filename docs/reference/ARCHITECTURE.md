@@ -63,7 +63,7 @@ session C --stdio--> mail-proxy --+                                    |
   proxy starts (docs/DISCIPLINE.md, "MCP context exposure"). With the
   daemon down a session's handshake fails outright rather than
   reporting an empty tool list (`provider_error_strategy="raise"`).
-- The cross-process Mail lock (`_acquire_mail_lock`) serializes the
+- The cross-process Mail lock (`mail_lock.py`) serializes the
   daemon's own threads and any stdio server or test run beside it.
 - The daemon tends Mail's compose windows (`tender.py`): a pass at
   start, every 15 minutes, and soon after a composition leaves its window
@@ -88,7 +88,8 @@ operation log become fleet-wide.
 | `tools/templates.py` | The template tools over `TemplateStore` | `server`, `security`, `templates` |
 | `tools/drafts.py` | The draft tools, `draft_create` to `draft_send`; a rebuild takes the caller's own part from the seed record | `server`, `drafts`, `security`, `exceptions`, `tools.send`, `tools.templates` |
 | `tools/send.py` | `email_send_html`, and the gates it shares with `draft_send`: the outbound allowlist, the user's confirmation, the checks on files to attach | `server`, `outbound_allowlist`, `security`, `exceptions` |
-| `mail_connector.py` | All AppleScript generation and execution (`AppleMailConnector`); dispatches to the IMAP fast path for a few bulk ops; records every compose window it opens in the compose ledger, and runs a tending pass (`tend_compose_windows`) | `compose_ledger`, `compose_tending`, `drafts`, `imap_connector`, `keychain`, `outbound_allowlist`, `utils`, `exceptions` |
+| `mail_connector.py` | All AppleScript generation and execution (`AppleMailConnector`); dispatches to the IMAP fast path for a few bulk ops; records every compose window it opens in the compose ledger, and runs a tending pass (`tend_compose_windows`) | `compose_ledger`, `compose_tending`, `drafts`, `imap_connector`, `keychain`, `mail_lock`, `outbound_allowlist`, `utils`, `exceptions` |
+| `mail_lock.py` | The cross-process Mail automation lock: a flock on a file under the data home, opened afresh on every acquisition | none |
 | `compose_ledger.py` | The record of every compose window the connector opens, by Mail's window id and process, and how each ended (sent, saved, salvaged, discarded, gone, or left open), one file per window under `<root>/compose_windows/` | `exceptions` |
 | `compose_tending.py` | What a tending pass does, decided from an inventory of the compose windows and the ledger (`plan_tending`); pure | `compose_ledger` |
 | `tender.py` | The daemon's tending thread and the logged, rate-limited pass it runs | `security`; `server` (imported at run time only) |

@@ -29,7 +29,7 @@ Concurrency, as read from the installed fastmcp 3.4.7 on 2026-09-26:
   makes their module-level names awaitable for callers in this process.
   tests/unit/test_tool_threadpool.py holds the tools whose work reaches
   Mail to it.
-- The Mail lock (``AppleMailConnector._acquire_mail_lock``) opens the lock
+- The Mail lock (``mail_lock.py``) opens the lock
   file afresh on every call, and flock(2) refuses a second open of the
   file from another thread of the same process just as it does from
   another process (observed on this machine 2026-09-26). So the lock
