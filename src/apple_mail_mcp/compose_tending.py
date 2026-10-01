@@ -141,9 +141,10 @@ class TendPlan:
     unidentified: int
 
 
-def _in_flight(record: WindowRecord, now: float, grace_s: float) -> bool:
+def in_flight(record: WindowRecord, now: float, grace_s: float) -> bool:
     """Its composition may still be running: it has not ended, and it
-    began less than ``grace_s`` ago."""
+    began less than ``grace_s`` ago. Tending leaves such a window, and
+    the daemon's Mail restarter puts a scheduled restart off for it."""
     return isinstance(record.state, Open) and now - record.opened_at < grace_s
 
 
@@ -180,7 +181,7 @@ def _claims(
             name_now = inventory.mail_windows.get(record.window_id)
         if name_now is not None:
             by_name[name_now].append(record)
-        elif not _in_flight(record, now, grace_s):
+        elif not in_flight(record, now, grace_s):
             gone.append(record)
     return _Claims(by_name=by_name, gone=tuple(gone), unidentified=unidentified)
 
@@ -193,7 +194,7 @@ def _decide(
     grace_s: float,
 ) -> TendAction | LeftReason:
     """For the one window of its name, which ``record`` claims."""
-    if _in_flight(record, now, grace_s):
+    if in_flight(record, now, grace_s):
         return "in_flight"
     if window.name != record.window_name:
         return "renamed"
