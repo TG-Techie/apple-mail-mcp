@@ -28,7 +28,7 @@ classifiers = [
 dependencies = [
     "anyio>=4.5",
     "fastmcp>=3.4.7,<4",
-    "imapclient>=3.0.0",
+    "imapclient>=4.1.0",
     "pyyaml>=6.0.3",
 ]
 
@@ -43,7 +43,7 @@ dev = [
     "mypy>=1.20.2",
 ]
 research = [
-    "imapclient>=3.0.0",
+    "imapclient>=4.1.0",
 ]
 
 [dependency-groups]
