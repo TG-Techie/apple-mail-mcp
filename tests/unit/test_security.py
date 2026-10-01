@@ -303,6 +303,12 @@ class TestCheckRateLimit:
         assert tender.OPERATION in INTERNAL_OPERATIONS
         assert OPERATION_TIERS[tender.OPERATION] == "expensive_ops"
 
+    def test_restarting_mail_is_an_internal_operation_among_the_mutations(self) -> None:
+        from apple_mail_mcp import restarter
+
+        assert restarter.OPERATION in INTERNAL_OPERATIONS
+        assert OPERATION_TIERS[restarter.OPERATION] == "expensive_ops"
+
     def test_tier_limits_config_exists_for_all_tiers(self) -> None:
         expected_tiers = {"cheap_reads", "expensive_ops", "sends"}
         assert set(TIER_LIMITS.keys()) == expected_tiers

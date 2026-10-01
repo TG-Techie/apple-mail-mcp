@@ -141,7 +141,13 @@ TIER_LIMITS: dict[str, tuple[int, float]] = {
 # does not confine it: it is no tool a test calls, it names no account,
 # and what it closes loses nothing — a salvage to Drafts, or a discard of
 # a window with nothing in it.
-INTERNAL_OPERATIONS: frozenset[str] = frozenset({"tend_compose_windows"})
+#
+# restart_mail (restarter.py): the daemon quitting and relaunching Mail,
+# when it has stopped answering Apple events and once a day. It changes
+# Mail's state, so it is in the tier of the other mutations, beside its
+# own back-off. Test mode does not confine it either: it is no tool a
+# test calls, it names no account, and only the daemon runs it.
+INTERNAL_OPERATIONS: frozenset[str] = frozenset({"tend_compose_windows", "restart_mail"})
 
 # The rate-limit tier of each operation, keyed by its name: one entry per
 # registered tool and per internal operation, and no other.
@@ -179,6 +185,7 @@ OPERATION_TIERS: dict[str, str] = {
     "render_template": "cheap_reads",
     # Internal operations.
     "tend_compose_windows": "expensive_ops",
+    "restart_mail": "expensive_ops",
 }
 
 
