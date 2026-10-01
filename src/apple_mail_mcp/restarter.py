@@ -22,6 +22,17 @@ answered with an error, is not a failure, and a Mail that is not
 running is not a wedge. Nothing here launches a Mail that was not
 running.
 
+Each tick also reads Mail's own resource use (``MacMailHost.usage``),
+so a Mail heading for a wedge is restarted before it stops answering.
+A CPU share of at least ``CPU_HIGH_SHARE`` (1.0 is one core) on
+``CPU_HIGH_TICKS`` ticks in a row restarts it with reason ``cpu``; a
+physical footprint of at least ``MEMORY_HIGH_BYTES`` on
+``MEMORY_HIGH_TICKS`` ticks in a row, with reason ``memory``. The run
+starts again after one tick under, a new Mail process, or a restart.
+Mail is still answering then, so these restarts wait for a composition
+in flight, as the scheduled one does, and the audit entry carries the
+measurements that called for them.
+
 A restart holds the Mail lock throughout, so no osascript is mid-flight
 against Mail: ask Mail to quit; if its process has not exited within a
 bound, SIGTERM; then SIGKILL; then ``open -g`` it and wait, bounded,
@@ -57,9 +68,9 @@ import threading
 import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
-from functools import partial
+from functools import lru_cache, partial
 from typing import Any, Literal, Protocol
 
 from . import mail_lock
@@ -98,6 +109,30 @@ RESTART_MIN_GAP_S = 60 * 60
 outcome or reason. A Mail rebuilding its index after a SIGKILL can be
 slow to answer for a while; it is not killed again for that."""
 
+CPU_HIGH_SHARE = 0.9
+"""A CPU share, since the previous tick, at or above which Mail counts
+as running hot: CPU time over wall time, so 1.0 is one core kept busy.
+A main thread stuck in a loop holds Mail at about one core."""
+
+CPU_HIGH_TICKS = 3
+"""Ticks in a row Mail must run hot before it is restarted for it. Mail
+legitimately runs hot for minutes at a time: syncing accounts, indexing
+after a relaunch, a long search. A run this long (15 minutes at the
+default interval) outlasts those."""
+
+MEMORY_HIGH_BYTES = 3 * 2**30
+"""A physical footprint at or above which Mail counts as grown too
+large. The footprint is what Activity Monitor shows as a process's
+Memory: what it has resident, compressed and swapped. Its resident size
+is no measure of this: the system can compress or swap out nearly all
+of a long-running Mail, leaving it resident in a sliver of what it
+holds. Set well above what Mail needs for its windows and
+mailboxes, so that only growth over a long uptime reaches it."""
+
+MEMORY_HIGH_TICKS = 2
+"""Ticks in a row Mail's footprint must stay that high before it is
+restarted for it: one reading can catch a passing peak."""
+
 LOCK_WAIT_S = 90.0
 """How long a probe or a restart waits for the Mail lock. Longer than
 the connector's 60 s osascript timeout, so a call stuck on a wedged Mail
@@ -130,7 +165,7 @@ _OSASCRIPT_GRACE_S = 5
 """osascript's own timeout runs this much past the script's, as a
 backstop: the script's ``with timeout`` is meant to end it first."""
 
-Reason = Literal["unresponsive", "scheduled"]
+Reason = Literal["unresponsive", "scheduled", "cpu", "memory"]
 ProbeOutcome = Literal["answered", "silent", "not_running", "error"]
 EndedBy = Literal["quit", "sigterm", "sigkill"]
 
@@ -143,6 +178,15 @@ class Probe:
 
     outcome: ProbeOutcome
     detail: str = ""
+
+
+@dataclass(frozen=True)
+class Usage:
+    """A process's resource use at one moment: CPU time used since it
+    started, in seconds, and its physical footprint."""
+
+    cpu_s: float
+    footprint_bytes: int
 
 
 @dataclass(frozen=True)
@@ -161,6 +205,7 @@ class RestartReport:
     answered: bool
     new_pid: int | None
     seconds: float
+    measured: dict[str, Any] = field(default_factory=dict)
 
     @property
     def succeeded(self) -> bool:
@@ -178,6 +223,7 @@ class RestartReport:
                 {"stage": s.name, "outcome": s.outcome, "seconds": round(s.seconds, 1)}
                 for s in self.stages
             ],
+            "measured": self.measured,
         }
 
 
@@ -190,6 +236,8 @@ class MailHost(Protocol):
     def mail_pid(self) -> int | None: ...
 
     def is_mail(self, pid: int) -> bool: ...
+
+    def usage(self, pid: int) -> Usage | None: ...
 
     def composition_in_flight(self) -> bool: ...
 
@@ -251,6 +299,77 @@ def _executable(pid: int) -> str | None:
     return buf.value.decode("utf-8", "replace")
 
 
+_PROC_PIDTASKINFO = 4
+_RUSAGE_INFO_V2 = 2
+
+
+class _TaskInfo(ctypes.Structure):
+    """``struct proc_taskinfo`` (sys/proc_info.h)."""
+
+    _fields_ = [
+        ("pti_virtual_size", ctypes.c_uint64),
+        ("pti_resident_size", ctypes.c_uint64),
+        ("pti_total_user", ctypes.c_uint64),
+        ("pti_total_system", ctypes.c_uint64),
+        ("pti_threads_user", ctypes.c_uint64),
+        ("pti_threads_system", ctypes.c_uint64),
+    ] + [
+        (name, ctypes.c_int32)
+        for name in (
+            "pti_policy", "pti_faults", "pti_pageins", "pti_cow_faults",
+            "pti_messages_sent", "pti_messages_received", "pti_syscalls_mach",
+            "pti_syscalls_unix", "pti_csw", "pti_threadnum", "pti_numrunning",
+            "pti_priority",
+        )
+    ]
+
+
+class _RUsageInfoV2(ctypes.Structure):
+    """``struct rusage_info_v2`` (sys/resource.h)."""
+
+    _fields_ = [("ri_uuid", ctypes.c_uint8 * 16)] + [
+        (name, ctypes.c_uint64)
+        for name in (
+            "ri_user_time", "ri_system_time", "ri_pkg_idle_wkups",
+            "ri_interrupt_wkups", "ri_pageins", "ri_wired_size", "ri_resident_size",
+            "ri_phys_footprint", "ri_proc_start_abstime", "ri_proc_exit_abstime",
+            "ri_child_user_time", "ri_child_system_time", "ri_child_pkg_idle_wkups",
+            "ri_child_interrupt_wkups", "ri_child_pageins", "ri_child_elapsed_abstime",
+            "ri_diskio_bytesread", "ri_diskio_byteswritten",
+        )
+    ]
+
+
+class _Timebase(ctypes.Structure):
+    _fields_ = [("numer", ctypes.c_uint32), ("denom", ctypes.c_uint32)]
+
+
+@lru_cache(maxsize=1)
+def _ns_per_tick() -> float:
+    """``pti_total_user`` and ``pti_total_system`` count Mach absolute
+    time units, which are nanoseconds on Intel but not on Apple silicon;
+    ``mach_timebase_info`` converts them."""
+    tb = _Timebase()
+    ctypes.CDLL("/usr/lib/libSystem.dylib").mach_timebase_info(ctypes.byref(tb))
+    return float(tb.numer) / float(tb.denom)
+
+
+def _usage(pid: int) -> Usage | None:
+    """``pid``'s CPU time (``proc_pidinfo`` PROC_PIDTASKINFO) and physical
+    footprint (``proc_pid_rusage``); None when either cannot be read,
+    as for a process that has exited. Reads only."""
+    lib = _libproc()
+    info = _TaskInfo()
+    size = ctypes.sizeof(info)
+    if lib.proc_pidinfo(pid, _PROC_PIDTASKINFO, ctypes.c_uint64(0), ctypes.byref(info), size) != size:
+        return None
+    rusage = _RUsageInfoV2()
+    if lib.proc_pid_rusage(pid, _RUSAGE_INFO_V2, ctypes.byref(rusage)) != 0:
+        return None
+    ticks = info.pti_total_user + info.pti_total_system
+    return Usage(cpu_s=ticks * _ns_per_tick() / 1e9, footprint_bytes=rusage.ri_phys_footprint)
+
+
 # Both scripts check that Mail is running first, so that neither starts
 # it. Their only interpolations are this module's integer timeouts.
 _PROBE_SCRIPT = """
@@ -292,6 +411,9 @@ class MacMailHost:
 
     def is_mail(self, pid: int) -> bool:
         return pid in _user_pids() and _executable(pid) == MAIL_EXECUTABLE
+
+    def usage(self, pid: int) -> Usage | None:
+        return _usage(pid)
 
     def composition_in_flight(self) -> bool:
         """Some composition, in this process or another, may be between
@@ -361,6 +483,58 @@ class MacMailHost:
         return Probe("error", err)
 
 
+class _LoadWatch:
+    """The current runs of hot ticks and of large-footprint ticks, for
+    one Mail process. A CPU share needs two readings of the same
+    process; the first reading of a process starts both runs afresh."""
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self._pid: int | None = None
+        self._last: tuple[float, float] | None = None
+        self.cpu_shares: list[float] = []
+        self.footprints: list[int] = []
+
+    def observe(self, pid: int, at: float, usage: Usage | None) -> None:
+        if usage is None or pid != self._pid:
+            self.reset()
+        if usage is None:
+            return
+        share: float | None = None
+        if self._last is not None and at > self._last[0]:
+            share = (usage.cpu_s - self._last[1]) / (at - self._last[0])
+        self._pid = pid
+        self._last = (at, usage.cpu_s)
+        if share is not None and share >= CPU_HIGH_SHARE:
+            if not self.cpu_shares:
+                logger.warning(
+                    "Mail is using %.0f%% of a CPU core; restarting it if that lasts "
+                    "%d checks in a row", share * 100, CPU_HIGH_TICKS,
+                )
+            self.cpu_shares.append(share)
+        else:
+            self.cpu_shares = []
+        if usage.footprint_bytes >= MEMORY_HIGH_BYTES:
+            if not self.footprints:
+                logger.warning(
+                    "Mail's memory footprint is %.1f GiB; restarting it if that lasts "
+                    "%d checks in a row", usage.footprint_bytes / 2**30, MEMORY_HIGH_TICKS,
+                )
+            self.footprints.append(usage.footprint_bytes)
+        else:
+            self.footprints = []
+
+    def due(self) -> tuple[Reason, dict[str, Any]] | None:
+        if len(self.cpu_shares) >= CPU_HIGH_TICKS:
+            shares = [round(x, 3) for x in self.cpu_shares[-CPU_HIGH_TICKS:]]
+            return "cpu", {"cpu_shares": shares}
+        if len(self.footprints) >= MEMORY_HIGH_TICKS:
+            return "memory", {"footprint_bytes": self.footprints[-MEMORY_HIGH_TICKS:]}
+        return None
+
+
 class MailRestarter:
     """The daemon's Mail restarter: ``start`` its thread, ``stop`` it.
     ``check`` is one turn of it, which the thread runs every
@@ -388,6 +562,7 @@ class MailRestarter:
         # off from the wedged Mail, runs again at once.
         self._on_restarted = on_restarted
         self._silent_probes = 0
+        self._load = _LoadWatch()
         self._last_restart: float | None = None
         self._last_check = self._clock.now()
         self._scheduled_for: datetime | None = None
@@ -403,8 +578,9 @@ class MailRestarter:
 
     def check(self) -> None:
         """Note whether the scheduled hour has come; then, under the Mail
-        lock, restart Mail if it is due, else probe it and restart it if
-        it has stopped answering."""
+        lock, restart Mail if it is due, else probe it and read its
+        resource use, and restart it if it has stopped answering or has
+        run hot or large for long enough."""
         self._note_schedule(self._clock.now())
         with self._host.mail_lock(LOCK_WAIT_S) as held:
             if not held:
@@ -417,13 +593,14 @@ class MailRestarter:
             pid = self._host.mail_pid()
             if pid is None:
                 self._silent_probes = 0
+                self._load.reset()
                 if self._scheduled_for is not None:
                     logger.info("scheduled restart of Mail skipped: Mail is not running")
                     self._scheduled_for = None
                 return
-            reason = self._due_reason()
-            if reason is not None:
-                self._restart(reason, pid)
+            due = self._due_reason(pid)
+            if due is not None:
+                self._restart(*due, pid)
 
     def seconds_to_next_check(self) -> float:
         """Until the next probe, or the scheduled hour if that is sooner
@@ -467,9 +644,9 @@ class MailRestarter:
             and self._clock.monotonic() - self._last_restart < RESTART_MIN_GAP_S
         )
 
-    def _due_reason(self) -> Reason | None:
-        """Under the lock, with Mail running: why Mail is to be restarted
-        now, if it is."""
+    def _due_reason(self, pid: int) -> tuple[Reason, dict[str, Any]] | None:
+        """Under the lock, with Mail running as ``pid``: why Mail is to be
+        restarted now, if it is, and what was measured to say so."""
         if self._scheduled_for is not None:
             if self._backing_off():
                 logger.info("scheduled restart of Mail skipped: Mail was restarted recently")
@@ -477,14 +654,31 @@ class MailRestarter:
             elif self._host.composition_in_flight():
                 logger.info("scheduled restart of Mail put off: a composition is in flight")
             else:
-                return "scheduled"
+                return "scheduled", {}
+        unresponsive = self._probe_says_restart()
+        self._load.observe(pid, self._clock.monotonic(), self._host.usage(pid))
+        if unresponsive:
+            return "unresponsive", {"silent_probes": self._silent_probes}
+        due = self._load.due()
+        if due is None:
+            return None
+        if self._backing_off():
+            logger.info("restart of Mail for %s put off: Mail was restarted recently", due[0])
+            return None
+        if self._host.composition_in_flight():
+            logger.info("restart of Mail for %s put off: a composition is in flight", due[0])
+            return None
+        return due
+
+    def _probe_says_restart(self) -> bool:
+        """Probe Mail, and say whether its silence now calls for a restart."""
         probe = self._host.probe(PROBE_TIMEOUT_S)
         if probe.outcome in ("answered", "not_running"):
             self._silent_probes = 0
-            return None
+            return False
         if probe.outcome == "error":
             logger.warning("Mail probe failed, not counted as silence: %s", probe.detail)
-            return None
+            return False
         self._silent_probes += 1
         logger.warning(
             "Mail did not answer a probe within %d s (%d in a row): %s",
@@ -493,25 +687,27 @@ class MailRestarter:
             probe.detail,
         )
         if self._silent_probes < SILENT_PROBES_TO_RESTART:
-            return None
+            return False
         if self._backing_off():
             logger.warning(
                 "Mail is not answering, but it was restarted less than %.0f min ago; "
                 "not restarting it again until then",
                 RESTART_MIN_GAP_S / 60,
             )
-            return None
-        return "unresponsive"
+            return False
+        return True
 
-    def _restart(self, reason: Reason, pid: int) -> None:
-        """Under the lock: restart Mail, log it, and start the back-off.
-        A restart the rate limiter refuses is left for the next check."""
+    def _restart(self, reason: Reason, measured: dict[str, Any], pid: int) -> None:
+        """Under the lock: restart Mail, log it with what was measured to
+        call for it, and start the back-off. A restart the rate limiter
+        refuses is left for the next check."""
         if check_rate_limit(OPERATION, {"reason": reason, "old_pid": pid}) is not None:
             return
         self._last_restart = self._clock.monotonic()
         self._silent_probes = 0
         self._scheduled_for = None
-        report = _Restart(self._host, self._clock, reason, pid).run()
+        self._load.reset()
+        report = replace(_Restart(self._host, self._clock, reason, pid).run(), measured=measured)
         operation_logger.log_operation(
             OPERATION, report.as_dict(), "success" if report.succeeded else "failure"
         )
@@ -525,7 +721,7 @@ def _log_restart(report: RestartReport) -> None:
     gap_min = RESTART_MIN_GAP_S / 60
     if report.succeeded:
         logger.log(
-            logging.WARNING if report.reason == "unresponsive" else logging.INFO,
+            logging.INFO if report.reason == "scheduled" else logging.WARNING,
             "restarted Mail (%s): ended by %s, answering again after %.0f s",
             report.reason, report.ended_by, report.seconds,
         )

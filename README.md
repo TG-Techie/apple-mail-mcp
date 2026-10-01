@@ -72,7 +72,10 @@ unchanged, and a client that runs its own server needs neither.
   unanswered for 20 seconds, it restarts Mail, and it also restarts Mail once
   a day at 04:00 local time (a day whose hour passed while the daemon was down
   is skipped, and the daily one waits while a send or draft is being
-  composed). A restart holds the Mail lock throughout, asks Mail to quit,
+  composed). It also restarts Mail before it wedges, when it has kept most
+  of a CPU core busy for 15 minutes or its memory footprint has stayed
+  above 3 GiB on two checks; these too wait for a composition. A restart
+  holds the Mail lock throughout, asks Mail to quit,
   then sends SIGTERM and SIGKILL if Mail's process has not exited, relaunches
   it in the background with `open -g`, and waits for it to answer; once Mail
   answers, it runs a tending pass rather than waiting out tending's back-off.

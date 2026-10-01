@@ -75,8 +75,10 @@ session C --stdio--> mail-proxy --+                                    |
 - The daemon keeps Mail answering (`restarter.py`): a probe under the Mail
   lock every 5 minutes, and a quit and relaunch of Mail when two probes in
   a row go unanswered and once a day at a set local hour, holding the lock
-  throughout and escalating from the quit event to SIGTERM and SIGKILL. A
-  restart whose relaunched Mail answers asks the tender for a pass. A
+  throughout and escalating from the quit event to SIGTERM and SIGKILL.
+  Each probe also reads Mail's CPU time and memory footprint through
+  libproc, and Mail is restarted before it wedges when either stays high
+  for several probes in a row. A restart whose relaunched Mail answers asks the tender for a pass. A
   relaunched Mail's restored compose windows have new ids, so tending ends
   their records as `gone`. `--mail-probe-interval 0` turns it off. A stdio
   server never restarts Mail.
@@ -101,7 +103,7 @@ operation log become fleet-wide.
 | `compose_ledger.py` | The record of every compose window the connector opens, by Mail's window id and process, and how each ended (sent, saved, salvaged, discarded, gone, or left open), one file per window under `<root>/compose_windows/` | `exceptions` |
 | `compose_tending.py` | What a tending pass does, decided from an inventory of the compose windows and the ledger (`plan_tending`); pure | `compose_ledger` |
 | `tender.py` | The daemon's tending thread and the logged, rate-limited pass it runs | `security`; `server` (imported at run time only) |
-| `restarter.py` | The daemon's Mail restarter thread: probes Mail, and quits and relaunches it when it stops answering and once a day, logged and rate-limited; finds Mail's process through libproc | `mail_lock`, `security` |
+| `restarter.py` | The daemon's Mail restarter thread: probes Mail, and quits and relaunches it when it stops answering, when its CPU or memory stays high, and once a day, logged and rate-limited; finds Mail's process and reads its resource use through libproc | `mail_lock`, `compose_ledger`, `compose_tending`, `security` |
 | `imap_connector.py` | Stateless IMAP client wrapper (`ImapConnector`) and a pooled-connection helper (`ImapConnectionPool`); deliberately unaware of Mail.app and Keychain — callers hand it resolved `(host, port, email, password)` | `exceptions` |
 | `keychain.py` | Reads/writes IMAP passwords in the macOS Keychain under the `apple-mail-mcp.imap.<account>` service name; backs the `apple-mail-mcp setup-imap` CLI and the IMAP fallback path | `exceptions` |
 | `outbound_allowlist.py` | The single point of truth for which recipient addresses may receive outbound mail. Sourced from a YAML config (`APPLE_MAIL_MCP_COMMS_CONFIG`); fails closed if that config is missing or unreadable. Consulted by the tools (`tools/send.py` refuses an off-list send before Mail is touched and skips elicitation for pre-trusted recipients; `tools/accounts_rules.py` checks a rule's `forward_to`) and by `mail_connector.py` (as the hard send-time block) | `exceptions` |

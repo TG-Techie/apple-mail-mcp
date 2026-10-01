@@ -21,7 +21,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from apple_mail_mcp import restarter
-from apple_mail_mcp.restarter import MailRestarter, Probe
+from apple_mail_mcp.restarter import MailRestarter, Probe, Usage
 from apple_mail_mcp.security import TIER_LIMITS, operation_logger, rate_limiter
 
 NOON = datetime(2026, 1, 14, 12, 0, 0)
@@ -46,6 +46,11 @@ class FakeMail:
         self.in_lock = False
         self.composing = False
         self.events: list[str] = []
+        # Mail's resource use: CPU time accrues at ``cpu_share`` of the
+        # time that passes; ``footprint`` is its physical footprint.
+        self.cpu_share = 0.05
+        self.cpu_s = 0.0
+        self.footprint = 500 * 2**20
 
     # The clock.
     def monotonic(self) -> float:
@@ -59,6 +64,7 @@ class FakeMail:
 
     def advance(self, seconds: float) -> None:
         self.mono += seconds
+        self.cpu_s += seconds * self.cpu_share
         self.wall += timedelta(seconds=seconds)
 
     def at(self, when: datetime) -> None:
@@ -91,6 +97,11 @@ class FakeMail:
 
     def is_mail(self, pid: int) -> bool:
         return pid == self.pid
+
+    def usage(self, pid: int) -> Usage | None:
+        if pid != self.pid:
+            return None
+        return Usage(cpu_s=self.cpu_s, footprint_bytes=self.footprint)
 
     def composition_in_flight(self) -> bool:
         assert self.in_lock
@@ -456,6 +467,158 @@ class TestTheRestart:
         rate_limiter.reset()
         wedged.check()
         assert "quit event" in mail.events
+
+
+GIB = 2**30
+
+
+class TestLoad:
+    """Mail's CPU share and footprint, read each tick; preventive restarts
+    when either stays high. Ticks are ``interval_s`` (300 s) apart."""
+
+    @staticmethod
+    def _ticks(r: MailRestarter, mail: FakeMail, n: int) -> None:
+        for _ in range(n):
+            mail.advance(300)
+            r.check()
+
+    def test_a_cpu_share_high_for_the_run_restarts_mail(
+        self, mail: FakeMail, logged: list[tuple[Any, ...]]
+    ) -> None:
+        r = _restarter(mail)
+        r.check()
+        mail.cpu_share = 1.0
+        self._ticks(r, mail, restarter.CPU_HIGH_TICKS - 1)
+        assert _restarts(logged) == []
+        self._ticks(r, mail, 1)
+        [(_, params, result)] = _restarts(logged)
+        assert params["reason"] == "cpu"
+        assert result == "success"
+        shares = params["measured"]["cpu_shares"]
+        assert len(shares) == restarter.CPU_HIGH_TICKS
+        assert all(s >= restarter.CPU_HIGH_SHARE for s in shares)
+
+    def test_one_low_tick_breaks_the_cpu_run(
+        self, mail: FakeMail, logged: list[tuple[Any, ...]]
+    ) -> None:
+        r = _restarter(mail)
+        r.check()
+        mail.cpu_share = 1.0
+        self._ticks(r, mail, restarter.CPU_HIGH_TICKS - 1)
+        mail.cpu_share = 0.2
+        self._ticks(r, mail, 1)
+        mail.cpu_share = 1.0
+        self._ticks(r, mail, restarter.CPU_HIGH_TICKS - 1)
+        assert _restarts(logged) == []
+        self._ticks(r, mail, 1)
+        assert [e[1]["reason"] for e in _restarts(logged)] == ["cpu"]
+
+    def test_a_new_mail_process_starts_the_window_again(
+        self, mail: FakeMail, logged: list[tuple[Any, ...]]
+    ) -> None:
+        r = _restarter(mail)
+        r.check()
+        mail.cpu_share = 1.0
+        self._ticks(r, mail, restarter.CPU_HIGH_TICKS - 1)
+        mail.pid = 6000
+        mail.cpu_s = 0.0
+        self._ticks(r, mail, restarter.CPU_HIGH_TICKS)
+        assert _restarts(logged) == []
+        self._ticks(r, mail, 1)
+        assert [e[1]["reason"] for e in _restarts(logged)] == ["cpu"]
+
+    def test_a_footprint_high_on_two_ticks_restarts_mail(
+        self, mail: FakeMail, logged: list[tuple[Any, ...]]
+    ) -> None:
+        r = _restarter(mail)
+        mail.footprint = restarter.MEMORY_HIGH_BYTES
+        r.check()
+        assert _restarts(logged) == []
+        self._ticks(r, mail, 1)
+        [(_, params, result)] = _restarts(logged)
+        assert params["reason"] == "memory"
+        assert params["measured"] == {
+            "footprint_bytes": [restarter.MEMORY_HIGH_BYTES] * restarter.MEMORY_HIGH_TICKS
+        }
+
+    def test_one_low_tick_breaks_the_memory_run(
+        self, mail: FakeMail, logged: list[tuple[Any, ...]]
+    ) -> None:
+        r = _restarter(mail)
+        mail.footprint = 4 * GIB
+        r.check()
+        mail.footprint = GIB
+        self._ticks(r, mail, 1)
+        mail.footprint = 4 * GIB
+        self._ticks(r, mail, 1)
+        assert _restarts(logged) == []
+
+    def test_a_restart_starts_the_window_again(
+        self, mail: FakeMail, logged: list[tuple[Any, ...]]
+    ) -> None:
+        r = _restarter(mail)
+        mail.footprint = 4 * GIB
+        r.check()
+        self._ticks(r, mail, 1)
+        assert len(_restarts(logged)) == 1
+        # Still high after the relaunch: once the gap has passed, it takes
+        # a fresh run of ticks, not the one from before the restart.
+        mail.advance(restarter.RESTART_MIN_GAP_S)
+        r.check()
+        assert len(_restarts(logged)) == 1
+        self._ticks(r, mail, 1)
+        assert len(_restarts(logged)) == 2
+
+    def test_respects_the_gap_between_restarts(
+        self, mail: FakeMail, logged: list[tuple[Any, ...]]
+    ) -> None:
+        r = _restarter(mail)
+        mail.wedge()
+        r.check()
+        r.check()
+        assert [e[1]["reason"] for e in _restarts(logged)] == ["unresponsive"]
+        mail.footprint = 4 * GIB
+        self._ticks(r, mail, int(restarter.RESTART_MIN_GAP_S // 300) - 1)
+        assert len(_restarts(logged)) == 1
+        self._ticks(r, mail, 2)
+        assert [e[1]["reason"] for e in _restarts(logged)] == ["unresponsive", "memory"]
+
+    def test_waits_for_a_composition_in_flight(
+        self, mail: FakeMail, logged: list[tuple[Any, ...]]
+    ) -> None:
+        r = _restarter(mail)
+        mail.footprint = 4 * GIB
+        mail.composing = True
+        r.check()
+        self._ticks(r, mail, 3)
+        assert _restarts(logged) == []
+        mail.composing = False
+        self._ticks(r, mail, 1)
+        assert [e[1]["reason"] for e in _restarts(logged)] == ["memory"]
+
+    def test_warns_once_when_a_threshold_is_crossed_and_not_while_under(
+        self, mail: FakeMail, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        r = _restarter(mail)
+        with caplog.at_level("INFO", logger="apple_mail_mcp.restarter"):
+            r.check()
+            self._ticks(r, mail, 5)
+            assert caplog.records == []
+            mail.cpu_share = 1.0
+            self._ticks(r, mail, restarter.CPU_HIGH_TICKS - 1)
+        warnings = [x.getMessage() for x in caplog.records if x.levelname == "WARNING"]
+        assert len(warnings) == 1 and "CPU" in warnings[0]
+
+    def test_an_unreadable_usage_is_no_measurement(
+        self, mail: FakeMail, logged: list[tuple[Any, ...]], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(mail, "usage", lambda pid: None)
+        mail.cpu_share = 1.0
+        mail.footprint = 4 * GIB
+        r = _restarter(mail)
+        r.check()
+        self._ticks(r, mail, 5)
+        assert _restarts(logged) == []
 
 
 class TestBackOff:
@@ -830,6 +993,27 @@ class TestTheMacHost:
         with restarter.MacMailHost().mail_lock(1.0) as got:
             assert got is True
             assert mail_lock.acquire(0.1) is None
+
+
+class TestTheUsageRead:
+    """The real host's read of a process's CPU time and footprint, on this
+    test's own process: read-only, and never Mail's."""
+
+    def test_cpu_time_is_in_seconds(self) -> None:
+        import os
+        import resource
+
+        end = time.process_time() + 0.2
+        while time.process_time() < end:
+            pass
+        usage = restarter.MacMailHost().usage(os.getpid())
+        ru = resource.getrusage(resource.RUSAGE_SELF)
+        assert usage is not None
+        assert usage.cpu_s == pytest.approx(ru.ru_utime + ru.ru_stime, rel=0.05)
+        assert usage.footprint_bytes > 0
+
+    def test_a_pid_that_is_no_process_has_none(self) -> None:
+        assert restarter.MacMailHost().usage(999_999_99) is None
 
 
 class TestTheProcessTable:
