@@ -5,9 +5,12 @@ salvages, compositions whose process died — and restored all of them
 at a relaunch (25 on 2026-09-27). The operator's direction that morning:
 "the mail app regularly has been accumulating failed windows so the MCP
 should periodically tend it reguardless". A pass
-(``AppleMailConnector.tend_compose_windows``) closes only the windows
-the compose ledger says this connector opened and nothing closed, and
-leaves and counts everything else (docs/research/compose-window-tending.md).
+(``AppleMailConnector.tend_compose_windows``) closes, each by Mail's
+window id, the windows the compose ledger says this connector opened and
+abandoned, and any other compose window whose content has not changed
+for ``compose_tending.STALE_S``, whoever opened it; an empty one is
+discarded and any other salvaged to Drafts, so nothing typed is lost
+(docs/research/compose-window-tending.md).
 
 The daemon (``mail-serve``) runs one pass when it starts, then one every
 ``TEND_INTERVAL_S``, and one soon after any composition ends with its
@@ -47,8 +50,8 @@ OPERATION = "tend_compose_windows"
 
 TEND_INTERVAL_S = 15 * 60
 """Between the daemon's passes, while Mail answers them. A pass holds
-the Mail lock while it reads the windows, about 6.5 s for 25 of them
-(2026-09-27), so it is not run often; a composition that leaves its
+the Mail lock while it reads the windows, about 10 s for 25 of them
+(2026-10-01), so it is not run often; a composition that leaves its
 window open asks for one at once instead."""
 
 TEND_MIN_GAP_S = 60.0

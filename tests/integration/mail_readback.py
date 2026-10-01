@@ -520,19 +520,28 @@ def compose_window_count(connector: AppleMailConnector, name: str) -> int:
     return int(out.strip())
 
 
+def mail_window_ids(connector: AppleMailConnector, name: str | None = None) -> set[int]:
+    """Mail's ids for its open windows, or for those named ``name``: the
+    visible ones and the minimized. Mail can keep a window it closed in its
+    list, neither visible nor miniaturized, after it is gone from the
+    screen (docs/research/compose-window-tending.md, Observation 10)."""
+    where = "visible is true or miniaturized is true"
+    if name is not None:
+        where = f"name is {_quoted(name)} and ({where})"
+    out = connector._run_applescript(
+        f'tell application "Mail" to set ids to id of every window whose {where}\n'
+        "set AppleScript's text item delimiters to \" \"\n"
+        "return ids as text"
+    )
+    return {int(i) for i in out.split()}
+
+
 def discard_compose_windows(connector: AppleMailConnector, name: str) -> None:
-    """Close every Mail window named ``name`` without saving, through the
-    connector's discard (close button, then Don't Save on the sheet), and
-    read back that none is left. Once per window: the discard addresses
-    the first window of the name, so its own read-back reports a failure
-    while another of the same name remains; only the final count counts.
-    """
-    for _ in range(compose_window_count(connector, name)):
-        connector._run_applescript(
-            f"set discardName to {_quoted(name)}\n"
-            + connector._as_discard_compose_block("discardName")
-            + "\nreturn discardOutcome"
-        )
+    """Close every Mail window named ``name`` without saving, each by
+    Mail's id for it, through the connector's discard (close button, then
+    Don't Save on the sheet), and read back that none is left."""
+    for window_id in sorted(mail_window_ids(connector, name)):
+        connector._discard_compose_window(name, window_id)
     remaining = compose_window_count(connector, name)
     if remaining:
         raise AssertionError(f"{remaining} windows named {name!r} are still open")

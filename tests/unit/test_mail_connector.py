@@ -28,8 +28,26 @@ from apple_mail_mcp.exceptions import (
     MailOutboundDisallowedError,
     MailTimeoutError,
 )
-from apple_mail_mcp.mail_connector import AppleMailConnector, _wrap_as_json_script
+from apple_mail_mcp.mail_connector import (
+    AppleMailConnector,
+    _ComposeWindow,
+    _WindowSnapshot,
+    _wrap_as_json_script,
+)
 from apple_mail_mcp.utils import SANITIZE_MAX_LENGTH
+
+
+@pytest.fixture(autouse=True)
+def _windows_before_compose(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every composition reads Mail's windows before it opens its own
+    (``_mail_window_snapshot``). Answered here with none, so each test's
+    scripted outcomes start at the opening script; what the read is for
+    is tested in test_compose_window_tending.py."""
+    monkeypatch.setattr(
+        AppleMailConnector,
+        "_mail_window_snapshot",
+        lambda self: _WindowSnapshot(mail_pid=77701, window_ids=frozenset()),
+    )
 
 
 class TestAppleMailConnector:
@@ -5911,10 +5929,17 @@ class TestComposition:
             connector, ["PASTE_FOCUS_FAILED:body area would not take focus"]
         )
         with pytest.raises(MailAppleScriptError, match="PASTE_FOCUS_FAILED"):
-            connector._paste_attachments("S", [f])
-        # file paste, then the salvage (close, Save); no AX verify, no send.
+            connector._paste_attachments(
+                _ComposeWindow(
+                    name="S", subject="S", to=[], cc=[], bcc=[], before_ids=[],
+                    window_id=2781,
+                ),
+                [f],
+            )
+        # file paste, then the salvage (close, Save) of Mail's window
+        # 2781; no AX verify, no send.
         assert len(captured) == 2
-        assert "AXCloseButton" in captured[1]
+        assert captured[1].startswith("set closeId to 2781\n")
 
 
 class TestWrapAsJsonScript:
@@ -6478,8 +6503,8 @@ class TestCreateDraft:
         assert "line1\nline2" in paste_s
         assert 'keystroke "a" using command down' in paste_s
         assert "AXWebArea" in readback_s
-        assert "AXCloseButton" in close_s
-        assert 'click button "Save" of first sheet' in close_s
+        assert "my tendClickClose(closeIdx)" in close_s
+        assert 'click button "Save" of sheet 1 of window closeIdx' in close_s
         assert 'messages of drafts mailbox whose subject is "hi"' in find_s
         assert "{5, 6}" in find_s
 
@@ -6621,7 +6646,7 @@ class TestCreateDraft:
             )
 
         connector._run_applescript = fake_run  # type: ignore[method-assign]
-        with pytest.raises(MailAppleScriptError, match="NO_COMPOSE_WINDOW"):
+        with pytest.raises(MailAppleScriptError, match="NO_COMPOSE_WINDOW") as exc:
             connector.create_draft(
                 seed="new",
                 to=["a@example.com"],
@@ -6629,7 +6654,10 @@ class TestCreateDraft:
                 body="x",
                 send_now=True,
             )
-        assert len(captured) == 1
+        # The open script, then the look for a window Mail opened late.
+        assert len(captured) == 2
+        assert "set expectedName to \"hi\"" in captured[1]
+        assert "(compose window: none found open)" in str(exc.value)
 
     def test_new_send_names_its_sender(
         self, connector: AppleMailConnector
@@ -7155,7 +7183,10 @@ class TestCreateDraft:
                 seed="forward", seed_id="160989", to=["a@example.com"],
                 body=self._NOTE, send_now=True,
             )
-        assert len(scripts) == 1
+        # The open script, then the look for a window it did not report;
+        # nothing pasted, nothing sent.
+        assert len(scripts) == 2
+        assert "set beforeIds to {}" in scripts[1]
 
     def test_plain_paste_probes_look_for_the_text_itself(self) -> None:
         """A plain note is read back as the text it is. Angle brackets in
@@ -7888,9 +7919,20 @@ def _compose_outcomes(
     return outcomes
 
 
+def _snapshot_before_compose(connector: AppleMailConnector) -> None:
+    """Answer the read of Mail's windows a composition takes before it
+    opens its own (``_mail_window_snapshot``) with no windows, so a test's
+    scripted outcomes start at the opening script."""
+    connector._mail_window_snapshot = lambda: _WindowSnapshot(  # type: ignore[method-assign]
+        mail_pid=77701, window_ids=frozenset()
+    )
+
+
 def _scripted(connector: AppleMailConnector, outcomes: list[str]) -> list[str]:
     """Answer the connector's osascript calls with ``outcomes`` in order
-    (the last repeats) and return the list each script is captured in."""
+    (the last repeats) and return the list each script is captured in.
+    The window snapshot a composition reads first is answered apart
+    (``_snapshot_before_compose``)."""
     captured: list[str] = []
 
     def fake_run(script: str) -> str:
@@ -7898,6 +7940,7 @@ def _scripted(connector: AppleMailConnector, outcomes: list[str]) -> list[str]:
         return outcomes[min(len(captured) - 1, len(outcomes) - 1)]
 
     connector._run_applescript = fake_run  # type: ignore[method-assign]
+    _snapshot_before_compose(connector)
     return captured
 
 
@@ -8683,7 +8726,7 @@ class TestVerifiedSendPrimitives:
             )
         assert "compose window: SALVAGED" in str(exc.value)
         assert len(captured) == self._SEND_AT + 2
-        assert 'click button "Save" of first sheet' in captured[-1]
+        assert 'click button "Save" of sheet 1 of window closeIdx' in captured[-1]
         assert all("sent mailbox whose subject" not in s for s in captured)
 
     def test_a_window_gone_goes_on_to_look_for_the_copy(
@@ -8814,17 +8857,102 @@ class TestVerifiedSendPrimitives:
             )
         assert sentinel.split(":")[0] in str(exc.value)
 
-    # -- discard primitive (used on gate-abort in later phases) ------------
+    # -- closing one compose window ----------------------------------------
+    #
+    # System Events turns `set w to window i` into a reference by name,
+    # which reads and clicks the first window of that name
+    # (docs/research/compose-window-tending.md, Observation 7). A close
+    # finds its window by Mail's id, ties it to System Events' list by
+    # name and position, and addresses it by index alone.
 
-    def test_discard_block_uses_curly_apostrophe_and_verifies(
+    def _close_script(
+        self, connector: AppleMailConnector, mode: str, window_id: int | None = 2781
+    ) -> str:
+        captured = _scripted(connector, ["X"])
+        if mode == "save":
+            connector._salvage_compose_to_draft('Probe "1"', window_id)
+        else:
+            connector._discard_compose_window('Probe "1"', window_id)
+        assert len(captured) == 1
+        return captured[0]
+
+    def test_discard_uses_the_curly_apostrophe_and_verifies(
         self, connector: AppleMailConnector
     ) -> None:
         """`Don’t Save` carries U+2019 (a straight quote never matches) and
         the block must verify the window actually closed — both Mail-
         dictionary discard routes fail silently (grounding report)."""
-        block = connector._as_discard_compose_block("targetName")
-        assert "Don’t Save" in block
-        assert "DISCARD_FAILED" in block
+        script = self._close_script(connector, "discard")
+        assert 'click button "Don’t Save" of sheet 1 of window closeIdx' in script
+        assert 'set closeOutcome to "DISCARDED" & sheetNote' in script
+        assert 'set closeOutcome to "DISCARD_FAILED:window still open"' in script
+
+    @pytest.mark.parametrize("mode", ["save", "discard"])
+    def test_a_close_addresses_mails_window_by_id(
+        self, connector: AppleMailConnector, mode: str
+    ) -> None:
+        script = self._close_script(connector, mode)
+        assert script.startswith('set closeId to 2781\nset closeName to "Probe \\"1\\""')
+        assert "set idBounds to bounds of window id closeId" in script
+        # Tied to System Events' list by name and position, before any click.
+        found_at = script.index("set closeIdx to my tendIndexOf(closeName, closePos)")
+        assert found_at < script.index("my tendClickClose(closeIdx)")
+        # Closed means Mail's window of that id is gone: not listed, or
+        # listed neither visible nor minimized and gone from System Events
+        # at its place (Mail keeps some closed windows listed).
+        assert "if not (exists window id wid) then return true" in script
+        assert "if (visible of window id wid) or (miniaturized of window id wid) then return false" in script
+        assert "return (my tendIndexOf(nm, pos)) is 0" in script
+        assert script.count("my tendGone(closeId, closeName, closePos)") == 2
+
+    @pytest.mark.parametrize("mode", ["save", "discard"])
+    def test_no_window_is_held_in_a_variable_or_clicked_by_name(
+        self, connector: AppleMailConnector, mode: str
+    ) -> None:
+        """Held in a variable, a System Events window is a by-name
+        reference; so is any element found in it."""
+        script = self._close_script(connector, mode)
+        assert "to window " not in script.replace("to window id", "")
+        assert "repeat with w in windows" not in script
+        assert "click button k of window i" in script
+        assert "of window closeName" not in script
+        assert "first button of window" not in script
+
+    def test_a_window_mail_cannot_tell_from_another_in_its_place_is_left(
+        self, connector: AppleMailConnector
+    ) -> None:
+        script = self._close_script(connector, "save")
+        twins_at = script.index("if twins is not 1 then")
+        assert twins_at < script.index("my tendClickClose(closeIdx)")
+        assert "so which to close cannot be told; none was closed" in script
+
+    def test_a_window_renamed_since_is_left(self, connector: AppleMailConnector) -> None:
+        script = self._close_script(connector, "save")
+        renamed_at = script.index("if closeOutcome is \"\" and idName is not closeName")
+        assert renamed_at < script.index("my tendClickClose(closeIdx)")
+
+    def test_without_an_id_only_the_one_window_of_its_name_is_closed(
+        self, connector: AppleMailConnector
+    ) -> None:
+        """A window the opening script got no id for is closed by name,
+        and only while its name is the only one: the first window of a
+        name could be someone else's."""
+        script = self._close_script(connector, "save", window_id=None)
+        assert script.startswith("set closeId to 0\n")
+        count_at = script.index("set nameCount to count of (windows whose name is closeName)")
+        assert count_at < script.index("my tendClickClose(closeIdx)")
+        assert "else if nameCount > 1 then" in script
+        assert "so which to close cannot be told by name; none was closed" in script
+
+    def test_a_close_that_cannot_run_is_a_failure_of_its_kind(
+        self, connector: AppleMailConnector
+    ) -> None:
+        def fail(script: str) -> str:
+            raise MailAppleScriptError("Mail got an error")
+
+        connector._run_applescript = fail  # type: ignore[method-assign]
+        assert connector._salvage_compose_to_draft("P", 1).startswith("SALVAGE_FAILED:")
+        assert connector._discard_compose_window("P", 1).startswith("DISCARD_FAILED:")
 
     # -- salvage, and Mail's send-error sheet --------------------------------
     #
@@ -8836,57 +8964,35 @@ class TestVerifiedSendPrimitives:
     # cannot be provoked on demand, so these read the script's text; no
     # live test covers it.
 
-    def _salvage_script(self, connector: AppleMailConnector) -> str:
-        captured = _scripted(connector, ["SALVAGED"])
-        assert connector._salvage_compose_to_draft('Probe "1"') == "SALVAGED"
-        assert len(captured) == 1
-        return captured[0]
-
     def test_salvage_dismisses_the_send_error_sheet_before_closing(
         self, connector: AppleMailConnector
     ) -> None:
-        script = self._salvage_script(connector)
-        edit_at = script.index(
-            'click button "Edit Message" of first sheet of window "Probe \\"1\\""'
-        )
-        close_at = script.index('whose subrole is "AXCloseButton"')
-        save_at = script.index('click button "Save" of first sheet')
+        script = self._close_script(connector, "save")
+        edit_at = script.index('click button "Edit Message" of sheet 1 of window closeIdx')
+        close_at = script.index("my tendClickClose(closeIdx)")
+        save_at = script.index('click button "Save" of sheet 1 of window closeIdx')
         assert edit_at < close_at < save_at
         # Only that sheet is dismissed that way: the button is looked for
         # before it is pressed.
-        assert 'exists button "Edit Message" of first sheet' in script
+        assert 'exists button "Edit Message" of sheet 1 of window closeIdx' in script
 
     def test_salvage_reports_the_send_error_sheet_text(
         self, connector: AppleMailConnector
     ) -> None:
-        script = self._salvage_script(connector)
-        assert "static texts of first sheet of window" in script
+        script = self._close_script(connector, "save")
+        assert "value of static texts of sheet 1 of window closeIdx" in script
         assert "Mail's send-error sheet: " in script
         # The text rides on every outcome after the sheet was read,
         # failures included.
-        assert 'set salvageOutcome to "SALVAGED" & sheetNote' in script
-        assert (
-            'set salvageOutcome to "SALVAGE_FAILED:window still open" & sheetNote'
-            in script
-        )
-        assert 'set salvageOutcome to "SALVAGE_FAILED:" & errMsg & sheetNote' in script
-        assert script.rstrip().endswith("return salvageOutcome")
+        assert 'set closeOutcome to "SALVAGED" & sheetNote' in script
+        assert 'set closeOutcome to "SALVAGE_FAILED:window still open" & sheetNote' in script
+        assert 'set closeOutcome to "SALVAGE_FAILED:" & errMsg & sheetNote' in script
+        assert "\nreturn closeOutcome\n" in script
 
-    def test_salvage_closes_a_window_only_when_its_name_is_the_only_one(
+    def test_a_discard_has_no_send_error_sheet_step(
         self, connector: AppleMailConnector
     ) -> None:
-        """A close addresses the window by name; with two of the name it
-        could close the other, a person's for all it can tell
-        (docs/research/compose-window-tending.md). The count comes before
-        any click."""
-        script = self._salvage_script(connector)
-        count_at = script.index(
-            'set sameNamed to count of (windows whose name is "Probe \\"1\\"")'
-        )
-        assert count_at < script.index('whose subrole is "AXCloseButton"')
-        assert 'if sameNamed is 0 then\n            set salvageOutcome to "NO_WINDOW"' in script
-        assert "else if sameNamed > 1 then" in script
-        assert "none was closed" in script
+        assert "Edit Message" not in self._close_script(connector, "discard")
 
     def test_the_sheet_text_reaches_the_raised_error(
         self, connector: AppleMailConnector

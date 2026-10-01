@@ -12,7 +12,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from apple_mail_mcp import server, tender
-from apple_mail_mcp.compose_tending import TendReport
+from apple_mail_mcp.compose_tending import LeftWindow, TendReport
 from apple_mail_mcp.exceptions import MailAppleScriptError, MailTimeoutError
 from apple_mail_mcp.security import TIER_LIMITS, operation_logger
 
@@ -263,14 +263,20 @@ class TestThePass:
     ) -> None:
         connector.tend_compose_windows.return_value = TendReport(
             dry_run=False, mail_running=True, compose_windows=26,
-            closed=(("Mine", "salvaged"),),
-            left=(("New Message", "unowned_empty"),) * 18 + (("Re: x", "unowned"),) * 7,
+            closed=(("Mine", "salvaged", "abandoned"), ("New Message", "discarded", "stale")),
+            left=(LeftWindow("New Message", "not_yet_stale", remaining_s=600.0),) * 17
+            + (LeftWindow("Re: x", "in_flight"),) * 7,
         )
         out = tender.run_tend_pass()
         connector.tend_compose_windows.assert_called_once_with(dry_run=False)
         assert logged == [("tend_compose_windows", out, "success")]
-        assert out["closed"] == [{"name": "Mine", "how": "salvaged"}]
-        assert out["left"] == {"unowned": 7, "unowned_empty": 18}
+        assert out["closed"] == [
+            {"name": "Mine", "how": "salvaged", "rule": "abandoned"},
+            {"name": "New Message", "how": "discarded", "rule": "stale"},
+        ]
+        assert out["closed_counts"] == {"abandoned_salvaged": 1, "stale_discarded": 1}
+        assert out["left"] == {"in_flight": 7, "not_yet_stale": 17}
+        assert out["not_yet_stale_minutes"] == [10] * 17
 
     def test_a_close_that_failed_is_logged_as_a_failure(
         self, connector: MagicMock, logged: list[tuple[Any, ...]]

@@ -20,6 +20,7 @@ from typing import IO, Any, Literal, cast
 from imapclient.exceptions import IMAPClientError, LoginError
 
 from . import mail_lock
+from .compose_clock import ComposeClock
 from .compose_ledger import (
     Closed,
     Closer,
@@ -30,9 +31,12 @@ from .compose_ledger import (
 )
 from .compose_tending import (
     RECORD_RETENTION_S,
+    STALE_S,
     TEND_GRACE_S,
     TendAction,
+    TendPlan,
     TendReport,
+    TendRule,
     inventory_from_report,
     plan_tending,
 )
@@ -139,6 +143,232 @@ _PASTE_CARET_KEYS: dict[_PastePlacement, str] = {
     ),
     "end": "key code 125 using command down\n            delay 0.2",
 }
+
+
+# -- addressing one compose window ------------------------------------------
+#
+# docs/research/compose-window-tending.md, Observation 7: System Events
+# turns ``set w to window i`` into a reference BY NAME, and every use of
+# ``w`` then reads, or clicks, the first window of that name, whichever
+# was meant; an element found inside it carries the same by-name window.
+# So every window here is addressed by its index alone, written out in
+# each specifier, and found again by its name and position after anything
+# that may reorder the windows. Mail's own ``id`` names one window within
+# one Mail process, and its ``bounds`` start where System Events'
+# ``position`` puts the window (Observation 3), which ties the two.
+
+_CloseMode = Literal["save", "discard"]
+_CLOSE_FAILED: dict[_CloseMode, str] = {
+    "save": "SALVAGE_FAILED:",
+    "discard": "DISCARD_FAILED:",
+}
+
+# How deep a compose body is read below its WebArea. A deeper element is
+# not read, and the body counts as content (not provably empty).
+_BODY_LEVELS = 8
+_BODY_PATH = "UI element k of scroll area 1 of group 1 of group 1 of window i"
+
+
+def _body_level_lines() -> str:
+    """One bulk read of roles and of values per level of the body, each
+    written out from ``window i``, stopping at the first level with no
+    element."""
+    lines = []
+    for level in range(1, _BODY_LEVELS + 1):
+        path = "UI elements of " * level + _BODY_PATH
+        lines.append(
+            f"                set r to role of {path}\n"
+            "                set end of levelRoles to r\n"
+            f"                set end of levelValues to (value of {path})\n"
+            "                if my tendLeafCount(r) is 0 then "
+            "return my tendBodyResult(levelRoles, levelValues, false)"
+        )
+    return "\n".join(lines)
+
+
+# Handlers the scripts that read or close compose windows share.
+# Top-level AppleScript, so each script carries them after its own code.
+_WINDOW_HANDLERS = (
+    """
+on tendIsBlank(t)
+    repeat with ch in (characters of t)
+        if (id of ch) is not in {32, 9, 10, 13, 160} then return false
+    end repeat
+    return true
+end tendIsBlank
+
+-- Whether System Events' window i of Mail is a compose window: its
+-- toolbar has a Send button.
+on tendIsCompose(i)
+    tell application "System Events"
+        tell application process "Mail"
+            try
+                return exists (first button of (first toolbar of window i) whose description is "Send")
+            end try
+        end tell
+    end tell
+    return false
+end tendIsCompose
+
+-- The text-field values (To, Cc, any other header shown, Subject) of
+-- window i, each read as text.
+on tendFieldValues(i)
+    tell application "System Events"
+        tell application process "Mail"
+            set roles to role of UI elements of window i
+            set vals to value of UI elements of window i
+        end tell
+    end tell
+    set fieldValues to {}
+    repeat with j from 1 to (count of roles)
+        if item j of roles is "AXTextField" then
+            set v to item j of vals
+            if v is missing value then set v to ""
+            set end of fieldValues to (v as text)
+        end if
+    end repeat
+    return fieldValues
+end tendFieldValues
+
+-- How many elements a nested read holds.
+on tendLeafCount(x)
+    if class of x is not list then return 1
+    set n to 0
+    repeat with y in x
+        set n to n + (my tendLeafCount(contents of y))
+    end repeat
+    return n
+end tendLeafCount
+
+-- Whether one level of a body read holds anything but blank text and
+-- groups: text, an attachment's button or image, or any other element.
+on tendHasContent(rs, vs)
+    if class of rs is list then
+        repeat with j from 1 to (count of rs)
+            set v to missing value
+            if class of vs is list then
+                if j is less than or equal to (count of vs) then set v to item j of vs
+            end if
+            if my tendHasContent(item j of rs, v) then return true
+        end repeat
+        return false
+    end if
+    if rs is "AXGroup" then return false
+    if rs is "AXStaticText" then
+        if vs is missing value then return false
+        return not my tendIsBlank(vs as text)
+    end if
+    return true
+end tendHasContent
+
+-- "empty" when the levels read hold nothing but blank text and groups,
+-- and the last held no element; otherwise "content". With the roles and
+-- values read, level by level, for the caller's fingerprint.
+on tendBodyResult(levelRoles, levelValues, truncated)
+    set verdict to "empty"
+    if truncated then set verdict to "content"
+    repeat with L from 1 to (count of levelRoles)
+        if my tendHasContent(item L of levelRoles, item L of levelValues) then set verdict to "content"
+    end repeat
+    return {bodyState:verdict, bodyRoles:levelRoles, bodyValues:levelValues}
+end tendBodyResult
+
+-- Window i's body, read below its WebArea; "unreadable" when the
+-- WebArea cannot be found.
+on tendBodyRead(i)
+    set levelRoles to {}
+    set levelValues to {}
+    try
+        tell application "System Events"
+            tell application process "Mail"
+                set saRoles to role of UI elements of scroll area 1 of group 1 of group 1 of window i
+                set k to 0
+                repeat with j from 1 to (count of saRoles)
+                    if item j of saRoles is "AXWebArea" then
+                        set k to j
+                        exit repeat
+                    end if
+                end repeat
+                if k is 0 then return {bodyState:"unreadable", bodyRoles:{}, bodyValues:{}}
+"""
+    + _body_level_lines()
+    + """
+            end tell
+        end tell
+    on error
+        return {bodyState:"unreadable", bodyRoles:{}, bodyValues:{}}
+    end try
+    return my tendBodyResult(levelRoles, levelValues, true)
+end tendBodyRead
+
+-- The index of the one window System Events lists with this name at
+-- this position; 0 when none is, -1 when more than one is.
+on tendIndexOf(nm, pos)
+    tell application "System Events"
+        tell application process "Mail"
+            set allNames to name of windows
+            set allPos to position of windows
+        end tell
+    end tell
+    set found to 0
+    repeat with j from 1 to (count of allNames)
+        if (item j of allNames) is nm and (item j of allPos) is pos then
+            if found is not 0 then return -1
+            set found to j
+        end if
+    end repeat
+    return found
+end tendIndexOf
+
+-- Click window i's close button, found by its subrole (`button 1` is
+-- "add contacts" on a compose window). False when it has none.
+on tendClickClose(i)
+    tell application "System Events"
+        tell application process "Mail"
+            set subroles to subrole of buttons of window i
+            repeat with k from 1 to (count of subroles)
+                if item k of subroles is "AXCloseButton" then
+                    click button k of window i
+                    return true
+                end if
+            end repeat
+        end tell
+    end tell
+    return false
+end tendClickClose
+
+-- Whether the window is gone: Mail's window wid, or, with no id, the
+-- one window named nm.
+on tendGone(wid, nm, pos)
+    -- Mail can keep a window it closed in its list, neither visible nor
+    -- miniaturized (a minimized one is miniaturized), long after System
+    -- Events stops listing it (Observation 10). Closed: not listed, or
+    -- listed so and no longer in System Events at its place.
+    if wid is not 0 then
+        tell application "Mail"
+            if not (exists window id wid) then return true
+            if (visible of window id wid) or (miniaturized of window id wid) then return false
+        end tell
+        return (my tendIndexOf(nm, pos)) is 0
+    end if
+    tell application "System Events"
+        tell application process "Mail"
+            return not (exists window nm)
+        end tell
+    end tell
+end tendGone
+"""
+)
+
+
+@dataclass(frozen=True)
+class _WindowSnapshot:
+    """Mail's process and the ids of its windows, read before a compose
+    window is opened, so a window that opens without its opening script
+    reporting it can still be told apart (``_adopt_unreported_windows``)."""
+
+    mail_pid: int
+    window_ids: frozenset[int]
 
 
 def _refuse_overlong_body(body: str) -> None:
@@ -1459,6 +1689,7 @@ class AppleMailConnector:
         imap_pool: ImapConnectionPool | None = None,
         lock_timeout: float = 30.0,
         compose_ledger: ComposeLedger | None = None,
+        compose_clock: ComposeClock | None = None,
     ) -> None:
         """
         Initialize the Mail connector.
@@ -1481,10 +1712,15 @@ class AppleMailConnector:
             compose_ledger: Where every compose window the connector
                 opens is recorded, and how it ended. Default: the store
                 under the data home, its root resolved on each use.
+            compose_clock: Where tending keeps, between passes, when it
+                first saw each compose window with its present content.
+                Default: the file beside the compose ledger, resolved on
+                each use.
         """
         self.timeout = timeout
         self.lock_timeout = lock_timeout
         self.compose_ledger = compose_ledger if compose_ledger is not None else ComposeLedger()
+        self.compose_clock = compose_clock if compose_clock is not None else ComposeClock()
         # Called when a composition ends with its window still open, so
         # whoever tends Mail's windows can do so now rather than at its
         # next turn. The daemon's tender sets it (tender.py); unset, the
@@ -5134,41 +5370,6 @@ if sameNamed > 1 then error "COMPOSE_WINDOW_NOT_UNIQUE: Mail opened a compose wi
 """
 
     @staticmethod
-    def _as_discard_compose_block(win_name_var: str) -> str:
-        """AppleScript fragment: discard a compose window with read-back.
-
-        ``win_name_var`` is the AppleScript variable holding the window
-        name. Both Mail-dictionary discards (``close … saving no``,
-        ``delete outgoing message``) fail silently (observed live) — the
-        only working route is the close button + the "Save this message as
-        a draft?" sheet. The Don't Save button's real name carries a curly
-        apostrophe (U+2019); a straight quote never matches. Sets
-        ``discardOutcome`` to "DISCARDED" or "DISCARD_FAILED:<name>".
-        """
-        return f"""
-        set discardOutcome to "DISCARDED"
-        tell application "System Events"
-            tell application process "Mail"
-                if exists window {win_name_var} then
-                    -- Close button by subrole — `button 1` is "add contacts"
-                    -- on compose windows (observed live 2026-07-20).
-                    click (first button of window {win_name_var} whose subrole is "AXCloseButton")
-                    delay 0.8
-                    if exists window {win_name_var} then
-                        if exists (first sheet of window {win_name_var}) then
-                            click button "Don’t Save" of first sheet of window {win_name_var}
-                            delay 0.8
-                        end if
-                    end if
-                    if exists window {win_name_var} then
-                        set discardOutcome to "DISCARD_FAILED:" & {win_name_var}
-                    end if
-                end if
-            end tell
-        end tell
-        """
-
-    @staticmethod
     def _paste_probe_strings(body: str, plain: bool = False) -> tuple[str, str]:
         """Compute the paste read-back probes for a body.
 
@@ -5354,84 +5555,232 @@ return "PASTED_UNVERIFIED"
 """
 
     @staticmethod
-    def _as_salvage_compose_block(name_expr: str) -> str:
-        """AppleScript fragment: close the compose window named
-        ``name_expr`` (an AppleScript string literal or variable) SAVING
-        it as a draft, and read back that it closed. Sets
-        ``salvageOutcome`` to "SALVAGED" (with a note on Mail's send-error
-        sheet when there was one), "NO_WINDOW", or "SALVAGE_FAILED:…".
+    def _as_close_compose_block(mode: _CloseMode, *, require_empty: bool = False) -> str:
+        """AppleScript fragment: close one compose window, saving it as a
+        draft (``mode`` "save") or not ("discard"), and read back that it
+        closed. Needs ``closeId`` (Mail's id for the window, 0 when there
+        is none) and ``closeName`` (its name) set before. Sets
+        ``closeOutcome`` to "SALVAGED" (with a note on Mail's send-error
+        sheet when there was one) or "DISCARDED"; "NO_WINDOW" when it was
+        gone already; or "SALVAGE_FAILED:…" / "DISCARD_FAILED:…", with
+        nothing closed unless it says so.
 
-        Only when that name is the only window of it: a close addresses
-        the window by name, and with two of the name it may close the
-        other, which could be a person's (the rule
-        ``_as_new_compose_window_block`` holds when a window opens).
-        With more than one, none is closed.
+        By id, the window is exactly Mail's window ``closeId``, still
+        named ``closeName``, found in System Events' list by its name and
+        position (``tendIndexOf``) however many windows share its name,
+        and closed only when no other visible window of its name stands
+        in the same place; it is verified closed by that id being gone.
+        With no id, only when ``closeName`` is the only window of its
+        name: a window addressed by name is the first of the name, which
+        could be someone else's.
+
+        Every window reference is an index written out from ``window i``
+        (Observation 7). The close button and the sheet go through Mail's
+        UI: both dictionary discards (``close … saving no``, ``delete
+        outgoing message``) fail silently (observed live 2026-07-20). The
+        "Don’t Save" button's name carries a curly apostrophe (U+2019).
+
+        ``require_empty`` (a discard by tending): the window must still
+        read provably empty, every header field blank, the body empty and
+        no sheet, in this script, right before the click, so nothing typed
+        into it since it was read is thrown away.
 
         A send Mail could not make through the account's server leaves a
         sheet on the window, "Cannot send message using the server …",
         whose buttons are Try Later, Try With Selected Server, Connection
         Doctor, Edit SMTP Server List and Edit Message (seen 2026-09-27),
-        and no Save. Found (by its Edit Message button), its text is
-        read, Edit Message pressed, and the window then closed with Save
-        as any other; the outcome carries the text, as "(Mail's
-        send-error sheet: …)", so the caller's error says why Mail did
-        not send. It cannot be provoked on demand, and no live test has
-        met it.
+        and no Save. On a save, found (by its Edit Message button), its
+        text is read, Edit Message pressed, and the window then closed
+        with Save as any other; the outcome carries the text, as
+        "(Mail's send-error sheet: …)", so the caller's error says why
+        Mail did not send. It cannot be provoked on demand, and no live
+        test has met it.
         """
-        win = f"window {name_expr}"
-        return f"""
-set salvageOutcome to ""
-tell application "System Events"
-    tell application process "Mail"
-        set sameNamed to count of (windows whose name is {name_expr})
-        if sameNamed is 0 then
-            set salvageOutcome to "NO_WINDOW"
-        else if sameNamed > 1 then
-            set salvageOutcome to "SALVAGE_FAILED:" & sameNamed & " windows are named " & {name_expr} & ", so which to close cannot be told by name; none was closed"
-        else
-            set sheetNote to ""
-            try
-                if exists (first sheet of {win}) then
-                    if exists button "Edit Message" of first sheet of {win} then
-                        set sheetText to ""
-                        try
-                            -- NB: "st" is a reserved AppleScript token; do not shorten this name.
-                            repeat with sheetTextEl in static texts of first sheet of {win}
-                                set sheetText to sheetText & (value of sheetTextEl) & " | "
-                            end repeat
-                        end try
-                        set sheetNote to " (Mail's send-error sheet: " & sheetText & ")"
-                        click button "Edit Message" of first sheet of {win}
-                        repeat 10 times
-                            if not (exists (first sheet of {win})) then exit repeat
-                            delay 0.3
-                        end repeat
-                    end if
-                end if
-                click (first button of {win} whose subrole is "AXCloseButton")
-                delay 0.8
-                if exists {win} then
-                    if exists (first sheet of {win}) then
-                        click button "Save" of first sheet of {win}
-                        delay 0.8
-                    end if
-                end if
-                if exists {win} then
-                    set salvageOutcome to "SALVAGE_FAILED:window still open" & sheetNote
-                else
-                    set salvageOutcome to "SALVAGED" & sheetNote
-                end if
-            on error errMsg
-                set salvageOutcome to "SALVAGE_FAILED:" & errMsg & sheetNote
-            end try
-        end if
+        failed = _CLOSE_FAILED[mode]
+        done = "SALVAGED" if mode == "save" else "DISCARDED"
+        sheet_button = "Save" if mode == "save" else "Don’t Save"
+        empty_check = (
+            f"""
+if closeOutcome is "" then
+    set fieldValues to my tendFieldValues(closeIdx)
+    set stillEmpty to ((count of fieldValues) > 0)
+    repeat with v in fieldValues
+        if not my tendIsBlank(contents of v) then set stillEmpty to false
+    end repeat
+    tell application "System Events"
+        tell application process "Mail"
+            if exists sheet 1 of window closeIdx then set stillEmpty to false
+        end tell
     end tell
-end tell
+    if stillEmpty then set stillEmpty to ((bodyState of (my tendBodyRead(closeIdx))) is "empty")
+    if not stillEmpty then set closeOutcome to "{failed}no longer empty; left open"
+end if
+"""
+            if require_empty
+            else ""
+        )
+        send_error_sheet = (
+            f"""
+if closeOutcome is "" then
+    tell application "System Events"
+        tell application process "Mail"
+            if exists sheet 1 of window closeIdx then
+                if exists button "Edit Message" of sheet 1 of window closeIdx then
+                    set sheetText to ""
+                    try
+                        repeat with sheetVal in (value of static texts of sheet 1 of window closeIdx)
+                            set sheetText to sheetText & ((contents of sheetVal) as text) & " | "
+                        end repeat
+                    end try
+                    set sheetNote to " (Mail's send-error sheet: " & sheetText & ")"
+                    click button "Edit Message" of sheet 1 of window closeIdx
+                end if
+            end if
+        end tell
+    end tell
+    if sheetNote is not "" then
+        repeat 10 times
+            delay 0.3
+            set closeIdx to my tendIndexOf(closeName, closePos)
+            if closeIdx is less than or equal to 0 then exit repeat
+            tell application "System Events"
+                tell application process "Mail"
+                    set sheetUp to exists sheet 1 of window closeIdx
+                end tell
+            end tell
+            if not sheetUp then exit repeat
+        end repeat
+        if closeIdx is less than or equal to 0 then set closeOutcome to "{failed}the window was lost after its send-error sheet" & sheetNote
+    end if
+end if
+"""
+            if mode == "save"
+            else ""
+        )
+        return f"""
+set closeOutcome to ""
+set closePos to {{}}
+set closeIdx to 0
+set sheetNote to ""
+if closeId is not 0 then
+    set idName to ""
+    tell application "Mail"
+        try
+            set idName to name of window id closeId
+            set idBounds to bounds of window id closeId
+        on error
+            set closeOutcome to "NO_WINDOW"
+        end try
+    end tell
+    if closeOutcome is "" and idName is not closeName then set closeOutcome to "{failed}Mail's window " & closeId & " is now named " & idName & "; left open"
+    if closeOutcome is "" then
+        set closePos to {{item 1 of idBounds, item 2 of idBounds}}
+        tell application "Mail"
+            set allNames to name of every window
+            set allBounds to bounds of every window
+            set allVisible to visible of every window
+        end tell
+        set twins to 0
+        repeat with j from 1 to (count of allNames)
+            if (item j of allVisible) and (item j of allNames) is closeName then
+                set b to item j of allBounds
+                -- Assigned before it is compared: a list literal of
+                -- `item n of b` compared with `is` is false (Observation 9).
+                set bPos to {{item 1 of b, item 2 of b}}
+                if bPos is closePos then set twins to twins + 1
+            end if
+        end repeat
+        if twins is not 1 then set closeOutcome to "{failed}" & twins & " visible windows named " & closeName & " stand where Mail's window " & closeId & " does, so which to close cannot be told; none was closed"
+    end if
+else
+    tell application "System Events"
+        tell application process "Mail"
+            set nameCount to count of (windows whose name is closeName)
+            set allNames to name of windows
+            set allPos to position of windows
+        end tell
+    end tell
+    if nameCount is 0 then
+        set closeOutcome to "NO_WINDOW"
+    else if nameCount > 1 then
+        set closeOutcome to "{failed}" & nameCount & " windows are named " & closeName & ", so which to close cannot be told by name; none was closed"
+    else
+        repeat with j from 1 to (count of allNames)
+            if (item j of allNames) is closeName then set closePos to item j of allPos
+        end repeat
+    end if
+end if
+if closeOutcome is "" then
+    set closeIdx to my tendIndexOf(closeName, closePos)
+    if closeIdx is 0 then set closeOutcome to "{failed}System Events lists no window named " & closeName & " in its place; none was closed"
+    if closeIdx < 0 then set closeOutcome to "{failed}System Events lists more than one window named " & closeName & " in its place; none was closed"
+end if
+{empty_check}{send_error_sheet}
+if closeOutcome is "" then
+    try
+        if not my tendClickClose(closeIdx) then error "the window has no close button"
+        delay 0.8
+        if not my tendGone(closeId, closeName, closePos) then
+            set closeIdx to my tendIndexOf(closeName, closePos)
+            if closeIdx > 0 then
+                tell application "System Events"
+                    tell application process "Mail"
+                        if exists sheet 1 of window closeIdx then
+                            click button "{sheet_button}" of sheet 1 of window closeIdx
+                            delay 0.8
+                        end if
+                    end tell
+                end tell
+            end if
+        end if
+        if my tendGone(closeId, closeName, closePos) then
+            set closeOutcome to "{done}" & sheetNote
+        else
+            set closeOutcome to "{failed}window still open" & sheetNote
+        end if
+    on error errMsg
+        set closeOutcome to "{failed}" & errMsg & sheetNote
+    end try
+end if
 """
 
-    def _salvage_compose_to_draft(self, window_name: str) -> str:
-        """Close a compose window SAVING it as a draft (best effort),
-        through ``_as_salvage_compose_block``.
+    def _build_close_script(
+        self,
+        window_name: str,
+        window_id: int | None,
+        mode: _CloseMode,
+        *,
+        require_empty: bool = False,
+    ) -> str:
+        """Full osascript source: ``_as_close_compose_block`` on one window,
+        returning its outcome."""
+        return (
+            f"set closeId to {int(window_id or 0)}\n"
+            f'set closeName to "{escape_applescript_string(window_name)}"\n'
+            + self._as_close_compose_block(mode, require_empty=require_empty)
+            + "\nreturn closeOutcome\n"
+            + _WINDOW_HANDLERS
+        )
+
+    def _close_compose_window(
+        self, window_name: str, window_id: int | None, mode: _CloseMode
+    ) -> str:
+        """Close one compose window (``_as_close_compose_block``); what the
+        block read back, or "SALVAGE_FAILED:" / "DISCARD_FAILED:" with the
+        error when the script itself failed."""
+        try:
+            return self._run_applescript(
+                self._build_close_script(window_name, window_id, mode)
+            ).strip()
+        except MailAppleScriptError as exc:
+            return f"{_CLOSE_FAILED[mode]}{exc}"
+
+    def _salvage_compose_to_draft(
+        self, window_name: str, window_id: int | None = None
+    ) -> str:
+        """Close a compose window SAVING it as a draft (best effort): Mail's
+        window ``window_id`` when given, else the one window named
+        ``window_name``.
 
         Failure policy on a headless machine (Jonah, 2026-07-23): a
         failed send attempt must never park an open compose window —
@@ -5441,29 +5790,21 @@ end tell
         state on failure — callers append this to their error, never
         mask the original failure with it.
         """
-        win_safe = escape_applescript_string(window_name)
-        try:
-            return self._run_applescript(
-                self._as_salvage_compose_block(f'"{win_safe}"')
-                + "\nreturn salvageOutcome"
-            ).strip()
-        except MailAppleScriptError as exc:
-            return f"SALVAGE_FAILED:{exc}"
+        return self._close_compose_window(window_name, window_id, "save")
 
-    def _discard_compose_window(self, window_name: str) -> str:
-        """Close a compose window without saving it
-        (``_as_discard_compose_block``); returns what the block read back,
-        "DISCARDED" or "DISCARD_FAILED:…", or "DISCARD_FAILED:<error>"
-        when the script itself failed."""
-        win_safe = escape_applescript_string(window_name)
-        try:
-            return self._run_applescript(
-                f'set discardName to "{win_safe}"\n'
-                + self._as_discard_compose_block("discardName")
-                + "\nreturn discardOutcome"
-            ).strip()
-        except MailAppleScriptError as exc:
-            return f"DISCARD_FAILED:{exc}"
+    def _salvage(self, window: _ComposeWindow) -> str:
+        """Salvage a composition's own window, by Mail's id for it when
+        the opening script found one."""
+        return self._salvage_compose_to_draft(window.name, window.window_id)
+
+    def _discard_compose_window(
+        self, window_name: str, window_id: int | None = None
+    ) -> str:
+        """Close a compose window without saving it: Mail's window
+        ``window_id`` when given, else the one window named
+        ``window_name``. Returns "DISCARDED", "NO_WINDOW", or
+        "DISCARD_FAILED:…"."""
+        return self._close_compose_window(window_name, window_id, "discard")
 
     # -- tending Mail's compose windows ------------------------------------
     #
@@ -5471,84 +5812,15 @@ end tell
     # rule. The decision is compose_tending.plan_tending; the AppleScript
     # that reads the windows and closes the ones decided on is here.
 
-    # Handlers the tending scripts share. Top-level AppleScript, so each
-    # script carries them after its own code.
-    _TEND_HANDLERS = """
-on tendIsBlank(t)
-    repeat with ch in (characters of t)
-        if (id of ch) is not in {32, 9, 10, 13, 160} then return false
-    end repeat
-    return true
-end tendIsBlank
-
--- "empty" when the body holds nothing but whitespace text; "content" at
--- the first anything else: text, an attachment's button or image, or a
--- group too deep to look into.
-on tendBodyState(el, depthLeft)
-    tell application "System Events"
-        set kids to UI elements of el
-        if (count of kids) is 0 then return "empty"
-        repeat with k in kids
-            set r to role of k
-            if r is "AXStaticText" then
-                set v to value of k
-                if v is missing value then set v to ""
-                if not my tendIsBlank(v as text) then return "content"
-            else if r is "AXGroup" and depthLeft > 0 then
-                if my tendBodyState(k, depthLeft - 1) is "content" then return "content"
-            else
-                return "content"
-            end if
-        end repeat
-    end tell
-    return "empty"
-end tendBodyState
-
--- A compose window's text-field values (To, Cc, any other header shown,
--- Subject), each read as text.
-on tendFieldValues(w)
-    tell application "System Events"
-        set roles to role of UI elements of w
-        set vals to value of UI elements of w
-    end tell
-    set fieldValues to {}
-    repeat with j from 1 to (count of roles)
-        if item j of roles is "AXTextField" then
-            set v to item j of vals
-            if v is missing value then set v to ""
-            set end of fieldValues to (v as text)
-        end if
-    end repeat
-    return fieldValues
-end tendFieldValues
-
--- The body's state when every header field is blank; "unread" when one
--- is not (the window is not empty whatever the body holds), and
--- "unreadable" when the body cannot be found.
-on tendBodyOf(w, fieldValues)
-    repeat with v in fieldValues
-        if not my tendIsBlank(contents of v) then return "unread"
-    end repeat
-    try
-        tell application "System Events"
-            set wa to first UI element of scroll area 1 of group 1 of group 1 of w whose role is "AXWebArea"
-        end tell
-        return my tendBodyState(wa, 6)
-    on error
-        return "unreadable"
-    end try
-end tendBodyOf
-"""
-
     def _build_compose_inventory_script(self) -> str:
         """Full osascript source: every compose window System Events lists
-        (a window whose toolbar has a Send button), each addressed as
-        ``window i`` — through a nested ``every`` reference the body
-        lookup failed on 7 windows of 25 (Observation 5) — with its
-        header fields, its body's state, whether a sheet is on it and
-        whether it is minimised; and Mail's own id and name for every
-        window, in one event. Read-only. When Mail is not running it says
-        so and starts nothing."""
+        (a window whose toolbar has a Send button), each read by its
+        index alone (Observation 7): its name and position, its header
+        fields, its body read level by level (``tendBodyRead``), whether
+        a sheet is on it and whether it is minimised; and Mail's own id,
+        name, bounds and visibility for every window, in one event.
+        Read-only. When Mail is not running it says so and starts
+        nothing."""
         body = """
 if not (application "Mail" is running) then
     set resultData to {|running|:false}
@@ -5557,111 +5829,73 @@ else
     tell application "System Events"
         tell application process "Mail"
             set mailPid to unix id
-            repeat with i from 1 to (count of windows)
-                set w to window i
-                set isCompose to false
-                try
-                    set isCompose to exists (first button of (first toolbar of w) whose description is "Send")
-                end try
-                if isCompose then
-                    set fieldValues to my tendFieldValues(w)
-                    set bodyState to my tendBodyOf(w, fieldValues)
-                    set end of composeWindows to {|name|:(name of w), |fields|:fieldValues, |body|:bodyState, |sheet|:((count of sheets of w) > 0), |minimized|:(value of attribute "AXMinimized" of w)}
-                end if
-            end repeat
+            set winCount to count of windows
         end tell
     end tell
+    repeat with i from 1 to winCount
+        if my tendIsCompose(i) then
+            tell application "System Events"
+                tell application process "Mail"
+                    set winName to name of window i
+                    set winPos to position of window i
+                    set hasSheet to ((count of sheets of window i) > 0)
+                    set isMin to value of attribute "AXMinimized" of window i
+                end tell
+            end tell
+            set fieldValues to my tendFieldValues(i)
+            set bodyRead to my tendBodyRead(i)
+            set end of composeWindows to {|name|:winName, |position|:winPos, |fields|:fieldValues, |body|:(bodyState of bodyRead), |body_roles|:(bodyRoles of bodyRead), |body_values|:(bodyValues of bodyRead), |sheet|:hasSheet, |minimized|:isMin}
+        end if
+    end repeat
     tell application "Mail"
         set mailWindows to {}
         set windowProps to properties of every window
         repeat with p in windowProps
             set props to contents of p
-            set end of mailWindows to {|id|:(id of props), |name|:(name of props)}
+            set end of mailWindows to {|id|:(id of props), |name|:(name of props), |bounds|:(bounds of props), |visible|:(visible of props)}
         end repeat
         set resultData to {|running|:true, |pid|:mailPid, |compose|:composeWindows, |mail_windows|:mailWindows}
     end tell
 end if
 """
-        return _wrap_as_json_script(body, timeout=self.timeout) + self._TEND_HANDLERS
+        return _wrap_as_json_script(body, timeout=self.timeout) + _WINDOW_HANDLERS
 
     def _build_tend_close_script(self, action: TendAction) -> str:
         """Full osascript source: close the window a tending pass decided
-        on, checking first, in the same script, that it is still that
-        window — Mail's id for it still names it, and no other window
-        has its name. Salvaged to Drafts through
-        ``_as_salvage_compose_block``; discarded through
-        ``_as_discard_compose_block`` only when it still reads empty, so
-        nothing typed into it since the inventory is thrown away.
-        Returns the block's outcome, or "NO_WINDOW", or "RENAMED:<name>"
-        when the window now carries another name (someone edited its
-        subject; it is left)."""
-        record = action.record
-        if record.window_id is None:
-            raise ValueError("tending acts only on a window Mail gave an id")
-        name_safe = escape_applescript_string(record.window_name)
+        on, by Mail's id for it: salvaged to Drafts, or discarded only
+        while it still reads empty (``_as_close_compose_block``)."""
         if action.action == "salvage":
-            close = (
-                self._as_salvage_compose_block("tendName")
-                + "\nset tendOutcome to salvageOutcome"
-            )
-        else:
-            close = f"""
-tell application "System Events"
-    tell application process "Mail"
-        set sameNamed to count of (windows whose name is tendName)
-        set stillEmpty to false
-        if sameNamed is 1 then
-            set fieldValues to my tendFieldValues(window tendName)
-            set stillEmpty to (my tendBodyOf(window tendName, fieldValues) is "empty")
-        end if
-    end tell
-end tell
-if sameNamed is 0 then
-    set tendOutcome to "NO_WINDOW"
-else if sameNamed > 1 then
-    set tendOutcome to "DISCARD_FAILED:" & sameNamed & " windows are named " & tendName & "; none was closed"
-else if not stillEmpty then
-    set tendOutcome to "DISCARD_FAILED:no longer empty; left open"
-else
-{self._as_discard_compose_block("tendName")}
-    set tendOutcome to discardOutcome
-end if
-"""
-        return f"""
-set tendName to "{name_safe}"
-set tendOutcome to ""
-set idName to ""
-tell application "Mail"
-    try
-        set idName to name of window id {int(record.window_id)}
-    on error
-        set tendOutcome to "NO_WINDOW"
-    end try
-end tell
-if tendOutcome is "" and idName is not tendName then set tendOutcome to "RENAMED:" & idName
-if tendOutcome is "" then
-{close}
-end if
-return tendOutcome
-""" + self._TEND_HANDLERS
+            return self._build_close_script(action.window_name, action.window_id, "save")
+        return self._build_close_script(
+            action.window_name, action.window_id, "discard", require_empty=True
+        )
 
     def tend_compose_windows(
-        self, *, dry_run: bool = False, grace_s: float = TEND_GRACE_S
+        self,
+        *,
+        dry_run: bool = False,
+        grace_s: float = TEND_GRACE_S,
+        stale_s: float = STALE_S,
     ) -> TendReport:
         """One tending pass over Mail's compose windows.
 
-        Reads every compose window (``_build_compose_inventory_script``)
-        and the compose ledger, decides (``compose_tending.plan_tending``),
-        and closes the windows decided on, one osascript each, recording
-        each in the ledger as closed by tending: those the ledger says
-        this connector opened and nothing closed, whose composition
-        cannot still be running (``grace_s``), each the only window of
-        its name. Every other window is left and counted. Records whose
+        Reads every compose window (``_build_compose_inventory_script``),
+        the compose ledger and the clock of when each window was first
+        seen with its present content (``compose_clock``), decides
+        (``compose_tending.plan_tending``), saves the clock, and closes
+        the windows decided on, one osascript each, by Mail's id for
+        each: the connector's own abandoned windows (the ledger names
+        them, and their composition cannot still be running,
+        ``grace_s``), and any other window whose content has not changed
+        for ``stale_s``. Each closed window is discarded if empty and
+        salvaged to Drafts otherwise; a ledger record is ended as closed
+        by tending. Every other window is left and counted. Records whose
         window is gone are ended as such, and records of windows closed
         more than ``RECORD_RETENTION_S`` ago are pruned.
 
-        ``dry_run`` reads and decides, and closes and records nothing: its
-        report's ``to_close`` is what a real pass would close.
+        ``dry_run`` reads and decides, and closes, records and saves
+        nothing: its report's ``to_close`` is what a real pass would
+        close, and the clock it reads is left as it was.
 
         A close Mail does not answer stops the pass: the windows after it
         are reported as not attempted rather than each waiting out the
@@ -5672,14 +5906,22 @@ return tendOutcome
             cast(dict[str, Any], parse_applescript_json(raw))
         )
         if inventory is None:
-            return TendReport(dry_run=dry_run, mail_running=False)
+            return TendReport(dry_run=dry_run, mail_running=False, stale_s=stale_s)
         contents = self.compose_ledger.read_all()
         now = time.time()
-        plan = plan_tending(inventory, contents.records, now=now, grace_s=grace_s)
+        plan = plan_tending(
+            inventory,
+            contents.records,
+            self.compose_clock.load(),
+            now=now,
+            grace_s=grace_s,
+            stale_s=stale_s,
+        )
         found = TendReport(
             dry_run=dry_run,
             mail_running=True,
             compose_windows=len(inventory.windows),
+            stale_s=stale_s,
             left=plan.left,
             records_unidentified=plan.unidentified,
             records_unreadable=contents.unreadable,
@@ -5687,30 +5929,11 @@ return tendOutcome
         if dry_run:
             return replace(
                 found,
-                to_close=tuple((a.record.window_name, a.action) for a in plan.actions),
+                to_close=tuple((a.window_name, a.action, a.rule) for a in plan.actions),
                 records_gone=len(plan.gone),
             )
-        closed: list[tuple[str, str]] = []
-        failed: list[tuple[str, str]] = []
-        not_attempted: list[str] = []
-        for index, action in enumerate(plan.actions):
-            name = action.record.window_name
-            try:
-                outcome = self._run_applescript(
-                    self._build_tend_close_script(action)
-                ).strip()
-            except MailAppleScriptError as exc:
-                failed.append((name, str(exc)))
-                not_attempted.extend(
-                    a.record.window_name for a in plan.actions[index + 1:]
-                )
-                break
-            closing = _closing_of(outcome, by="tending", at=time.time())
-            if closing is None:
-                failed.append((name, outcome))
-                continue
-            self._end_tended_record(action.record.record_id, closing)
-            closed.append((name, closing.how))
+        self._save_clock(plan)
+        closed, failed, not_attempted = self._carry_out(plan.actions)
         gone = sum(
             self._end_tended_record(
                 record.record_id, Closed(how="gone", by="tending", at=now)
@@ -5720,12 +5943,52 @@ return tendOutcome
         pruned = self.compose_ledger.prune(before=now - RECORD_RETENTION_S)
         return replace(
             found,
-            closed=tuple(closed),
-            failed=tuple(failed),
-            not_attempted=tuple(not_attempted),
+            closed=closed,
+            failed=failed,
+            not_attempted=not_attempted,
             records_gone=gone,
             records_pruned=pruned,
         )
+
+    def _save_clock(self, plan: TendPlan) -> None:
+        """Keep the pass's clock for the next. One that cannot be written
+        is logged: the next pass then starts its windows' clocks again,
+        which delays a close and never hastens one."""
+        try:
+            self.compose_clock.save(plan.clock)
+        except OSError as exc:
+            logger.error("compose clock: could not save: %s", exc)
+
+    def _carry_out(
+        self, actions: tuple[TendAction, ...]
+    ) -> tuple[
+        tuple[tuple[str, str, TendRule], ...],
+        tuple[tuple[str, str], ...],
+        tuple[str, ...],
+    ]:
+        """Close each window a pass decided on, ending its ledger record
+        when it has one; what closed, what failed, and what was not
+        attempted after a close Mail did not answer."""
+        closed: list[tuple[str, str, TendRule]] = []
+        failed: list[tuple[str, str]] = []
+        for index, action in enumerate(actions):
+            name = action.window_name
+            try:
+                outcome = self._run_applescript(
+                    self._build_tend_close_script(action)
+                ).strip()
+            except MailAppleScriptError as exc:
+                failed.append((name, str(exc)))
+                rest = tuple(a.window_name for a in actions[index + 1:])
+                return tuple(closed), tuple(failed), rest
+            closing = _closing_of(outcome, by="tending", at=time.time())
+            if closing is None:
+                failed.append((name, outcome))
+                continue
+            if action.record is not None:
+                self._end_tended_record(action.record.record_id, closing)
+            closed.append((name, closing.how, action.rule))
+        return tuple(closed), tuple(failed), ()
 
     def _end_tended_record(self, record_id: str, state: Closed) -> bool:
         """End a record tending acted on; False, logged, when it had been
@@ -5796,12 +6059,12 @@ end tell
     def _paste_verified(
         self,
         *,
-        window_name: str,
+        window: _ComposeWindow,
         body: str,
         placement: _PastePlacement,
         plain: bool,
     ) -> None:
-        """Paste ``body`` into the named compose window at ``placement``
+        """Paste ``body`` into the compose window at ``placement``
         and read it back: plain text when ``plain``, HTML otherwise.
 
         The read-back is its own osascript process, since a fresh process
@@ -5819,20 +6082,20 @@ end tell
         for attempt in (1, 2):
             paste_result = self._run_applescript(
                 self._build_paste_script(
-                    window_name=window_name,
+                    window_name=window.name,
                     fill=fill,
                     placement=placement,
                     undo_first=(attempt == 2),
                 )
             ).strip()
             if paste_result != "PASTED_UNVERIFIED":
-                salvage = self._salvage_compose_to_draft(window_name)
+                salvage = self._salvage(window)
                 raise MailComposeWindowError(
                     f"paste: {paste_result!r} (compose window: {salvage})",
                     window_outcome=salvage,
                 )
             seen = self._run_applescript(
-                self._build_readback_script(window_name)
+                self._build_readback_script(window.name)
             ).strip()
             # Normalize whitespace: styled runs (<b>…) split AX static
             # texts, so the joined read-back carries doubled spaces.
@@ -5843,7 +6106,7 @@ end tell
             if arrived and not degraded:
                 return
             if attempt == 2:
-                salvage = self._salvage_compose_to_draft(window_name)
+                salvage = self._salvage(window)
                 raise MailComposeWindowError(
                     f"paste: 'PASTE_FAILED:read-back saw [{seen}] "
                     f"wanted [{snippet}] without raw [{raw_marker}]' "
@@ -5852,9 +6115,9 @@ end tell
                 )
 
     def _paste_attachments(
-        self, window_name: str, attachment_paths: list[Path]
+        self, window: _ComposeWindow, attachment_paths: list[Path]
     ) -> None:
-        """Paste the files at the end of the named compose window's body,
+        """Paste the files at the end of the compose window's body,
         then wait for each to show in the window's AX tree. On any
         failure the window is salvaged to Drafts and
         ``MailAppleScriptError`` raised; nothing is sent.
@@ -5869,7 +6132,7 @@ end tell
         """
         outcome = self._run_applescript(
             self._build_paste_script(
-                window_name=window_name,
+                window_name=window.name,
                 fill=self._files_paste_fill(attachment_paths),
                 placement="end",
                 undo_first=False,
@@ -5878,12 +6141,12 @@ end tell
         if outcome == "PASTED_UNVERIFIED":
             outcome = self._run_applescript(
                 self._build_attachment_ax_verify_script(
-                    window_name=window_name,
+                    window_name=window.name,
                     filenames=[Path(p).name for p in attachment_paths],
                 )
             ).strip()
         if outcome != "ATTACHMENTS_VERIFIED":
-            salvage = self._salvage_compose_to_draft(window_name)
+            salvage = self._salvage(window)
             raise MailComposeWindowError(
                 f"attachments: {outcome!r}; send NOT attempted "
                 f"(compose window: {salvage})",
@@ -5924,11 +6187,10 @@ end tell
             window.to or None, window.cc or None, window.bcc or None, seed="new"
         )
 
-    def _send_compose_window(self, window_name: str) -> None:
-        """Run the verified send on the named compose window; on any
-        outcome but SENT the window is salvaged to Drafts and the outcome
-        raised."""
-        win_safe = escape_applescript_string(window_name)
+    def _send_compose_window(self, window: _ComposeWindow) -> None:
+        """Run the verified send on the compose window; on any outcome but
+        SENT the window is salvaged to Drafts and the outcome raised."""
+        win_safe = escape_applescript_string(window.name)
         send_script = (
             f'set composeName to "{win_safe}"\n'
             + self._as_verified_send_block()
@@ -5937,7 +6199,7 @@ end tell
         result = self._run_applescript(send_script).strip()
         if result == "SENT":
             return
-        salvage = self._salvage_compose_to_draft(window_name)
+        salvage = self._salvage(window)
         raise MailComposeWindowError(
             f"verified send: {result!r} (compose window: {salvage})",
             window_outcome=salvage,
@@ -6420,22 +6682,18 @@ end if
                 except MailOutboundDisallowedError as exc:
                     end_window(
                         _composition_closing(
-                            self._discard_compose_window(window.name),
+                            self._discard_compose_window(window.name, window.window_id),
                             failure=f"recipients refused: {exc}",
                         )
                     )
                     raise
-            self._fill_compose(
-                window.name, seed=seed, body=body, plain=plain, files=files
-            )
+            self._fill_compose(window, seed=seed, body=body, plain=plain, files=files)
             if send_now:
-                self._send_compose_window(window.name)
+                self._send_compose_window(window)
                 end_window(Closed(how="sent", by="composition", at=time.time()))
                 return self._sent_ending(window, files)
             try:
-                draft_id = self._save_compose_window_as_draft(
-                    window.name, window.subject, window.before_ids
-                )
+                draft_id = self._save_compose_window_as_draft(window)
             except MailDraftNotSettledError:
                 # Closed with Save; the draft it became is not yet listed.
                 end_window(Closed(how="salvaged", by="composition", at=time.time()))
@@ -6494,7 +6752,7 @@ end if
 
     def _fill_compose(
         self,
-        window: str,
+        window: _ComposeWindow,
         *,
         seed: str,
         body: str,
@@ -6526,11 +6784,11 @@ end if
         """
         if seed == "new":
             self._paste_verified(
-                window_name=window, body=body, placement="replace", plain=plain,
+                window=window, body=body, placement="replace", plain=plain,
             )
         elif body:
             self._paste_verified(
-                window_name=window, body=body, placement="above", plain=plain,
+                window=window, body=body, placement="above", plain=plain,
             )
         if files:
             self._paste_attachments(window, files)
@@ -6750,16 +7008,46 @@ end if
         describes, record it in the compose ledger, and return what the
         script reported; a seed that is gone is
         ``MailMessageNotFoundError``. A failure once the window existed
-        records it as left open and raises ``MailAppleScriptError``."""
+        records it as left open and raises ``MailAppleScriptError``.
+
+        A window can also open without the script reporting it: Mail
+        opened it more than 5 s after it was asked (NO_COMPOSE_WINDOW),
+        the script was stopped at the timeout, or its report could not be
+        read. Mail's windows are read before the script for that case,
+        and on any such failure every compose window that opened since is
+        recorded as left open (``_adopt_unreported_windows``), so tending
+        closes it on its next pass; the error raised says so."""
+        snapshot = self._mail_window_snapshot()
         script = self._build_open_compose_script(
             seed=seed, seed_id=seed_id, reply_all=reply_all, to=to, cc=cc,
             bcc=bcc, subject=subject, sender=sender, operation=operation,
         )
-        raw = self._run_seeded_script(
-            _wrap_as_json_script(script, timeout=self.timeout), seed_id
-        )
-        report = cast(dict[str, Any], parse_applescript_json(raw))
-        window = _compose_window_from_report(report)
+        try:
+            raw = self._run_seeded_script(
+                _wrap_as_json_script(script, timeout=self.timeout), seed_id
+            )
+            report = cast(dict[str, Any], parse_applescript_json(raw))
+            window = _compose_window_from_report(report)
+        except MailMessageNotFoundError:
+            raise  # SEED_NOT_FOUND: raised before any window is asked for
+        except (MailAppleScriptError, ValueError, KeyError, TypeError) as exc:
+            adopted = self._adopt_unreported_windows(
+                snapshot,
+                expected_name=sanitize_input(subject) if seed == "new" and subject else None,
+                operation=operation,
+                seed=cast(Seed, seed),
+                failure=f"{type(exc).__name__}: {exc}",
+            )
+            note = (
+                f"{adopted} left open, recorded for tending"
+                if adopted
+                else "none found open"
+            )
+            if type(exc) in (MailAppleScriptError, MailTimeoutError):
+                raise type(exc)(f"{exc} (compose window: {note})") from exc
+            raise MailAppleScriptError(
+                f"compose window report unreadable: {exc} (compose window: {note})"
+            ) from exc
         window = replace(
             window,
             record_id=self._record_window_open(
@@ -6792,20 +7080,149 @@ end if
             )
             return None
 
-    def _save_compose_window_as_draft(
-        self, window: str, subject: str, before_ids: list[int]
+    # How long, after an opening script failed without reporting a window,
+    # to look for one Mail opens late: the script already waited 5 s.
+    _ADOPT_WAIT_S = 10.0
+    _ADOPT_POLL_S = 0.5
+
+    def _mail_window_snapshot(self) -> _WindowSnapshot:
+        """Mail's process id and the ids of all its windows, read before a
+        composition opens its window. Opens nothing."""
+        raw = self._run_applescript(
+            _wrap_as_json_script(
+                """
+tell application "System Events"
+    tell application process "Mail"
+        set mailPid to unix id
+    end tell
+end tell
+tell application "Mail"
+    set resultData to {|pid|:mailPid, |ids|:(id of every window)}
+end tell
+""",
+                timeout=self.timeout,
+            )
+        )
+        report = cast(dict[str, Any], parse_applescript_json(raw))
+        return _WindowSnapshot(
+            mail_pid=int(report["pid"]),
+            window_ids=frozenset(int(i) for i in report.get("ids") or []),
+        )
+
+    def _build_adopt_script(
+        self, snapshot: _WindowSnapshot, expected_name: str | None
     ) -> str:
+        """Full osascript source: poll, for up to ``_ADOPT_WAIT_S``, for
+        compose windows of the same Mail process whose ids were not in
+        ``snapshot`` (and, when ``expected_name`` is given, of that name),
+        each tied to System Events' list by its name and position and
+        checked for a Send button. Returns them as ``found``. Read-only."""
+        ids = ", ".join(str(i) for i in sorted(snapshot.window_ids))
+        expected = (
+            f'"{escape_applescript_string(expected_name)}"'
+            if expected_name is not None
+            else '""'
+        )
+        polls = max(1, round(self._ADOPT_WAIT_S / self._ADOPT_POLL_S))
+        body = f"""
+set beforeIds to {{{ids}}}
+set expectedName to {expected}
+set found to {{}}
+set samePid to true
+repeat {polls} times
+    tell application "System Events"
+        tell application process "Mail"
+            set pidNow to unix id
+        end tell
+    end tell
+    if pidNow is not {snapshot.mail_pid} then
+        set samePid to false
+        exit repeat
+    end if
+    tell application "Mail"
+        set allIds to id of every window
+        set allNames to name of every window
+        set allBounds to bounds of every window
+        set allVisible to visible of every window
+    end tell
+    repeat with j from 1 to (count of allIds)
+        set wid to item j of allIds
+        set nm to item j of allNames
+        if wid is not in beforeIds and (item j of allVisible) and (expectedName is "" or nm is expectedName) then
+            set b to item j of allBounds
+            set bPos to {{item 1 of b, item 2 of b}}
+            set idx to my tendIndexOf(nm, bPos)
+            if idx > 0 then
+                if my tendIsCompose(idx) then set end of found to {{|id|:wid, |name|:nm}}
+            end if
+        end if
+    end repeat
+    if (count of found) > 0 then exit repeat
+    delay {self._ADOPT_POLL_S}
+end repeat
+tell application "Mail"
+    set resultData to {{|same_pid|:samePid, |found|:found}}
+end tell
+"""
+        return _wrap_as_json_script(body, timeout=self.timeout) + _WINDOW_HANDLERS
+
+    def _adopt_unreported_windows(
+        self,
+        snapshot: _WindowSnapshot,
+        *,
+        expected_name: str | None,
+        operation: WindowOperation,
+        seed: Seed,
+        failure: str,
+    ) -> int:
+        """Record, as left open with ``failure``, each compose window that
+        opened since ``snapshot`` while an opening script failed without
+        reporting one (``_build_adopt_script``), so tending closes it at
+        its next pass and nothing is lost: a window with anything in it
+        is salvaged. A window some unfinished ledger record already
+        names is another composition's, and is left to it. Returns how
+        many were recorded; a look that fails is logged and counts none,
+        since the composition is failing either way."""
+        try:
+            raw = self._run_applescript(self._build_adopt_script(snapshot, expected_name))
+            report = cast(dict[str, Any], parse_applescript_json(raw))
+        except (MailAppleScriptError, ValueError) as exc:
+            logger.error("could not look for a compose window left unreported: %s", exc)
+            return 0
+        claimed = {
+            r.window_id
+            for r in self.compose_ledger.read_all().records
+            if r.unfinished and r.mail_pid == snapshot.mail_pid
+        }
+        adopted = 0
+        for found in report.get("found") or []:
+            window_id = int(found["id"])
+            if window_id in claimed:
+                continue
+            window = _ComposeWindow(
+                name=str(found["name"]), subject="", to=[], cc=[], bcc=[],
+                before_ids=[], window_id=window_id, mail_pid=snapshot.mail_pid,
+            )
+            window = replace(
+                window,
+                record_id=self._record_window_open(window, operation=operation, seed=seed),
+            )
+            self._record_window_end(window, LeftOpen(failure=failure, at=time.time()))
+            adopted += 1
+        return adopted
+
+    def _save_compose_window_as_draft(self, window: _ComposeWindow) -> str:
         """Close the compose window with Save, then find the draft it
-        became: the Drafts entry with ``subject`` that was not among
-        ``before_ids``, polled for and then given the settle time a new
-        draft needs before Mail acts on it."""
-        outcome = self._salvage_compose_to_draft(window)
+        became: the Drafts entry with the window's subject that was not
+        among the ids Drafts held before it opened, polled for and then
+        given the settle time a new draft needs before Mail acts on it."""
+        outcome = self._salvage(window)
         if outcome != "SALVAGED":
             raise MailComposeWindowError(
                 f"draft save: {outcome}", window_outcome=outcome
             )
-        ids = ", ".join(str(i) for i in before_ids)
-        subject_safe = escape_applescript_string(subject)
+        ids = ", ".join(str(i) for i in window.before_ids)
+        subject_safe = escape_applescript_string(window.subject)
         result = self._run_applescript(f"""
 tell application "Mail"
     set beforeIds to {{{ids}}}

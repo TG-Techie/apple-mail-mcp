@@ -258,18 +258,15 @@ class TestDiscardCompose:
         self, connector: AppleMailConnector
     ) -> None:
         """The discard primitive must actually close the window and read
-        that fact back (both Mail-dictionary discards fail silently)."""
+        that fact back (both Mail-dictionary discards fail silently). By
+        name here, with no id: the window is the only one of its name."""
         subject = f"discard-int-{uuid.uuid4().hex[:8]}"
         connector._run_applescript(
             f'tell application "Mail" to make new outgoing message '
             f'with properties {{subject:"{subject}", content:"x", visible:true}}'
         )
         time.sleep(1)
-        block = connector._as_discard_compose_block("discardName")
-        out = connector._run_applescript(
-            f'set discardName to "{subject}"\n{block}\nreturn discardOutcome'
-        ).strip()
-        assert out == "DISCARDED"
+        assert connector._discard_compose_window(subject) == "DISCARDED"
         still_open = connector._run_applescript(
             f'tell application "System Events" to tell application process "Mail" '
             f'to return (exists window "{subject}") as text'
