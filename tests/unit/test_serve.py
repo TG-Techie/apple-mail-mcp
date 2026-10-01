@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 
-from apple_mail_mcp import serve, tender
+from apple_mail_mcp import restarter, serve, tender
 
 
 @pytest.fixture(autouse=True)
@@ -20,6 +20,19 @@ def tenders_started(monkeypatch: pytest.MonkeyPatch) -> list[float]:
     interval each start asked for instead."""
     started: list[float] = []
     monkeypatch.setattr(serve, "start_tender", lambda interval_s: started.append(interval_s))
+    return started
+
+
+@pytest.fixture(autouse=True)
+def restarters_started(monkeypatch: pytest.MonkeyPatch) -> list[tuple[float, int]]:
+    """A real restarter would probe Mail, and might restart it; this
+    records what each start asked for instead."""
+    started: list[tuple[float, int]] = []
+    monkeypatch.setattr(
+        serve,
+        "start_restarter",
+        lambda interval_s, restart_hour: started.append((interval_s, restart_hour)),
+    )
     return started
 
 
@@ -103,4 +116,55 @@ class TestTending:
     def test_a_negative_interval_is_refused(self) -> None:
         with pytest.raises(SystemExit) as exc:
             serve.build_parser().parse_args(["--tend-interval", "-5"])
+        assert exc.value.code == 2
+
+
+class TestRestartingMail:
+    """The daemon probes Mail and restarts it when it stops answering and
+    once a day (restarter.py), unless told not to; the e2e daemon, which
+    must not reach Mail, is told not to."""
+
+    @pytest.fixture(autouse=True)
+    def _no_server(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from apple_mail_mcp import server
+
+        monkeypatch.setattr(server.mcp, "run", lambda **kw: None)
+
+    def test_starts_by_default(self, restarters_started: list[tuple[float, int]]) -> None:
+        serve.main([])
+        assert restarters_started == [(restarter.PROBE_INTERVAL_S, restarter.RESTART_HOUR)]
+
+    def test_takes_its_interval_and_hour_from_the_flags(
+        self, restarters_started: list[tuple[float, int]]
+    ) -> None:
+        serve.main(["--mail-probe-interval", "120", "--mail-restart-hour", "23"])
+        assert restarters_started == [(120.0, 23)]
+
+    def test_zero_turns_it_off(self, restarters_started: list[tuple[float, int]]) -> None:
+        serve.main(["--mail-probe-interval", "0"])
+        assert restarters_started == []
+
+    def test_it_is_apart_from_tending(
+        self,
+        restarters_started: list[tuple[float, int]],
+        tenders_started: list[float],
+    ) -> None:
+        serve.main(["--tend-interval", "0"])
+        assert tenders_started == [] and len(restarters_started) == 1
+        restarters_started.clear()
+        serve.main(["--mail-probe-interval", "0"])
+        assert restarters_started == [] and len(tenders_started) == 1
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["--mail-probe-interval", "-5"],
+            ["--mail-restart-hour", "24"],
+            ["--mail-restart-hour", "-1"],
+            ["--mail-restart-hour", "4.5"],
+        ],
+    )
+    def test_out_of_range_values_are_refused(self, argv: list[str]) -> None:
+        with pytest.raises(SystemExit) as exc:
+            serve.build_parser().parse_args(argv)
         assert exc.value.code == 2

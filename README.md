@@ -67,6 +67,19 @@ unchanged, and a client that runs its own server needs neither.
   empty), and only those; every other window is left and counted in the
   audit log. `--tend-interval SECONDS` changes the interval, and 0 turns it
   off (docs/research/compose-window-tending.md).
+- The daemon quits and relaunches Mail on its own. Every 5 minutes it asks
+  Mail one cheap question under the Mail lock; when Mail leaves two in a row
+  unanswered for 20 seconds, it restarts Mail, and it also restarts Mail once
+  a day at 04:00 local time (a day whose hour passed while the daemon was down
+  is skipped, and the daily one waits while a send or draft is being
+  composed). A restart holds the Mail lock throughout, asks Mail to quit,
+  then sends SIGTERM and SIGKILL if Mail's process has not exited, relaunches
+  it in the background with `open -g`, and waits for it to answer. It never
+  launches a Mail that was not running, never restarts Mail more than once an
+  hour, and logs every restart to the audit log as `restart_mail`.
+  `--mail-probe-interval SECONDS` changes the probe interval, and 0 turns
+  probing and both kinds of restart off; `--mail-restart-hour HOUR` moves the
+  daily one. The stdio server never restarts Mail.
 - Restarting the daemon is a deploy. A session already connected through its
   proxy reaches the new daemon on its next call; changed instructions reach a
   session when it next starts.

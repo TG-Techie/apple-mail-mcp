@@ -44,12 +44,20 @@ start, one every ``--tend-interval`` seconds, and one soon after a
 composition leaves its window open. ``--tend-interval 0`` turns it off,
 for a daemon that must not reach Mail (the e2e tests run one on a
 temporary data home, whose Mail lock no other process holds).
+
+And it keeps Mail answering (``restarter.py``): a probe every
+``--mail-probe-interval`` seconds, a quit and relaunch of Mail when it
+has left several probes in a row unanswered, and one daily at
+``--mail-restart-hour``. ``--mail-probe-interval 0`` turns all of that
+off, for the same daemons. Only the daemon does either: many stdio
+servers can run at once, one per session.
 """
 
 from __future__ import annotations
 
 import argparse
 
+from .restarter import PROBE_INTERVAL_S, RESTART_HOUR, start_restarter
 from .tender import TEND_INTERVAL_S, start_tender
 
 DEFAULT_PORT = 41108
@@ -91,6 +99,27 @@ def build_parser() -> argparse.ArgumentParser:
             f"{TEND_INTERVAL_S}); 0 turns tending off."
         ),
     )
+    parser.add_argument(
+        "--mail-probe-interval",
+        type=_seconds,
+        default=float(PROBE_INTERVAL_S),
+        metavar="SECONDS",
+        help=(
+            "seconds between probes of Mail; Mail is quit and relaunched when it "
+            "stops answering them, and once a day (default "
+            f"{PROBE_INTERVAL_S}); 0 turns probing and both restarts off."
+        ),
+    )
+    parser.add_argument(
+        "--mail-restart-hour",
+        type=_hour,
+        default=RESTART_HOUR,
+        metavar="HOUR",
+        help=(
+            "local hour, 0 to 23, of the daily restart of Mail (default "
+            f"{RESTART_HOUR})."
+        ),
+    )
     return parser
 
 
@@ -101,12 +130,24 @@ def _seconds(text: str) -> float:
     return value
 
 
+def _hour(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"must be a whole hour, got {text}") from None
+    if not 0 <= value <= 23:
+        raise argparse.ArgumentTypeError(f"must be 0 to 23, got {text}")
+    return value
+
+
 def main(argv: list[str] | None = None) -> int:
     ns = build_parser().parse_args(argv)
     from .server import mcp
 
     if ns.tend_interval > 0:
         start_tender(interval_s=ns.tend_interval)
+    if ns.mail_probe_interval > 0:
+        start_restarter(interval_s=ns.mail_probe_interval, restart_hour=ns.mail_restart_hour)
     mcp.run(transport="http", host=HOST, port=int(ns.port), path=MCP_PATH)
     return 0
 

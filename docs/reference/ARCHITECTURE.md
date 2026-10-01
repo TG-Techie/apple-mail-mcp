@@ -72,6 +72,13 @@ session C --stdio--> mail-proxy --+                                    |
   (docs/research/compose-window-tending.md). `--tend-interval 0` turns it
   off. A stdio server records its windows in the same ledger but does not
   tend.
+- The daemon keeps Mail answering (`restarter.py`): a probe under the Mail
+  lock every 5 minutes, and a quit and relaunch of Mail when two probes in
+  a row go unanswered and once a day at a set local hour, holding the lock
+  throughout and escalating from the quit event to SIGTERM and SIGKILL. A
+  relaunched Mail's restored compose windows have new ids, so tending ends
+  their records as `gone`. `--mail-probe-interval 0` turns it off. A stdio
+  server never restarts Mail.
 
 What one process for all sessions changes, and is not yet decided, is in
 the design queue: the per-process rate-limit budget and the in-memory
@@ -93,13 +100,14 @@ operation log become fleet-wide.
 | `compose_ledger.py` | The record of every compose window the connector opens, by Mail's window id and process, and how each ended (sent, saved, salvaged, discarded, gone, or left open), one file per window under `<root>/compose_windows/` | `exceptions` |
 | `compose_tending.py` | What a tending pass does, decided from an inventory of the compose windows and the ledger (`plan_tending`); pure | `compose_ledger` |
 | `tender.py` | The daemon's tending thread and the logged, rate-limited pass it runs | `security`; `server` (imported at run time only) |
+| `restarter.py` | The daemon's Mail restarter thread: probes Mail, and quits and relaunches it when it stops answering and once a day, logged and rate-limited; finds Mail's process through libproc | `mail_lock`, `security` |
 | `imap_connector.py` | Stateless IMAP client wrapper (`ImapConnector`) and a pooled-connection helper (`ImapConnectionPool`); deliberately unaware of Mail.app and Keychain — callers hand it resolved `(host, port, email, password)` | `exceptions` |
 | `keychain.py` | Reads/writes IMAP passwords in the macOS Keychain under the `apple-mail-mcp.imap.<account>` service name; backs the `apple-mail-mcp setup-imap` CLI and the IMAP fallback path | `exceptions` |
 | `outbound_allowlist.py` | The single point of truth for which recipient addresses may receive outbound mail. Sourced from a YAML config (`APPLE_MAIL_MCP_COMMS_CONFIG`); fails closed if that config is missing or unreadable. Consulted by the tools (`tools/send.py` refuses an off-list send before Mail is touched and skips elicitation for pre-trusted recipients; `tools/accounts_rules.py` checks a rule's `forward_to`) and by `mail_connector.py` (as the hard send-time block) | `exceptions` |
 | `security.py` | Rate limiting, audit logging (`OperationLogger`), attachment validation, and the `MAIL_TEST_MODE` safety gate (`check_test_mode_safety`) that confines destructive/send/rule operations to a named test account and reserved test domains | `utils` |
 | `drafts.py` | Persists seed metadata (`seed_kind`, `seed_id`, `reply_all`) and the caller's own text and attachment names per reply or forward draft under `<root>/<draft_id>.json`, since Mail.app forbids mutating a saved draft and `draft_update` and `draft_send` rebuild it | `exceptions` |
 | `templates.py` | Email template storage and `str.format`-style rendering (`TemplateStore`, `Template`); one `<name>.md` file per template under `<root>/templates/` | `exceptions` |
-| `serve.py` | The `mail-serve` console entry: the resident daemon, `server.mcp` over HTTP on loopback, and its tender | `tender`; `server` (imported at run time only) |
+| `serve.py` | The `mail-serve` console entry: the resident daemon, `server.mcp` over HTTP on loopback, its tender and its Mail restarter | `tender`, `restarter`; `server` (imported at run time only) |
 | `proxy.py` | The `mail-proxy` console entry: a per-session stdio proxy that forwards everything to the daemon and serves its instructions | `serve` (for the port and path); never imports `server` |
 | `cli.py` | The `apple-mail-mcp setup-imap` subcommand; the no-subcommand path starts the MCP server via `server.main()` and is unaffected by this module | `mail_connector`, `imap_connector`, `keychain`, `exceptions` |
 | `utils.py` | Pure functions: AppleScript string escaping/sanitizing, JSON parsing (`parse_applescript_json`), flag/rule field mapping, email/name validation | stdlib only |
