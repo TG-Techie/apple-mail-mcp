@@ -13,7 +13,7 @@ import pytest
 
 from apple_mail_mcp import server, tender
 from apple_mail_mcp.compose_tending import TendReport
-from apple_mail_mcp.exceptions import MailAppleScriptError
+from apple_mail_mcp.exceptions import MailAppleScriptError, MailTimeoutError
 from apple_mail_mcp.security import TIER_LIMITS, operation_logger
 
 
@@ -107,6 +107,129 @@ class TestTheTender:
     def test_an_interval_that_is_not_positive_is_refused(self) -> None:
         with pytest.raises(ValueError):
             tender.ComposeTender(interval_s=0)
+
+
+class TestBackoffOnATimeout:
+    def test_a_timeout_doubles_the_wait_before_the_next_pass(self) -> None:
+        passes: list[float] = []
+        calls = {"n": 0}
+
+        def flaky() -> None:
+            calls["n"] += 1
+            passes.append(time.monotonic())
+            if calls["n"] <= 2:
+                raise MailTimeoutError("osascript timed out")
+
+        t = tender.ComposeTender(interval_s=0.05, min_gap_s=0, run_pass=flaky)
+        t.start()
+        try:
+            _until(lambda: len(passes) >= 3)
+        finally:
+            t.stop()
+        assert passes[1] - passes[0] >= 0.09  # backed off to ~2x interval_s
+        assert passes[2] - passes[1] >= 0.19  # backed off again, to ~4x interval_s
+
+    def test_the_wait_is_capped(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(tender, "TEND_BACKOFF_CAP_S", 0.25)
+        passes: list[float] = []
+
+        def always_times_out() -> None:
+            passes.append(time.monotonic())
+            raise MailTimeoutError("osascript timed out")
+
+        t = tender.ComposeTender(interval_s=0.1, min_gap_s=0, run_pass=always_times_out)
+        t.start()
+        try:
+            _until(lambda: len(passes) >= 4, timeout=10)
+        finally:
+            t.stop()
+        gaps = [b - a for a, b in zip(passes, passes[1:], strict=False)]
+        assert gaps[0] >= 0.18  # first back-off, ~2x interval_s (0.2)
+        assert 0.2 <= gaps[1] < 0.35  # capped at 0.25; would be 4x (0.4) uncapped
+        assert 0.2 <= gaps[2] < 0.35  # stays at the cap, not 8x (0.8)
+
+    def test_success_resets_the_wait_to_the_interval(self) -> None:
+        passes: list[float] = []
+        calls = {"n": 0}
+
+        def flaky() -> None:
+            calls["n"] += 1
+            passes.append(time.monotonic())
+            if calls["n"] == 1:
+                raise MailTimeoutError("osascript timed out")
+
+        t = tender.ComposeTender(interval_s=0.3, min_gap_s=0, run_pass=flaky)
+        t.start()
+        try:
+            _until(lambda: len(passes) >= 3, timeout=10)
+        finally:
+            t.stop()
+        assert passes[1] - passes[0] >= 0.5  # backed off after the timeout
+        assert passes[2] - passes[1] < 0.45  # back to the plain interval after success
+
+    def test_a_non_timeout_failure_resets_the_wait(self) -> None:
+        passes: list[float] = []
+        calls = {"n": 0}
+
+        def flaky() -> None:
+            calls["n"] += 1
+            passes.append(time.monotonic())
+            if calls["n"] == 1:
+                raise MailTimeoutError("osascript timed out")
+            if calls["n"] == 2:
+                raise MailAppleScriptError("Mail got an error: -1708")
+
+        t = tender.ComposeTender(interval_s=0.3, min_gap_s=0, run_pass=flaky)
+        t.start()
+        try:
+            _until(lambda: len(passes) >= 3, timeout=10)
+        finally:
+            t.stop()
+        assert passes[1] - passes[0] >= 0.5  # backed off after the timeout
+        assert passes[2] - passes[1] < 0.45  # a different failure is not more timeouts
+
+    def test_a_request_cuts_a_backed_off_wait_short(self) -> None:
+        passes: list[int] = []
+        calls = {"n": 0}
+
+        def flaky() -> None:
+            calls["n"] += 1
+            passes.append(1)
+            if calls["n"] == 1:
+                raise MailTimeoutError("osascript timed out")
+
+        t = tender.ComposeTender(interval_s=3600, min_gap_s=0, run_pass=flaky)
+        t.start()
+        try:
+            _until(lambda: len(passes) == 1)
+            t.request_pass()
+            _until(lambda: len(passes) == 2)
+        finally:
+            t.stop()
+
+    def test_backoff_start_and_growth_and_recovery_are_logged(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level("INFO", logger="apple_mail_mcp.tender")
+        passes: list[int] = []
+        calls = {"n": 0}
+
+        def flaky() -> None:
+            calls["n"] += 1
+            passes.append(1)
+            if calls["n"] <= 2:
+                raise MailTimeoutError("osascript timed out")
+
+        t = tender.ComposeTender(interval_s=0.02, min_gap_s=0, run_pass=flaky)
+        t.start()
+        try:
+            _until(lambda: len(passes) >= 3)
+        finally:
+            t.stop()
+        warnings = [r.message for r in caplog.records if r.levelname == "WARNING"]
+        infos = [r.message for r in caplog.records if r.levelname == "INFO"]
+        assert len(warnings) == 2  # once when back-off starts, once when it grows
+        assert any("back" in m.lower() for m in infos)  # recovery after back-off
 
 
 class TestStartingIt:

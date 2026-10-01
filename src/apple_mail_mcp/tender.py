@@ -11,10 +11,15 @@ leaves and counts everything else (docs/research/compose-window-tending.md).
 
 The daemon (``mail-serve``) runs one pass when it starts, then one every
 ``TEND_INTERVAL_S``, and one soon after any composition ends with its
-window open, but never two within ``TEND_MIN_GAP_S``. The stdio server
-does not tend: many of them can run at once, each for one session, and
-one resident process is enough; the windows a stdio server leaves are in
-the same ledger, where the daemon finds them.
+window open, but never two within ``TEND_MIN_GAP_S``. While Mail is not
+answering Apple events at all, a pass times out holding the cross-process
+Mail automation lock for the full timeout; consecutive timeouts widen the
+gap between passes up to ``TEND_BACKOFF_CAP_S`` instead of hammering a
+Mail that cannot respond, and a request still cuts that wait short
+(``ComposeTender``). The stdio server does not tend: many of them can run
+at once, each for one session, and one resident process is enough; the
+windows a stdio server leaves are in the same ledger, where the daemon
+finds them.
 
 Every pass is logged through ``operation_logger`` as
 ``tend_compose_windows``, and counts against the ``expensive_ops`` rate
@@ -33,6 +38,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
+from .exceptions import MailTimeoutError
 from .security import check_rate_limit, operation_logger
 
 logger = logging.getLogger(__name__)
@@ -40,14 +46,19 @@ logger = logging.getLogger(__name__)
 OPERATION = "tend_compose_windows"
 
 TEND_INTERVAL_S = 15 * 60
-"""Between the daemon's passes. A pass holds the Mail lock while it
-reads the windows, about 6.5 s for 25 of them (2026-09-27), so it is
-not run often; a composition that leaves its window open asks for one
-at once instead."""
+"""Between the daemon's passes, while Mail answers them. A pass holds
+the Mail lock while it reads the windows, about 6.5 s for 25 of them
+(2026-09-27), so it is not run often; a composition that leaves its
+window open asks for one at once instead."""
 
 TEND_MIN_GAP_S = 60.0
 """The least time between the starts of two passes, however many
 compositions ask."""
+
+TEND_BACKOFF_CAP_S = 4 * 60 * 60
+"""The most a backed-off wait ever reaches (see ``ComposeTender``), so a
+Mail that stays wedged for a long time still gets tried a few times a
+day rather than never."""
 
 
 def run_tend_pass(*, dry_run: bool = False) -> dict[str, Any]:
@@ -80,7 +91,19 @@ class ComposeTender:
     """The daemon's tending thread: a pass at once, then one per
     ``interval_s``, and one when asked (``request_pass``), with at least
     ``min_gap_s`` between the starts of any two. A pass that raises is
-    logged and the thread goes on."""
+    logged and the thread goes on.
+
+    A pass that times out means Mail is not answering Apple events at
+    all, and held the cross-process Mail automation lock for the whole
+    timeout to find that out — retrying it at full cadence only adds
+    lock contention a wedged Mail cannot relieve. So each consecutive
+    timeout doubles the wait before the next scheduled pass, starting
+    from ``interval_s`` and capped at ``TEND_BACKOFF_CAP_S``; a request
+    (``request_pass``) still cuts that wait short, since a composition
+    reaching Mail is evidence it answers again. A pass that succeeds, or
+    fails some other way, resets the wait to ``interval_s`` — only a
+    timeout is evidence Mail itself is unresponsive, so only a timeout
+    backs off."""
 
     def __init__(
         self,
@@ -100,6 +123,7 @@ class ComposeTender:
             target=self._loop, name="compose-tender", daemon=True
         )
         self.passes = 0
+        self._wait_s = interval_s
 
     def start(self) -> None:
         self._thread.start()
@@ -123,13 +147,50 @@ class ComposeTender:
             started = time.monotonic()
             try:
                 self._run_pass()
+            except MailTimeoutError:
+                logger.exception("compose-window tending pass failed")
+                self._back_off()
             except Exception:
                 logger.exception("compose-window tending pass failed")
+                self._reset_wait()
+            else:
+                self._recover()
             self.passes += 1
-            self._wake.wait(self.interval_s)
+            self._wake.wait(self._wait_s)
             remaining = self.min_gap_s - (time.monotonic() - started)
             if remaining > 0:
                 self._stopping.wait(remaining)
+
+    def _back_off(self) -> None:
+        """A pass just timed out: double the wait before the next one,
+        capped at ``TEND_BACKOFF_CAP_S``. Logged once per change, so a
+        Mail stuck at the cap does not repeat the warning every pass."""
+        grown = min(self._wait_s * 2, TEND_BACKOFF_CAP_S)
+        if grown != self._wait_s:
+            self._wait_s = grown
+            logger.warning(
+                "Mail is not answering Apple events; tending backs off to "
+                "%.0f s between passes",
+                self._wait_s,
+            )
+
+    def _recover(self) -> None:
+        """A pass just succeeded: resume the plain interval, and say so
+        if it had been backed off."""
+        if self._wait_s != self.interval_s:
+            logger.info(
+                "a tending pass succeeded; back-off ends and tending "
+                "resumes its %.0f s interval",
+                self.interval_s,
+            )
+        self._wait_s = self.interval_s
+
+    def _reset_wait(self) -> None:
+        """A pass just failed some other way: a timeout is the only
+        failure that means Mail itself is not answering, so only a
+        timeout earns back-off. Quiet, since the exception is already
+        logged above."""
+        self._wait_s = self.interval_s
 
 
 def start_tender(interval_s: float = TEND_INTERVAL_S) -> ComposeTender:
