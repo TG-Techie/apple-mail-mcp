@@ -67,11 +67,14 @@ session C --stdio--> mail-proxy --+                                    |
   daemon's own threads and any stdio server or test run beside it.
 - The daemon tends Mail's compose windows (`tender.py`): a pass at
   start, every 15 minutes, and soon after a composition leaves its window
-  open. A pass closes only the windows the compose ledger says the
-  connector opened and nothing closed, and leaves and counts every other
-  (docs/research/compose-window-tending.md). `--tend-interval 0` turns it
-  off. A stdio server records its windows in the same ledger but does not
-  tend.
+  open. A pass closes, each by Mail's window id, the windows the compose
+  ledger says the connector opened and abandoned, and any other compose
+  window whose content has not changed for an hour, whoever opened it:
+  discarded when empty, salvaged to Drafts otherwise
+  (docs/research/compose-window-tending.md). When it first saw each
+  window with its present content is kept in the compose clock.
+  `--tend-interval 0` turns it off. A stdio server records its windows
+  in the same ledger but does not tend.
 - The daemon keeps Mail answering (`restarter.py`): a probe under the Mail
   lock every 5 minutes, and a quit and relaunch of Mail when two probes in
   a row go unanswered and once a day at a set local hour, holding the lock
@@ -80,7 +83,7 @@ session C --stdio--> mail-proxy --+                                    |
   libproc, and Mail is restarted before it wedges when either stays high
   for several probes in a row. A restart whose relaunched Mail answers asks the tender for a pass. A
   relaunched Mail's restored compose windows have new ids, so tending ends
-  their records as `gone`. `--mail-probe-interval 0` turns it off. A stdio
+  their records as `gone` and starts their clocks again. `--mail-probe-interval 0` turns it off. A stdio
   server never restarts Mail.
 
 What one process for all sessions changes, and is not yet decided, is in
@@ -98,10 +101,11 @@ operation log become fleet-wide.
 | `tools/templates.py` | The template tools over `TemplateStore` | `server`, `security`, `templates` |
 | `tools/drafts.py` | The draft tools, `draft_create` to `draft_send`; a rebuild takes the caller's own part from the seed record | `server`, `drafts`, `security`, `exceptions`, `tools.send`, `tools.templates` |
 | `tools/send.py` | `email_send_html`, and the gates it shares with `draft_send`: the outbound allowlist, the user's confirmation, the checks on files to attach | `server`, `outbound_allowlist`, `security`, `exceptions` |
-| `mail_connector.py` | All AppleScript generation and execution (`AppleMailConnector`); dispatches to the IMAP fast path for a few bulk ops; records every compose window it opens in the compose ledger, and runs a tending pass (`tend_compose_windows`) | `compose_ledger`, `compose_tending`, `drafts`, `imap_connector`, `keychain`, `mail_lock`, `outbound_allowlist`, `utils`, `exceptions` |
+| `mail_connector.py` | All AppleScript generation and execution (`AppleMailConnector`); dispatches to the IMAP fast path for a few bulk ops; records every compose window it opens in the compose ledger, including one Mail opened without its opening script reporting it, and runs a tending pass (`tend_compose_windows`) that closes windows by Mail's id | `compose_clock`, `compose_ledger`, `compose_tending`, `drafts`, `imap_connector`, `keychain`, `mail_lock`, `outbound_allowlist`, `utils`, `exceptions` |
 | `mail_lock.py` | The cross-process Mail automation lock: a flock on a file under the data home, opened afresh on every acquisition | none |
 | `compose_ledger.py` | The record of every compose window the connector opens, by Mail's window id and process, and how each ended (sent, saved, salvaged, discarded, gone, or left open), one file per window under `<root>/compose_windows/` | `exceptions` |
-| `compose_tending.py` | What a tending pass does, decided from an inventory of the compose windows and the ledger (`plan_tending`); pure | `compose_ledger` |
+| `compose_tending.py` | What a tending pass does, decided from an inventory of the compose windows, the ledger and the clock (`plan_tending`): the abandoned and stale rules and each window's content fingerprint; pure | `compose_ledger` |
+| `compose_clock.py` | When tending first saw each compose window with its present content, by Mail's process and window id, with the content's hash only, in `<root>/compose_clock.json` | `compose_ledger`, `compose_tending` |
 | `tender.py` | The daemon's tending thread and the logged, rate-limited pass it runs | `security`; `server` (imported at run time only) |
 | `restarter.py` | The daemon's Mail restarter thread: probes Mail, and quits and relaunches it when it stops answering, when its CPU or memory stays high, and once a day, logged and rate-limited; finds Mail's process and reads its resource use through libproc | `mail_lock`, `compose_ledger`, `compose_tending`, `security` |
 | `imap_connector.py` | Stateless IMAP client wrapper (`ImapConnector`) and a pooled-connection helper (`ImapConnectionPool`); deliberately unaware of Mail.app and Keychain — callers hand it resolved `(host, port, email, password)` | `exceptions` |
