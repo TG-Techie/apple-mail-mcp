@@ -49,8 +49,10 @@ And it keeps Mail answering (``restarter.py``): a probe every
 ``--mail-probe-interval`` seconds, a quit and relaunch of Mail when it
 has left several probes in a row unanswered, and one daily at
 ``--mail-restart-hour``. ``--mail-probe-interval 0`` turns all of that
-off, for the same daemons. Only the daemon does either: many stdio
-servers can run at once, one per session.
+off, for the same daemons. A restart whose relaunched Mail answers asks
+the tender for a pass, so tending does not stay backed off from the
+Mail that was wedged. Only the daemon does either: many stdio servers
+can run at once, one per session.
 """
 
 from __future__ import annotations
@@ -144,10 +146,13 @@ def main(argv: list[str] | None = None) -> int:
     ns = build_parser().parse_args(argv)
     from .server import mcp
 
-    if ns.tend_interval > 0:
-        start_tender(interval_s=ns.tend_interval)
+    tender = start_tender(interval_s=ns.tend_interval) if ns.tend_interval > 0 else None
     if ns.mail_probe_interval > 0:
-        start_restarter(interval_s=ns.mail_probe_interval, restart_hour=ns.mail_restart_hour)
+        start_restarter(
+            interval_s=ns.mail_probe_interval,
+            restart_hour=ns.mail_restart_hour,
+            on_restarted=tender.request_pass if tender is not None else None,
+        )
     mcp.run(transport="http", host=HOST, port=int(ns.port), path=MCP_PATH)
     return 0
 

@@ -32,7 +32,9 @@ outcome and how long it took, and counts against the ``expensive_ops``
 rate tier. One that could not end Mail, or whose relaunch never
 answered, is logged as a failure and at ERROR. Whatever its outcome, no
 other restart follows within ``RESTART_MIN_GAP_S``, so a Mail that will
-not come back is not killed over and over.
+not come back is not killed over and over. After one that succeeded,
+the daemon's tender is asked for a pass (``on_restarted``), so tending
+does not stay backed off from the Mail that was wedged.
 
 The stdio server never restarts Mail: many of them can run at once, one
 per session, for the same reason none of them tends compose windows
@@ -371,6 +373,7 @@ class MailRestarter:
         restart_hour: int = RESTART_HOUR,
         host: MailHost | None = None,
         clock: Clock | None = None,
+        on_restarted: Callable[[], None] | None = None,
     ) -> None:
         if interval_s <= 0:
             raise ValueError(f"interval_s must be positive, got {interval_s}")
@@ -380,6 +383,10 @@ class MailRestarter:
         self.restart_hour = restart_hour
         self._host: MailHost = host if host is not None else MacMailHost()
         self._clock: Clock = clock if clock is not None else SystemClock()
+        # Called after a restart whose relaunched Mail answered. The
+        # daemon passes its tender's request_pass, so tending, backed
+        # off from the wedged Mail, runs again at once.
+        self._on_restarted = on_restarted
         self._silent_probes = 0
         self._last_restart: float | None = None
         self._last_check = self._clock.now()
@@ -509,6 +516,8 @@ class MailRestarter:
             OPERATION, report.as_dict(), "success" if report.succeeded else "failure"
         )
         _log_restart(report)
+        if report.succeeded and self._on_restarted is not None:
+            self._on_restarted()
 
 
 def _log_restart(report: RestartReport) -> None:
@@ -619,10 +628,15 @@ class _Restart:
 
 
 def start_restarter(
-    interval_s: float = PROBE_INTERVAL_S, restart_hour: int = RESTART_HOUR
+    interval_s: float = PROBE_INTERVAL_S,
+    restart_hour: int = RESTART_HOUR,
+    on_restarted: Callable[[], None] | None = None,
 ) -> MailRestarter:
-    """Start this process's Mail restarter."""
-    restarter = MailRestarter(interval_s=interval_s, restart_hour=restart_hour)
+    """Start this process's Mail restarter. ``on_restarted`` is called
+    after each restart whose relaunched Mail answered."""
+    restarter = MailRestarter(
+        interval_s=interval_s, restart_hour=restart_hour, on_restarted=on_restarted
+    )
     restarter.start()
     logger.info(
         "probing Mail every %.0f s, restarting it when it stops answering and daily at %02d:00",

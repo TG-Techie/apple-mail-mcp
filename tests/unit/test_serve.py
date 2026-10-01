@@ -14,25 +14,51 @@ import pytest
 from apple_mail_mcp import restarter, serve, tender
 
 
+class FakeTender:
+    def request_pass(self) -> None:
+        pass
+
+
+@pytest.fixture
+def tender_objects() -> list[FakeTender]:
+    return []
+
+
 @pytest.fixture(autouse=True)
-def tenders_started(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+def tenders_started(
+    monkeypatch: pytest.MonkeyPatch, tender_objects: list[FakeTender]
+) -> list[float]:
     """A real tender would run passes against Mail; this records the
-    interval each start asked for instead."""
+    interval each start asked for instead, and hands back a stand-in."""
     started: list[float] = []
-    monkeypatch.setattr(serve, "start_tender", lambda interval_s: started.append(interval_s))
+
+    def start(interval_s: float) -> FakeTender:
+        started.append(interval_s)
+        tender_objects.append(FakeTender())
+        return tender_objects[-1]
+
+    monkeypatch.setattr(serve, "start_tender", start)
     return started
 
 
+@pytest.fixture
+def restart_callbacks() -> list[object]:
+    return []
+
+
 @pytest.fixture(autouse=True)
-def restarters_started(monkeypatch: pytest.MonkeyPatch) -> list[tuple[float, int]]:
+def restarters_started(
+    monkeypatch: pytest.MonkeyPatch, restart_callbacks: list[object]
+) -> list[tuple[float, int]]:
     """A real restarter would probe Mail, and might restart it; this
     records what each start asked for instead."""
     started: list[tuple[float, int]] = []
-    monkeypatch.setattr(
-        serve,
-        "start_restarter",
-        lambda interval_s, restart_hour: started.append((interval_s, restart_hour)),
-    )
+
+    def start(interval_s: float, restart_hour: int, on_restarted: object) -> None:
+        started.append((interval_s, restart_hour))
+        restart_callbacks.append(on_restarted)
+
+    monkeypatch.setattr(serve, "start_restarter", start)
     return started
 
 
@@ -154,6 +180,27 @@ class TestRestartingMail:
         restarters_started.clear()
         serve.main(["--mail-probe-interval", "0"])
         assert restarters_started == [] and len(tenders_started) == 1
+
+    def test_a_restart_asks_the_tender_for_a_pass(
+        self, restart_callbacks: list[object], tender_objects: list[FakeTender]
+    ) -> None:
+        """A tender backed off from a wedged Mail would otherwise wait out
+        its back-off after Mail recovers."""
+        serve.main([])
+        [t] = tender_objects
+        assert restart_callbacks == [t.request_pass]
+
+    def test_with_tending_off_a_restart_asks_for_nothing(
+        self, restart_callbacks: list[object]
+    ) -> None:
+        serve.main(["--tend-interval", "0"])
+        assert restart_callbacks == [None]
+
+    def test_with_restarts_off_nothing_is_wired(
+        self, restart_callbacks: list[object], tender_objects: list[FakeTender]
+    ) -> None:
+        serve.main(["--mail-probe-interval", "0"])
+        assert len(tender_objects) == 1 and restart_callbacks == []
 
     @pytest.mark.parametrize(
         "argv",

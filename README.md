@@ -74,9 +74,11 @@ unchanged, and a client that runs its own server needs neither.
   is skipped, and the daily one waits while a send or draft is being
   composed). A restart holds the Mail lock throughout, asks Mail to quit,
   then sends SIGTERM and SIGKILL if Mail's process has not exited, relaunches
-  it in the background with `open -g`, and waits for it to answer. It never
-  launches a Mail that was not running, never restarts Mail more than once an
-  hour, and logs every restart to the audit log as `restart_mail`.
+  it in the background with `open -g`, and waits for it to answer; once Mail
+  answers, it runs a tending pass rather than waiting out tending's back-off.
+  It never launches a Mail that was not running, never restarts Mail more
+  than once an hour, and logs every restart to the audit log as
+  `restart_mail`.
   `--mail-probe-interval SECONDS` changes the probe interval, and 0 turns
   probing and both kinds of restart off; `--mail-restart-hour HOUR` moves the
   daily one. The stdio server never restarts Mail.

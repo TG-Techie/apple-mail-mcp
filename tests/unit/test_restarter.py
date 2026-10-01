@@ -401,6 +401,38 @@ class TestTheRestart:
         [(_, params, _)] = _restarts(logged)
         assert params["reason"] == "unresponsive"
 
+    def test_a_successful_restart_asks_once_for_what_follows(self, mail: FakeMail) -> None:
+        """The daemon hands in its tender's request_pass, so tending,
+        backed off from the wedged Mail, runs again at once."""
+        called: list[int] = []
+        mail.wedge()
+        r = _restarter(mail, on_restarted=lambda: called.append(1))
+        r.check()
+        assert called == []
+        r.check()
+        assert called == [1]
+        for _ in range(3):
+            mail.advance(300)
+            r.check()
+        assert called == [1]
+
+    @pytest.mark.parametrize("failure", ["will_not_end", "never_answers", "open_fails"])
+    def test_a_failed_restart_does_not_ask(self, mail: FakeMail, failure: str) -> None:
+        if failure == "will_not_end":
+            mail.quits_on_event = False
+            mail.dies_on = set()
+        elif failure == "never_answers":
+            mail.relaunch_answers_after = None
+        else:
+            mail.launch_error = "LSOpenURLsWithRole() failed"
+        called: list[int] = []
+        mail.wedge()
+        r = _restarter(mail, on_restarted=lambda: called.append(1))
+        r.check()
+        r.check()
+        assert "quit event" in mail.events
+        assert called == []
+
     def test_the_count_starts_again_after_a_restart(
         self, mail: FakeMail, wedged: MailRestarter, logged: list[tuple[Any, ...]]
     ) -> None:
@@ -634,6 +666,18 @@ class TestStartingIt:
         assert started == [r]
         assert r.interval_s == 42 and r.restart_hour == 5
         assert isinstance(r._host, restarter.MacMailHost)
+        assert r._on_restarted is None
+
+    def test_passes_on_what_to_call_after_a_restart(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(MailRestarter, "start", lambda self: None)
+
+        def after() -> None:
+            pass
+
+        r = restarter.start_restarter(interval_s=42, restart_hour=5, on_restarted=after)
+        assert r._on_restarted is after
 
     def test_the_stdio_server_never_starts_one(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Many stdio servers run at once, one per session; only the

@@ -76,6 +76,7 @@ session C --stdio--> mail-proxy --+                                    |
   lock every 5 minutes, and a quit and relaunch of Mail when two probes in
   a row go unanswered and once a day at a set local hour, holding the lock
   throughout and escalating from the quit event to SIGTERM and SIGKILL. A
+  restart whose relaunched Mail answers asks the tender for a pass. A
   relaunched Mail's restored compose windows have new ids, so tending ends
   their records as `gone`. `--mail-probe-interval 0` turns it off. A stdio
   server never restarts Mail.
