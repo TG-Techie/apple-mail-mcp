@@ -110,83 +110,72 @@ class TestTheTender:
 
 
 class TestBackoffOnATimeout:
-    def test_a_timeout_doubles_the_wait_before_the_next_pass(self) -> None:
-        passes: list[float] = []
-        calls = {"n": 0}
+    """None of these wait on a real interval: ``request_pass`` cuts any
+    wait short regardless of how long it is, so ``interval_s`` can be
+    large and every pass still runs as soon as the last one is seen.
+    Each fake ``run_pass`` records ``t._wait_s`` the instant it is
+    called — the wait the loop just used to schedule this pass — so the
+    assertions are on that exact, deterministic sequence rather than on
+    wall-clock gaps between passes."""
+
+    def test_the_wait_sequence_through_backoff_and_recovery(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(tender, "TEND_BACKOFF_CAP_S", 350)
+        samples: list[float] = []
+        outcomes = iter(
+            [MailTimeoutError("osascript timed out")] * 3 + [None, None]
+        )
 
         def flaky() -> None:
-            calls["n"] += 1
-            passes.append(time.monotonic())
-            if calls["n"] <= 2:
-                raise MailTimeoutError("osascript timed out")
+            samples.append(t._wait_s)
+            exc = next(outcomes)
+            if exc is not None:
+                raise exc
 
-        t = tender.ComposeTender(interval_s=0.05, min_gap_s=0, run_pass=flaky)
+        t = tender.ComposeTender(interval_s=100, min_gap_s=0, run_pass=flaky)
         t.start()
         try:
-            _until(lambda: len(passes) >= 3)
+            _until(lambda: len(samples) == 1)
+            for expected in range(2, 6):
+                t.request_pass()
+                _until(lambda expected=expected: len(samples) == expected)
         finally:
             t.stop()
-        assert passes[1] - passes[0] >= 0.09  # backed off to ~2x interval_s
-        assert passes[2] - passes[1] >= 0.19  # backed off again, to ~4x interval_s
-
-    def test_the_wait_is_capped(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(tender, "TEND_BACKOFF_CAP_S", 0.25)
-        passes: list[float] = []
-
-        def always_times_out() -> None:
-            passes.append(time.monotonic())
-            raise MailTimeoutError("osascript timed out")
-
-        t = tender.ComposeTender(interval_s=0.1, min_gap_s=0, run_pass=always_times_out)
-        t.start()
-        try:
-            _until(lambda: len(passes) >= 4, timeout=10)
-        finally:
-            t.stop()
-        gaps = [b - a for a, b in zip(passes, passes[1:], strict=False)]
-        assert gaps[0] >= 0.18  # first back-off, ~2x interval_s (0.2)
-        assert 0.2 <= gaps[1] < 0.35  # capped at 0.25; would be 4x (0.4) uncapped
-        assert 0.2 <= gaps[2] < 0.35  # stays at the cap, not 8x (0.8)
-
-    def test_success_resets_the_wait_to_the_interval(self) -> None:
-        passes: list[float] = []
-        calls = {"n": 0}
-
-        def flaky() -> None:
-            calls["n"] += 1
-            passes.append(time.monotonic())
-            if calls["n"] == 1:
-                raise MailTimeoutError("osascript timed out")
-
-        t = tender.ComposeTender(interval_s=0.3, min_gap_s=0, run_pass=flaky)
-        t.start()
-        try:
-            _until(lambda: len(passes) >= 3, timeout=10)
-        finally:
-            t.stop()
-        assert passes[1] - passes[0] >= 0.5  # backed off after the timeout
-        assert passes[2] - passes[1] < 0.45  # back to the plain interval after success
+        # 100 (initial) -> 200, 350 (doubling, then capped) over the three
+        # timeouts -> 350 still (the failed fourth doubling is capped) ->
+        # 100 (the success resets it, held for the next pass).
+        assert samples == [100, 200, 350, 350, 100]
 
     def test_a_non_timeout_failure_resets_the_wait(self) -> None:
-        passes: list[float] = []
-        calls = {"n": 0}
+        samples: list[float] = []
+        outcomes = iter(
+            [
+                MailTimeoutError("osascript timed out"),
+                MailAppleScriptError("Mail got an error: -1708"),
+                None,
+            ]
+        )
 
         def flaky() -> None:
-            calls["n"] += 1
-            passes.append(time.monotonic())
-            if calls["n"] == 1:
-                raise MailTimeoutError("osascript timed out")
-            if calls["n"] == 2:
-                raise MailAppleScriptError("Mail got an error: -1708")
+            samples.append(t._wait_s)
+            exc = next(outcomes)
+            if exc is not None:
+                raise exc
 
-        t = tender.ComposeTender(interval_s=0.3, min_gap_s=0, run_pass=flaky)
+        t = tender.ComposeTender(interval_s=100, min_gap_s=0, run_pass=flaky)
         t.start()
         try:
-            _until(lambda: len(passes) >= 3, timeout=10)
+            _until(lambda: len(samples) == 1)
+            for expected in (2, 3):
+                t.request_pass()
+                _until(lambda expected=expected: len(samples) == expected)
         finally:
             t.stop()
-        assert passes[1] - passes[0] >= 0.5  # backed off after the timeout
-        assert passes[2] - passes[1] < 0.45  # a different failure is not more timeouts
+        # 100 (initial) -> 200 (backed off by the timeout) -> 100 (a
+        # different failure is not more timeouts, so it resets, held for
+        # the next pass).
+        assert samples == [100, 200, 100]
 
     def test_a_request_cuts_a_backed_off_wait_short(self) -> None:
         passes: list[int] = []
@@ -211,19 +200,28 @@ class TestBackoffOnATimeout:
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
         caplog.set_level("INFO", logger="apple_mail_mcp.tender")
-        passes: list[int] = []
-        calls = {"n": 0}
+        samples: list[int] = []
+        outcomes = iter(
+            [
+                MailTimeoutError("osascript timed out"),
+                MailTimeoutError("osascript timed out"),
+                None,
+            ]
+        )
 
         def flaky() -> None:
-            calls["n"] += 1
-            passes.append(1)
-            if calls["n"] <= 2:
-                raise MailTimeoutError("osascript timed out")
+            samples.append(1)
+            exc = next(outcomes)
+            if exc is not None:
+                raise exc
 
-        t = tender.ComposeTender(interval_s=0.02, min_gap_s=0, run_pass=flaky)
+        t = tender.ComposeTender(interval_s=100, min_gap_s=0, run_pass=flaky)
         t.start()
         try:
-            _until(lambda: len(passes) >= 3)
+            _until(lambda: len(samples) == 1)
+            for expected in (2, 3):
+                t.request_pass()
+                _until(lambda expected=expected: len(samples) == expected)
         finally:
             t.stop()
         warnings = [r.message for r in caplog.records if r.levelname == "WARNING"]
