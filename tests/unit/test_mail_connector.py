@@ -3572,6 +3572,7 @@ class TestAppleMailConnector:
             include_content=True,
             headers_only=False,
             include_attachments=False,
+            include_links=False,
         )
         as_path.assert_not_called()
 
@@ -3589,7 +3590,7 @@ class TestAppleMailConnector:
 
         assert result == {"id": "1"}
         imap_path.assert_not_called()
-        as_path.assert_called_once_with("123", True, False)
+        as_path.assert_called_once_with("123", True, False, include_links=False)
 
     def test_get_message_partial_hint_skips_imap(
         self, connector: AppleMailConnector
@@ -3729,7 +3730,7 @@ class TestAppleMailConnector:
             connector.get_message("123", headers_only=True)
         # AppleScript path receives the original signature (message_id,
         # include_content, include_attachments); headers_only is silently dropped.
-        as_path.assert_called_once_with("123", True, False)
+        as_path.assert_called_once_with("123", True, False, include_links=False)
 
 
     def test_get_attachments_uses_imap_when_account_and_mailbox_provided(

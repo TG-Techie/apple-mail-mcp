@@ -66,6 +66,12 @@ from .exceptions import (
 )
 from .imap_connector import ImapConnectionPool, ImapConnector
 from .keychain import get_imap_password
+from .links import (
+    MAX_SOURCE_BYTES,
+    links_from_source,
+    source_too_large_warning,
+    source_unreadable_warning,
+)
 from .outbound_allowlist import (
     assert_forward_targets_allowed,
     assert_recipients_allowed_for_send,
@@ -912,6 +918,64 @@ def _render_recipients(record: dict[str, Any]) -> None:
                 (str(r.get("name") or ""), str(r.get("address") or ""))
                 for r in record[key] or []
             )
+
+
+# The record fields ``_source_read_block`` fills, which ``_take_links``
+# turns into the row's ``links``.
+_SOURCE_FIELDS = (
+    "|source|:msgSource, |source_size|:msgSourceSize, |source_error|:msgSourceError"
+)
+
+
+def _source_read_block(*, message_var: str, indent: int) -> str:
+    """Emit the AppleScript that reads ``<message_var>``'s raw source into
+    ``msgSource``, for ``include_links``.
+
+    Two events: ``message size``, then ``source`` only when the size is
+    within ``MAX_SOURCE_BYTES``, so an oversized message is never
+    carried through JSON. Both under their own ``try``: the lookup loops
+    that call this treat any error as "not in this mailbox", so an
+    unreadable source would otherwise become "message not found". The
+    error goes to ``msgSourceError`` for ``_take_links`` to report.
+    """
+    pad = " " * indent
+    lines = [
+        'set msgSource to ""',
+        "set msgSourceSize to 0",
+        'set msgSourceError to ""',
+        "try",
+        f"    set msgSourceSize to message size of {message_var}",
+        "    if msgSourceSize is missing value then set msgSourceSize to 0",
+        f"    if msgSourceSize ≤ {MAX_SOURCE_BYTES} then",
+        f"        set msgSource to source of {message_var}",
+        '        if msgSource is missing value then set msgSource to ""',
+        "    end if",
+        "on error errMsg number errNum",
+        '    set msgSource to ""',
+        '    set msgSourceError to (errMsg & " (error " & errNum & ")")',
+        "end try",
+    ]
+    return "\n".join(pad + line for line in lines)
+
+
+def _take_links(record: dict[str, Any]) -> list[str]:
+    """Replace the source fields a script emitted (``_SOURCE_FIELDS``)
+    with the row's ``links``, in place, and return any warnings: the
+    source could not be read, was over ``MAX_SOURCE_BYTES``, or had
+    more links than are returned."""
+    source = str(record.pop("source", "") or "")
+    size = int(record.pop("source_size", 0) or 0)
+    error = str(record.pop("source_error", "") or "")
+    message_id = str(record.get("id", ""))
+    if error:
+        record["links"] = []
+        return [source_unreadable_warning(message_id, error)]
+    if size > MAX_SOURCE_BYTES:
+        record["links"] = []
+        return [source_too_large_warning(message_id, size)]
+    links, warnings = links_from_source(source, message_id=message_id)
+    record["links"] = links
+    return warnings
 
 
 # The property a body or text criterion reads.
@@ -2907,6 +2971,7 @@ class AppleMailConnector:
         account: str | None = None,
         mailbox: str | None = None,
         include_attachments: bool = False,
+        include_links: bool = False,
     ) -> dict[str, Any]:
         """
         Get full message details.
@@ -2936,12 +3001,16 @@ class AppleMailConnector:
             account: Mail.app account name. Optional; required (with
                 ``mailbox``) to enable the IMAP fast path.
             mailbox: Folder to look in for the IMAP path. Optional.
+            include_links: Add ``links``, read from the message's raw
+                source (``links.links_from_source``): ``source of`` in the
+                same script on the AppleScript path, ``BODY[]`` in the
+                same FETCH on the IMAP path.
 
         Returns:
             Message dictionary with keys: id, rfc_message_id, subject,
             sender, to, cc, bcc, date_received, read_status, flagged,
             content; ``warnings`` when there are any, and always with
-            ``attachments``.
+            ``attachments``; ``links`` with ``include_links``.
 
         Raises:
             MailMessageNotFoundError: Message not found via either path.
@@ -2961,6 +3030,7 @@ class AppleMailConnector:
                     include_content=include_content,
                     headers_only=headers_only,
                     include_attachments=include_attachments,
+                    include_links=include_links,
                 )
                 self._imap_clear_breaker(account)
                 return result
@@ -2969,7 +3039,8 @@ class AppleMailConnector:
                 # fall through to AppleScript
 
         return self._get_message_applescript(
-            message_id, include_content, include_attachments
+            message_id, include_content, include_attachments,
+            include_links=include_links,
         )
 
     def _imap_get_message(
@@ -2981,6 +3052,7 @@ class AppleMailConnector:
         include_content: bool,
         headers_only: bool,
         include_attachments: bool,
+        include_links: bool = False,
     ) -> dict[str, Any]:
         """Run get_message through the IMAP path. Mirrors _imap_search.
 
@@ -2996,6 +3068,7 @@ class AppleMailConnector:
             include_content=include_content,
             headers_only=headers_only,
             include_attachments=include_attachments,
+            include_links=include_links,
         )
 
     def _enumerate_attachments_for_message(
@@ -3090,6 +3163,8 @@ class AppleMailConnector:
         message_id: str,
         include_content: bool,
         include_attachments: bool = False,
+        *,
+        include_links: bool = False,
     ) -> dict[str, Any]:
         """AppleScript fallback for get_message — iterates account × mailbox.
 
@@ -3102,6 +3177,10 @@ class AppleMailConnector:
         single owner of the inline-image -10000 guard. That adds one
         extra ``osascript`` round-trip per call (~100-300ms); the cost
         is the price of having one source of truth for the guard.
+
+        ``include_links`` reads the source in the same script
+        (``_source_read_block``), so it costs two Apple events and no
+        further ``osascript`` call.
         """
         message_id_safe = escape_applescript_string(sanitize_input(message_id))
 
@@ -3124,6 +3203,10 @@ class AppleMailConnector:
         recipients_clause = _recipient_read_block(
             message_var="msg", warnings_var="recipWarnings", indent=24
         )
+        source_clause = (
+            _source_read_block(message_var="msg", indent=24) if include_links else ""
+        )
+        source_fields = f", {_SOURCE_FIELDS}" if include_links else ""
 
         tell_body = f'''
         tell application "Mail"
@@ -3135,7 +3218,8 @@ class AppleMailConnector:
                         {content_clause}
                         set recipWarnings to {{}}
 {recipients_clause}
-                        set resultData to {{|id|:(id of msg as text), |rfc_message_id|:(message id of msg), |subject|:(subject of msg), |sender|:(sender of msg), |date_received|:(date received of msg as text), |read_status|:(read status of msg), |flagged|:(flagged status of msg), |content|:msgContent, {_RECIPIENT_FIELDS}, |warnings|:recipWarnings}}
+{source_clause}
+                        set resultData to {{|id|:(id of msg as text), |rfc_message_id|:(message id of msg), |subject|:(subject of msg), |sender|:(sender of msg), |date_received|:(date received of msg as text), |read_status|:(read status of msg), |flagged|:(flagged status of msg), |content|:msgContent, {_RECIPIENT_FIELDS}, |warnings|:recipWarnings{source_fields}}}
                         exit repeat
                     end try
                 end repeat
@@ -3153,6 +3237,8 @@ class AppleMailConnector:
         msg = cast(dict[str, Any], parse_applescript_json(result))
         _render_recipients(msg)
         warnings = cast(list[str], msg.pop("warnings", None) or [])
+        if include_links:
+            warnings += _take_links(msg)
 
         if include_attachments:
             attachments, attachment_warnings = (
@@ -4780,6 +4866,7 @@ class AppleMailConnector:
         self,
         include_content: bool = True,
         include_attachments: bool = False,
+        include_links: bool = False,
     ) -> list[dict[str, Any]]:
         """
         Get messages currently selected in Apple Mail.
@@ -4789,6 +4876,8 @@ class AppleMailConnector:
             include_attachments: Include per-message attachment metadata
                 list (name, mime_type, size, downloaded). On AppleScript,
                 this can be expensive on cold caches — see #142.
+            include_links: Add ``links``, read from each message's source
+                in the same script, as ``get_message`` does.
 
         Returns:
             List of message dicts (same structure as get_message). Empty list if
@@ -4813,6 +4902,10 @@ class AppleMailConnector:
         recipients_clause = _recipient_read_block(
             message_var="msg", warnings_var="recipWarnings", indent=16
         )
+        source_clause = (
+            _source_read_block(message_var="msg", indent=16) if include_links else ""
+        )
+        source_fields = f", {_SOURCE_FIELDS}" if include_links else ""
 
         tell_body = f"""
         tell application "Mail"
@@ -4822,7 +4915,8 @@ class AppleMailConnector:
                 {content_clause}
                 set recipWarnings to {{}}
 {recipients_clause}
-                set msgRecord to {{|id|:(id of msg as text), |subject|:(subject of msg), |sender|:(sender of msg), |date_received|:(date received of msg as text), |read_status|:(read status of msg), |flagged|:(flagged status of msg), |content|:msgContent, {_RECIPIENT_FIELDS}, |warnings|:recipWarnings}}
+{source_clause}
+                set msgRecord to {{|id|:(id of msg as text), |subject|:(subject of msg), |sender|:(sender of msg), |date_received|:(date received of msg as text), |read_status|:(read status of msg), |flagged|:(flagged status of msg), |content|:msgContent, {_RECIPIENT_FIELDS}, |warnings|:recipWarnings{source_fields}}}
                 set end of resultData to msgRecord
             end repeat
         end tell
@@ -4835,6 +4929,8 @@ class AppleMailConnector:
         for m in messages:
             _render_recipients(m)
             warnings = cast(list[str], m.pop("warnings", None) or [])
+            if include_links:
+                warnings += _take_links(m)
             if include_attachments:
                 attachments, attachment_warnings = (
                     self._selected_message_attachments(cast(str, m.get("id", "")))

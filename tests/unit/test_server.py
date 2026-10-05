@@ -1157,6 +1157,7 @@ class TestSearchMessages:
         mock_mail.get_selected_messages.assert_called_once_with(
             include_content=False,
             include_attachments=False,
+            include_links=False,
         )
         mock_mail.search_messages.assert_not_called()
 
@@ -1309,6 +1310,7 @@ class TestSearchMessages:
         mock_mail.get_selected_messages.assert_called_once_with(
             include_content=False,
             include_attachments=False,
+            include_links=False,
         )
         mock_mail.get_message.assert_called_once()
 
@@ -1560,6 +1562,7 @@ class TestGetMessages:
             account=None,
             mailbox=None,
             include_attachments=True,
+            include_links=False,
         )
         mock_logger.log_operation.assert_called_once()
 
@@ -1621,6 +1624,7 @@ class TestGetMessages:
         mock_mail.get_selected_messages.assert_called_once_with(
             include_content=True,
             include_attachments=True,
+            include_links=False,
         )
         # No per-id get_message lookup needed for SELECTED-resolved rows.
         mock_mail.get_message.assert_not_called()
@@ -1652,6 +1656,7 @@ class TestGetMessages:
         mock_mail.get_selected_messages.assert_called_once_with(
             include_content=True,
             include_attachments=True,
+            include_links=False,
         )
         mock_mail.get_message.assert_called_once()
 
@@ -1687,6 +1692,7 @@ class TestGetMessages:
             account="iCloud",
             mailbox="INBOX",
             include_attachments=True,
+            include_links=False,
         )
 
     # ---- include_attachments (#133 + #142) -------------------------------
@@ -1723,6 +1729,7 @@ class TestGetMessages:
         mock_mail.get_selected_messages.assert_called_once_with(
             include_content=True,
             include_attachments=False,
+            include_links=False,
         )
 
     def test_unexpected_exception_maps_to_unknown(

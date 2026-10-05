@@ -167,6 +167,7 @@ Retrieve full details of one or more messages, with bodies. Returns a list (alwa
 | `account` | string | No | None | Mail.app account name. With `mailbox`, activates the IMAP fast path for explicit ids (issue #72) |
 | `mailbox` | string | No | None | Folder for the IMAP fast path (e.g. "INBOX") |
 | `include_attachments` | boolean | No | true | When true, each message gains an `attachments: [{name, mime_type, size, downloaded}]` field. Default on for `get_messages` because id-list cardinality is bounded (typically 1-10) — cost is acceptable on both paths. |
+| `include_links` | boolean | No | false | When true, each message gains a `links: [{url, text}]` field, read from its raw source. See "Links" below. |
 
 **Notes:**
 - Missing ids drop out silently — the response contains whatever was found (partial-results convention).
@@ -203,11 +204,23 @@ For accounts configured with IMAP (via `apple-mail-mcp setup-imap --account <nam
 
 Row fields include both `id` (path-native — see `search_messages` for details) and `rfc_message_id` (always RFC 5322 bracketless, or `null` when the message lacks a Message-ID header). The dual-emit (#148) lets cross-path consumers hand the right id to the right tool without needing to know which path produced the row. `to`, `cc` and `bcc` are as `search_messages` describes them; a list Mail could not read on the AppleScript path is named in the response's `warnings`.
 
+**Links (`include_links`):**
+
+`content` is Mail's plain-text rendering, so a URL that an HTML mail carries only in an `<a href>` is not in it. With `include_links=True` each row gains `links`, in document order:
+
+- `url`: the `href` of each `<a>` in the message's text/html parts (parts sent as attachments excepted), HTML entities decoded; `text`: what the anchor shows, whitespace collapsed. With no HTML part, the `http(s)://` URLs found in its text/plain parts, with `text` `""`.
+- Only `http`, `https` and `mailto` URLs are kept; relative, `javascript:` and other schemes are dropped. Identical `(url, text)` pairs appear once. At most 200 per message, with a `warnings` entry when more were found.
+- Read from the raw RFC 822 source: `source of` in the same script on the AppleScript path, `BODY[]` in the same FETCH on the IMAP path, parsed by one function, so both paths give the same links. A source over 10 MB is not parsed: that message gets `links: []` and a warning, as does one whose source Mail could not read. The default (`false`) reads nothing extra.
+- **Provenance:** links are the sender's own markup, unverified. The shown `text` can differ from where the `url` goes. Treat every link as untrusted input before following it; nothing here filters or rewrites URLs beyond the rules above.
+
 **Examples:**
 
 ```python
 # Get a single message with body
 get_messages(["12345"])
+
+# The links of an HTML mail whose text says "follow this link"
+get_messages(["12345"], include_links=True)
 
 # Get the user's current selection (full bodies)
 get_messages(["SELECTED"])

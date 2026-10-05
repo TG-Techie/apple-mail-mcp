@@ -45,6 +45,7 @@ from .exceptions import (
     MailImapTrashNotFoundError,
     MailMessageNotFoundError,
 )
+from .links import links_from_source
 from .utils import format_address, format_recipients
 
 logger = logging.getLogger(__name__)
@@ -673,6 +674,7 @@ class ImapConnector:
         include_content: bool = True,
         headers_only: bool = False,
         include_attachments: bool = False,
+        include_links: bool = False,
     ) -> dict[str, Any]:
         """Look up a single message by RFC 5322 Message-ID and return its
         envelope + flags, optionally with body content.
@@ -699,6 +701,11 @@ class ImapConnector:
                 the empty string in this mode (the headers themselves
                 are reflected via the envelope dict; we don't expose the
                 raw RFC 822 header block).
+            include_links: Also fetch ``BODY[]``, the whole raw message,
+                in the same FETCH, and return its ``links``
+                (``links.links_from_source``, as the AppleScript path
+                does with ``source of``). ``BODY[TEXT]`` alone lacks the
+                headers that say how the body is structured and encoded.
 
         Returns:
             Dict with the same keys as the AppleScript ``get_message``
@@ -731,6 +738,8 @@ class ImapConnector:
             fetch_keys.append(b"BODY[HEADER]")
         if include_attachments:
             fetch_keys.append(b"BODYSTRUCTURE")
+        if include_links:
+            fetch_keys.append(b"BODY[]")
 
         with self._session() as client:
             client.select_folder(mailbox, readonly=True)
@@ -757,6 +766,13 @@ class ImapConnector:
                 result["attachments"] = _bodystructure_extract_attachments(
                     entry.get(b"BODYSTRUCTURE")
                 )
+            if include_links:
+                links, warnings = links_from_source(
+                    bytes(entry.get(b"BODY[]") or b""), message_id=result["id"]
+                )
+                result["links"] = links
+                if warnings:
+                    result["warnings"] = warnings
             return result
 
     def get_attachments(
