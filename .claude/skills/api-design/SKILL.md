@@ -83,7 +83,7 @@ def list_mailboxes():
 1. Verify it doesn't fit in an existing tool (run through decision tree above)
 2. Write unit tests (mock AppleScript)
 3. Write integration tests (real Mail.app)
-4. Implement in `mail_connector.py`
+4. Implement in the connector: `mail_connector.py`, or the `connector_*.py` module of its domain, with its AppleScript built in a script module (`script_blocks.py` and the others `scripts/check_applescript_safety.sh` lists)
 5. Expose it as a tool in its domain's module under `src/apple_mail_mcp/tools/`
 6. Run `./scripts/check_client_server_parity.sh`
 7. Update `docs/reference/TOOLS.md`

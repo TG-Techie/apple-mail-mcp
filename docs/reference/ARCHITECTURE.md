@@ -14,8 +14,8 @@ server.py (FastMCP) + tools/
   |-- Error wrapping (exceptions -> dicts)
         |
         v
-mail_connector.py (AppleMailConnector)
-  |-- AppleScript generation
+mail_connector.py (AppleMailConnector, over connector_compose, connector_rules and connector_base)
+  |-- AppleScript generation (script_blocks, search_script, compose_script, rule_script)
   |-- subprocess.run(["osascript", "-"])
   |-- Output parsing (JSON via ASObjC NSJSONSerialization)
   |-- Error routing (stderr -> typed exceptions)
@@ -101,7 +101,10 @@ operation log become fleet-wide.
 | `tools/templates.py` | The template tools over `TemplateStore` | `server`, `security`, `templates` |
 | `tools/drafts.py` | The draft tools, `draft_create` to `draft_send`; a rebuild takes the caller's own part from the seed record | `server`, `drafts`, `security`, `exceptions`, `tools.send`, `tools.templates` |
 | `tools/send.py` | `email_send_html`, and the gates it shares with `draft_send`: the outbound allowlist, the user's confirmation, the checks on files to attach | `server`, `outbound_allowlist`, `security`, `exceptions` |
-| `mail_connector.py` | The execution of AppleScript and the operations built on it (`AppleMailConnector`); dispatches to the IMAP fast path for a few bulk ops; records every compose window it opens in the compose ledger, including one Mail opened without its opening script reporting it, and runs a tending pass (`tend_compose_windows`) that closes windows by Mail's id | `compose_clock`, `compose_ledger`, `compose_script`, `compose_tending`, `compose_window`, `drafts`, `imap_connector`, `keychain`, `mail_lock`, `outbound_allowlist`, `rule_script`, `script_blocks`, `search_script`, `utils`, `exceptions` |
+| `mail_connector.py` | `AppleMailConnector`, the one public surface over Mail: search, read, thread, attachments, mailboxes, and the IMAP fast paths and their breaker; inherits the three classes below; dispatches to the IMAP fast path for a few bulk ops; records every compose window it opens in the compose ledger, including one Mail opened without its opening script reporting it, and runs a tending pass (`tend_compose_windows`) that closes windows by Mail's id | `connector_compose`, `connector_rules`, `imap_connector`, `keychain`, `script_blocks`, `search_script`, `utils`, `exceptions` |
+| `connector_base.py` | `ConnectorBase`, what the connector stands on: the timeouts, the compose ledger and clock, the IMAP pool and breaker state, the Mail lock, the one runner every script goes through (`_run_applescript`, which maps stderr to typed exceptions), and the account lookups | `compose_clock`, `compose_ledger`, `imap_connector`, `mail_lock`, `script_blocks`, `utils`, `exceptions` |
+| `connector_compose.py` | `ComposeConnector`: drafts, sends, the compose windows they open and record in the ledger (including one Mail opened without its script reporting it), and the tending pass (`tend_compose_windows`) that closes windows by Mail's id | `connector_base`, `compose_ledger`, `compose_script`, `compose_tending`, `compose_window`, `drafts`, `outbound_allowlist`, `script_blocks`, `utils`, `exceptions` |
+| `connector_rules.py` | `RulesConnector`: list, create, update and delete Mail rules | `connector_base`, `rule_script`, `script_blocks`, `utils`, `exceptions` |
 | `script_blocks.py` | The AppleScript fragments several scripts share: the JSON wrapper, the bulk repeat, the attachment walk, the recipient and source reads, and a flag patch's actions. Pure text; none of these touches Mail | `links`, `utils` |
 | `search_script.py` | The script `search_messages` runs, built from its filters, and the constants that tune how it reads | `script_blocks`, `utils` |
 | `compose_script.py` | The AppleScript a composition runs: the compose window's handlers, and the open, creation, paste, send, close, tending-close, read-back and attachment-check scripts and blocks | `utils` |
@@ -127,7 +130,7 @@ operation log become fleet-wide.
 
 ## Design Decisions
 
-**Two-layer separation, plus a narrow IMAP escape hatch:** the server layer, `server.py` and the tool modules under `tools/`, is thin (MCP plumbing: gates, validation, response shape); `mail_connector.py` is thick (domain logic). Business logic never goes in the server layer. A tool module reads the connector as `server.mail` when a tool runs, and another tool module's helpers the same way, through the module (`send.confirm_send`): every tool module loads inside `server`'s own import, so the one imported first is still half-loaded while the rest load. `imap_connector.py` is not a third domain layer — it's a private acceleration path `mail_connector.py` reaches for when it has the credentials, always with an AppleScript fallback.
+**Two-layer separation, plus a narrow IMAP escape hatch:** the server layer, `server.py` and the tool modules under `tools/`, is thin (MCP plumbing: gates, validation, response shape); the connector (`mail_connector.py` and its `connector_*.py` parts) is thick (domain logic). Business logic never goes in the server layer. A tool module reads the connector as `server.mail` when a tool runs, and another tool module's helpers the same way, through the module (`send.confirm_send`): every tool module loads inside `server`'s own import, so the one imported first is still half-loaded while the rest load. `imap_connector.py` is not a third domain layer — it's a private acceleration path `mail_connector.py` reaches for when it has the credentials, always with an AppleScript fallback.
 
 **Single execution point:** All AppleScript runs through `_run_applescript()`. This is the mock boundary for unit tests and the single place where timeout/error handling lives.
 

@@ -181,7 +181,7 @@ server.py + tools/ (FastMCP tools — thin orchestration)
 
 - **server.py** — the FastMCP instance, the connector, confirmation and the error envelope
 - **tools/** — the MCP tools, one module per domain: input validation, gates, response formatting
-- **mail_connector.py** — All AppleScript generation and execution
+- **mail_connector.py** and the modules beside it — `AppleMailConnector`, which runs the AppleScript, and the modules that build it (`script_blocks.py`, `search_script.py`, `compose_script.py`, `rule_script.py`)
 - **security.py** — Input sanitization, audit logging, confirmation flows
 - **utils.py** — Pure functions: escaping, parsing, validation
 - **exceptions.py** — Typed exception hierarchy

@@ -84,7 +84,7 @@ quoted original and a forward's own attachments.
 ## Core Principles
 
 - **TDD always** — RED/GREEN/REFACTOR. Tests before implementation.
-- **Backend + frontend together** — Every feature touches `mail_connector.py` AND its tool module under `tools/`. Verify with `check_client_server_parity.sh`.
+- **Backend + frontend together** — Every feature touches the connector (`mail_connector.py`, or the `connector_*.py` module of its domain) AND its tool module under `tools/`. Verify with `check_client_server_parity.sh`.
 - **Sanitize everything twice** — All user input: `sanitize_input()` then `escape_applescript_string()` before AppleScript.
 - **Structured responses** — Every tool returns `{"success": bool, ...}`. Errors include `error` and `error_type`.
 - **Security checklist per feature** — see [`docs/guides/SECURITY_CHECKLIST.md`](docs/guides/SECURITY_CHECKLIST.md) for the canonical reference (6 concerns: input sanitization, AppleScript escaping, path-traversal-safe name validation, rate limiting, audit logging, the outbound allowlist on every path by which mail leaves). Don't duplicate guidance here; link out instead.
@@ -154,7 +154,7 @@ Load these skills when working in their domains:
 
 ## Key Files
 
-- `src/apple_mail_mcp/mail_connector.py` — Core AppleScript client, the project's largest module (its line count is deliberately not recorded here, for the same reason as the test counts above)
+- `src/apple_mail_mcp/mail_connector.py` — `AppleMailConnector`, the one public surface over Mail: it inherits `ComposeConnector` (`connector_compose.py`: drafts, sends, compose windows and their tending) and `RulesConnector` (`connector_rules.py`), both on `ConnectorBase` (`connector_base.py`: the state, the one runner every script goes through, the Mail lock, accounts); what is left in it is search, read, thread, attachments, mailboxes, and the IMAP fast paths and their breaker. Line counts are deliberately not recorded here, for the same reason as the test counts above. The IMAP names the tests patch (`mail_connector.ImapConnector`, `.get_imap_password`) are looked up in this module, so the methods that use them stay here
 - `src/apple_mail_mcp/script_blocks.py`, `search_script.py`, `compose_script.py` and `rule_script.py` — the AppleScript the connector runs, built as pure text (the shared fragments, the search, a composition, a rule); none of them touches Mail, so tests read their output without a mocked `osascript`
 - `src/apple_mail_mcp/compose_window.py` — a compose window and a sent copy as the connector reads them back, and the checks made on a composition's arguments, recipients and sent copy
 - `src/apple_mail_mcp/server.py` — the FastMCP instance, the connector, confirmation, the error envelope and `main`

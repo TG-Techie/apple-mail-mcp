@@ -127,7 +127,7 @@ def test_mailbox(self, connector, test_account):
 
 ## Hard Rule
 
-**If you wrote or modified AppleScript in `mail_connector.py`, integration tests must cover that operation before merge.**
+**If you wrote or modified AppleScript in the connector (any file `scripts/check_applescript_safety.sh` lists), integration tests must cover that operation before merge.**
 
 This is not optional. This is not "nice to have." Unit tests with mocked `_run_applescript()` give false confidence about AppleScript correctness.
 
