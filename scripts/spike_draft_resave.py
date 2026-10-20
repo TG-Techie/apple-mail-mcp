@@ -61,6 +61,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from apple_mail_mcp.compose_script import as_new_compose_window_block
 from apple_mail_mcp.mail_connector import AppleMailConnector
 from apple_mail_mcp.script_blocks import wrap_as_json_script
 from apple_mail_mcp.utils import escape_applescript_string, parse_applescript_json
@@ -333,7 +334,7 @@ tell application "Mail"
     set theMessage to make new outgoing message with properties {{subject:{_q(subject)}, content:"x", sender:{_q(sender)}, visible:true}}
     make new to recipient at end of to recipients of theMessage with properties {{address:{_q(PROBE_TO)}}}
 end tell
-{connector._as_new_compose_window_block()}
+{as_new_compose_window_block()}
 tell application "Mail"
     set resultData to {{|window|:newName, |before_ids|:beforeIds}}
 end tell

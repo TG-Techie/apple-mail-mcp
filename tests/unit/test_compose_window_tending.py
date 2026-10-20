@@ -25,6 +25,7 @@ from apple_mail_mcp.compose_ledger import (
     WindowRecord,
 )
 from apple_mail_mcp.compose_tending import RECORD_RETENTION_S, TEND_GRACE_S, SightingClock
+from apple_mail_mcp.compose_window import WindowSnapshot
 from apple_mail_mcp.exceptions import (
     MailAppleScriptError,
     MailDraftNotSettledError,
@@ -32,7 +33,7 @@ from apple_mail_mcp.exceptions import (
     MailOutboundDisallowedError,
     MailTimeoutError,
 )
-from apple_mail_mcp.mail_connector import AppleMailConnector, _WindowSnapshot
+from apple_mail_mcp.mail_connector import AppleMailConnector
 
 from .test_mail_connector import _compose_outcomes, _scripted
 
@@ -55,7 +56,7 @@ def connector(ledger: ComposeLedger, clock: ComposeClock) -> AppleMailConnector:
     connector = AppleMailConnector(timeout=30, compose_ledger=ledger, compose_clock=clock)
     # The read of Mail's windows a composition takes before opening its
     # own; TestAWindowTheOpenScriptDidNotReport tests what it is for.
-    connector._mail_window_snapshot = lambda: _WindowSnapshot(PID, frozenset())  # type: ignore[method-assign]
+    connector._mail_window_snapshot = lambda: WindowSnapshot(PID, frozenset())  # type: ignore[method-assign]
     return connector
 
 
@@ -306,7 +307,7 @@ class TestAWindowTheOpenScriptDidNotReport:
     script, and on such a failure each compose window that opened since
     is recorded as left open, for tending to close at once."""
 
-    BEFORE = _WindowSnapshot(mail_pid=PID, window_ids=frozenset({100, 101}))
+    BEFORE = WindowSnapshot(mail_pid=PID, window_ids=frozenset({100, 101}))
 
     @pytest.fixture(autouse=True)
     def snapshot(self, connector: AppleMailConnector) -> None:
@@ -410,7 +411,7 @@ class TestAWindowTheOpenScriptDidNotReport:
         connector = AppleMailConnector(timeout=30, compose_ledger=ComposeLedger(tmp_path / "l"))
         captured = _scripted(connector, [json.dumps({"pid": PID, "ids": [5, 6]})])
         del connector._mail_window_snapshot  # the real one, not _scripted's answer
-        assert connector._mail_window_snapshot() == _WindowSnapshot(PID, frozenset({5, 6}))
+        assert connector._mail_window_snapshot() == WindowSnapshot(PID, frozenset({5, 6}))
         assert "id of every window" in captured[0] and "unix id" in captured[0]
         assert "click" not in captured[0] and "make new" not in captured[0]
 

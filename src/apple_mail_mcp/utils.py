@@ -5,6 +5,7 @@ Utility functions for Apple Mail MCP.
 import json
 import re
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any
 
 # Strict ISO 8601 YYYY-MM-DD: the search's date_from/date_to filters reject
@@ -602,3 +603,36 @@ def safe_attachment_filename(raw: object, fallback: str) -> str:
         return fallback
 
     return candidate
+
+
+def destination_names(
+    attachments: list[dict[str, Any]],
+    selected_zero_based: list[int],
+    save_directory: Path,
+    overwrite: bool,
+) -> list[str]:
+    """What each selected attachment will be called on disk, and that
+    those names are free to take.
+
+    Each declared name is reduced to a safe filename (sender-controlled
+    text never reaches a path expression), the batch is made distinct
+    so two attachments sharing a name land in two files, and unless
+    ``overwrite`` is set every name is checked against the directory
+    before anything is written. Raises ``FileExistsError`` naming the
+    taken files and saying how to replace them.
+    """
+    names = distinct_filenames([
+        safe_attachment_filename(
+            attachments[i].get("name"), f"attachment-{i + 1}"
+        )
+        for i in selected_zero_based
+    ])
+    if overwrite:
+        return names
+    taken = [n for n in names if (save_directory / n).exists()]
+    if taken:
+        raise FileExistsError(
+            "already in the directory: " + ", ".join(taken)
+            + "; nothing was written. Pass overwrite=True to replace it."
+        )
+    return names

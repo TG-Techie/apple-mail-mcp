@@ -14,6 +14,14 @@ import pytest
 from imapclient.exceptions import LoginError
 
 from apple_mail_mcp.compose_ledger import WindowOperation
+from apple_mail_mcp.compose_script import (
+    build_attachment_ax_verify_script,
+    build_paste_script,
+    files_paste_fill,
+    paste_probe_strings,
+    text_paste_fill,
+)
+from apple_mail_mcp.compose_window import ComposeWindow, WindowSnapshot
 from apple_mail_mcp.exceptions import (
     MailAccountNotFoundError,
     MailAppleScriptError,
@@ -28,11 +36,7 @@ from apple_mail_mcp.exceptions import (
     MailOutboundDisallowedError,
     MailTimeoutError,
 )
-from apple_mail_mcp.mail_connector import (
-    AppleMailConnector,
-    _ComposeWindow,
-    _WindowSnapshot,
-)
+from apple_mail_mcp.mail_connector import AppleMailConnector
 from apple_mail_mcp.script_blocks import wrap_as_json_script
 from apple_mail_mcp.utils import SANITIZE_MAX_LENGTH
 
@@ -46,7 +50,7 @@ def _windows_before_compose(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         AppleMailConnector,
         "_mail_window_snapshot",
-        lambda self: _WindowSnapshot(mail_pid=77701, window_ids=frozenset()),
+        lambda self: WindowSnapshot(mail_pid=77701, window_ids=frozenset()),
     )
 
 
@@ -5881,8 +5885,8 @@ class TestComposition:
     ) -> None:
         """Select all, delete, then paste. Pasted above the seed instead,
         the sent message carried an empty <blockquote type="cite">."""
-        script = connector._build_paste_script(
-            window_name="S", fill=connector._text_paste_fill("hi", plain=True),
+        script = build_paste_script(
+            window_name="S", fill=text_paste_fill("hi", plain=True),
             placement="replace", undo_first=False,
         )
         select_at = script.index('keystroke "a" using command down')
@@ -5896,8 +5900,8 @@ class TestComposition:
     ) -> None:
         """A reply's quote and a forward's attachments live in the body:
         a select-all or a delete there would take them."""
-        script = connector._build_paste_script(
-            window_name="S", fill=connector._text_paste_fill("<p>hi</p>", plain=False),
+        script = build_paste_script(
+            window_name="S", fill=text_paste_fill("<p>hi</p>", plain=False),
             placement="above", undo_first=False,
         )
         assert "key code 126 using command down" in script
@@ -5910,8 +5914,8 @@ class TestComposition:
     ) -> None:
         f = tmp_path / "report.pdf"
         f.write_bytes(b"%PDF")
-        script = connector._build_paste_script(
-            window_name="S", fill=connector._files_paste_fill([f]),
+        script = build_paste_script(
+            window_name="S", fill=files_paste_fill([f]),
             placement="end", undo_first=False,
         )
         assert "writeObjects:fileURLs" in script
@@ -5931,7 +5935,7 @@ class TestComposition:
         )
         with pytest.raises(MailAppleScriptError, match="PASTE_FOCUS_FAILED"):
             connector._paste_attachments(
-                _ComposeWindow(
+                ComposeWindow(
                     name="S", subject="S", to=[], cc=[], bcc=[], before_ids=[],
                     window_id=2781,
                 ),
@@ -7192,12 +7196,12 @@ class TestCreateDraft:
     def test_plain_paste_probes_look_for_the_text_itself(self) -> None:
         """A plain note is read back as the text it is. Angle brackets in
         it are text, not a sign the paste degraded to raw source."""
-        snippet, raw = AppleMailConnector._paste_probe_strings(
+        snippet, raw = paste_probe_strings(
             "<see> the  attached & more", plain=True
         )
         assert snippet == "<see> the attached & mor"
         assert raw == ""
-        html_snippet, html_raw = AppleMailConnector._paste_probe_strings(
+        html_snippet, html_raw = paste_probe_strings(
             "<p>hi <b>there</b></p>"
         )
         assert html_snippet == "hi there"
@@ -7909,7 +7913,7 @@ def _compose_outcomes(
     id."""
     outcomes = [_compose_meta(window)]
     if seed == "new" or body:
-        snippet, _ = AppleMailConnector._paste_probe_strings(body, plain=plain)
+        snippet, _ = paste_probe_strings(body, plain=plain)
         outcomes += ["PASTED_UNVERIFIED", f"pad {snippet} pad"]
     if file_names:
         outcomes += ["PASTED_UNVERIFIED", "ATTACHMENTS_VERIFIED"]
@@ -7924,7 +7928,7 @@ def _snapshot_before_compose(connector: AppleMailConnector) -> None:
     """Answer the read of Mail's windows a composition takes before it
     opens its own (``_mail_window_snapshot``) with no windows, so a test's
     scripted outcomes start at the opening script."""
-    connector._mail_window_snapshot = lambda: _WindowSnapshot(  # type: ignore[method-assign]
+    connector._mail_window_snapshot = lambda: WindowSnapshot(  # type: ignore[method-assign]
         mail_pid=77701, window_ids=frozenset()
     )
 
@@ -8282,7 +8286,7 @@ class TestSendHtmlWithAttachments:
         check matching only AXButton refused every image. What an image
         looks like live is covered by test_loopback.py; here, that the
         script accepts either role for a description naming the file."""
-        script = AppleMailConnector._build_attachment_ax_verify_script(
+        script = build_attachment_ax_verify_script(
             window_name="w", filenames=["probe.png"],
         )
         assert (
@@ -8790,14 +8794,14 @@ class TestVerifiedSendPrimitives:
         assert all("click sendBtn" not in s for s in captured)
 
     def test_paste_probe_strings(self) -> None:
-        snippet, raw = AppleMailConnector._paste_probe_strings(
+        snippet, raw = paste_probe_strings(
             "<p>Hello <b>world</b> of probes</p>"
         )
         assert snippet.startswith("Hello world")
         assert "<" not in snippet
         assert raw.startswith("<p>Hello ") and len(raw) == 16
         # Text-led body: no raw marker (nothing tag-like to detect).
-        _, raw2 = AppleMailConnector._paste_probe_strings("plain text body")
+        _, raw2 = paste_probe_strings("plain text body")
         assert raw2 == ""
 
     # -- clipboard restore must survive AppleScript errors -----------------

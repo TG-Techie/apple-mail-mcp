@@ -3,18 +3,16 @@ AppleScript-based connector for Apple Mail.
 """
 
 import logging
-import re
 import subprocess
 import time
 import warnings
-from collections import Counter
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from datetime import date as _date
 from email.utils import parseaddr
 from pathlib import Path
-from typing import IO, Any, Literal, cast
+from typing import IO, Any, cast
 
 from imapclient.exceptions import IMAPClientError, LoginError
 
@@ -22,11 +20,27 @@ from . import mail_lock
 from .compose_clock import ComposeClock
 from .compose_ledger import (
     Closed,
-    Closer,
     ComposeLedger,
     LeftOpen,
     Seed,
     WindowOperation,
+)
+from .compose_script import (
+    CLOSE_FAILED,
+    WINDOW_HANDLERS,
+    CloseMode,
+    PastePlacement,
+    as_close_compose_block,
+    as_new_compose_window_block,
+    as_verified_send_block,
+    build_attachment_ax_verify_script,
+    build_creation_block,
+    build_paste_script,
+    build_readback_script,
+    files_paste_fill,
+    paste_probe_strings,
+    recipient_override_block,
+    text_paste_fill,
 )
 from .compose_tending import (
     RECORD_RETENTION_S,
@@ -38,6 +52,23 @@ from .compose_tending import (
     TendRule,
     inventory_from_report,
     plan_tending,
+)
+from .compose_window import (
+    ENDING_MAILBOX,
+    ComposeWindow,
+    SentMessageCopy,
+    SentMessageCopyUnidentified,
+    WindowSnapshot,
+    check_sent_attachments,
+    closing_of,
+    compose_window_from_report,
+    composition_closing,
+    existing_files,
+    gate_compose_recipients,
+    gate_named_recipients,
+    refuse_overlong_body,
+    sent_result,
+    validate_compose_args,
 )
 from .drafts import _validate_draft_id
 from .exceptions import (
@@ -57,7 +88,6 @@ from .exceptions import (
     MailMailboxNotFoundError,
     MailMessageNotFoundError,
     MailOutboundDisallowedError,
-    MailRuleChangedError,
     MailRuleNotFoundError,
     MailTimeoutError,
     MailUnsupportedGmailSystemLabelError,
@@ -66,13 +96,22 @@ from .exceptions import (
 from .imap_connector import ImapConnectionPool, ImapConnector
 from .keychain import get_imap_password
 from .outbound_allowlist import (
-    assert_forward_targets_allowed,
     assert_recipients_allowed_for_send,
+)
+from .rule_script import (
+    RULE_FIELD_MAP,
+    RULE_OPERATOR_MAP,
+    build_action_lines,
+    guarded_rule_mutation,
+    raise_if_rule_changed,
+    validate_rule_actions,
+    validate_rule_condition,
 )
 from .script_blocks import (
     RECIPIENT_FIELDS,
     SOURCE_FIELDS,
     attachment_walk_block,
+    build_flag_actions,
     bulk_repeat_block,
     recipient_read_block,
     render_recipients,
@@ -85,15 +124,11 @@ from .search_script import (
     search_script_body,
 )
 from .utils import (
-    SANITIZE_MAX_LENGTH,
     applescript_account_clause,
-    distinct_filenames,
+    destination_names,
     escape_applescript_string,
-    get_flag_index,
     parse_applescript_json,
-    safe_attachment_filename,
     sanitize_input,
-    validate_email,
 )
 
 # Exception classes that trigger AppleScript fallback per the graceful-
@@ -120,37 +155,7 @@ logger = logging.getLogger(__name__)
 # AppleScript fallback against a mailbox where IMAP would help.
 _SLOW_SEARCH_THRESHOLD_SEC = 5.0
 
-# One-character body seed for a compose window made by `make new
-# outgoing message`. Such a window with an EMPTY body had a WebArea that
-# refused keyboard focus by every route tried (observed 2026-09-05; not
-# reproduced since, see docs/research/paste-focus-failed.md, so it
-# stays). The seed reaches neither a sent message nor a saved draft: the
-# composition selects the whole body of a fresh message and deletes it
-# before pasting (``_PASTE_CARET_KEYS["replace"]``), empty body or not,
-# because Mail keeps anything set through ``content`` inside a
-# <blockquote type="cite">.
-_BODY_SEED = " "
 
-# Where a clipboard paste lands in a compose window's body, as the keys
-# pressed just before cmd+v. Measured through the loopback read-back on
-# 2026-09-27 (docs/research/icloud-draft-resync.md, Observation 10):
-#   above   - cmd+up: above what Mail wrote (a reply's quote, a forward's
-#             header block and attachments), which stays as Mail made it.
-#   replace - cmd+a, delete: the whole body. On a fresh message that is
-#             the seed inside Mail's URLShare wrapper; pasting above it
-#             instead sent an empty <blockquote type="cite">, which iOS
-#             Mail draws as a purple quoted-reply bar.
-#   end     - cmd+down: after everything, where the composition pastes
-#             files once the body is in.
-_PastePlacement = Literal["above", "replace", "end"]
-_PASTE_CARET_KEYS: dict[_PastePlacement, str] = {
-    "above": "key code 126 using command down\n            delay 0.2",
-    "replace": (
-        'keystroke "a" using command down\n            delay 0.3\n'
-        "            key code 51\n            delay 0.3"
-    ),
-    "end": "key code 125 using command down\n            delay 0.2",
-}
 
 
 # -- addressing one compose window ------------------------------------------
@@ -165,298 +170,23 @@ _PASTE_CARET_KEYS: dict[_PastePlacement, str] = {
 # one Mail process, and its ``bounds`` start where System Events'
 # ``position`` puts the window (Observation 3), which ties the two.
 
-_CloseMode = Literal["save", "discard"]
-_CLOSE_FAILED: dict[_CloseMode, str] = {
-    "save": "SALVAGE_FAILED:",
-    "discard": "DISCARD_FAILED:",
-}
-
-# How deep a compose body is read below its WebArea. A deeper element is
-# not read, and the body counts as content (not provably empty).
-_BODY_LEVELS = 8
-_BODY_PATH = "UI element k of scroll area 1 of group 1 of group 1 of window i"
 
 
-def _body_level_lines() -> str:
-    """One bulk read of roles and of values per level of the body, each
-    written out from ``window i``, stopping at the first level with no
-    element."""
-    lines = []
-    for level in range(1, _BODY_LEVELS + 1):
-        path = "UI elements of " * level + _BODY_PATH
-        lines.append(
-            f"                set r to role of {path}\n"
-            "                set end of levelRoles to r\n"
-            f"                set end of levelValues to (value of {path})\n"
-            "                if my tendLeafCount(r) is 0 then "
-            "return my tendBodyResult(levelRoles, levelValues, false)"
-        )
-    return "\n".join(lines)
 
 
-# Handlers the scripts that read or close compose windows share.
-# Top-level AppleScript, so each script carries them after its own code.
-_WINDOW_HANDLERS = (
-    """
-on tendIsBlank(t)
-    repeat with ch in (characters of t)
-        if (id of ch) is not in {32, 9, 10, 13, 160} then return false
-    end repeat
-    return true
-end tendIsBlank
-
--- Whether System Events' window i of Mail is a compose window: its
--- toolbar has a Send button.
-on tendIsCompose(i)
-    tell application "System Events"
-        tell application process "Mail"
-            try
-                return exists (first button of (first toolbar of window i) whose description is "Send")
-            end try
-        end tell
-    end tell
-    return false
-end tendIsCompose
-
--- The text-field values (To, Cc, any other header shown, Subject) of
--- window i, each read as text.
-on tendFieldValues(i)
-    tell application "System Events"
-        tell application process "Mail"
-            set roles to role of UI elements of window i
-            set vals to value of UI elements of window i
-        end tell
-    end tell
-    set fieldValues to {}
-    repeat with j from 1 to (count of roles)
-        if item j of roles is "AXTextField" then
-            set v to item j of vals
-            if v is missing value then set v to ""
-            set end of fieldValues to (v as text)
-        end if
-    end repeat
-    return fieldValues
-end tendFieldValues
-
--- How many elements a nested read holds.
-on tendLeafCount(x)
-    if class of x is not list then return 1
-    set n to 0
-    repeat with y in x
-        set n to n + (my tendLeafCount(contents of y))
-    end repeat
-    return n
-end tendLeafCount
-
--- Whether one level of a body read holds anything but blank text and
--- groups: text, an attachment's button or image, or any other element.
-on tendHasContent(rs, vs)
-    if class of rs is list then
-        repeat with j from 1 to (count of rs)
-            set v to missing value
-            if class of vs is list then
-                if j is less than or equal to (count of vs) then set v to item j of vs
-            end if
-            if my tendHasContent(item j of rs, v) then return true
-        end repeat
-        return false
-    end if
-    if rs is "AXGroup" then return false
-    if rs is "AXStaticText" then
-        if vs is missing value then return false
-        return not my tendIsBlank(vs as text)
-    end if
-    return true
-end tendHasContent
-
--- "empty" when the levels read hold nothing but blank text and groups,
--- and the last held no element; otherwise "content". With the roles and
--- values read, level by level, for the caller's fingerprint.
-on tendBodyResult(levelRoles, levelValues, truncated)
-    set verdict to "empty"
-    if truncated then set verdict to "content"
-    repeat with L from 1 to (count of levelRoles)
-        if my tendHasContent(item L of levelRoles, item L of levelValues) then set verdict to "content"
-    end repeat
-    return {bodyState:verdict, bodyRoles:levelRoles, bodyValues:levelValues}
-end tendBodyResult
-
--- Window i's body, read below its WebArea; "unreadable" when the
--- WebArea cannot be found.
-on tendBodyRead(i)
-    set levelRoles to {}
-    set levelValues to {}
-    try
-        tell application "System Events"
-            tell application process "Mail"
-                set saRoles to role of UI elements of scroll area 1 of group 1 of group 1 of window i
-                set k to 0
-                repeat with j from 1 to (count of saRoles)
-                    if item j of saRoles is "AXWebArea" then
-                        set k to j
-                        exit repeat
-                    end if
-                end repeat
-                if k is 0 then return {bodyState:"unreadable", bodyRoles:{}, bodyValues:{}}
-"""
-    + _body_level_lines()
-    + """
-            end tell
-        end tell
-    on error
-        return {bodyState:"unreadable", bodyRoles:{}, bodyValues:{}}
-    end try
-    return my tendBodyResult(levelRoles, levelValues, true)
-end tendBodyRead
-
--- The index of the one window System Events lists with this name at
--- this position; 0 when none is, -1 when more than one is.
-on tendIndexOf(nm, pos)
-    tell application "System Events"
-        tell application process "Mail"
-            set allNames to name of windows
-            set allPos to position of windows
-        end tell
-    end tell
-    set found to 0
-    repeat with j from 1 to (count of allNames)
-        if (item j of allNames) is nm and (item j of allPos) is pos then
-            if found is not 0 then return -1
-            set found to j
-        end if
-    end repeat
-    return found
-end tendIndexOf
-
--- Click window i's close button, found by its subrole (`button 1` is
--- "add contacts" on a compose window). False when it has none.
-on tendClickClose(i)
-    tell application "System Events"
-        tell application process "Mail"
-            set subroles to subrole of buttons of window i
-            repeat with k from 1 to (count of subroles)
-                if item k of subroles is "AXCloseButton" then
-                    click button k of window i
-                    return true
-                end if
-            end repeat
-        end tell
-    end tell
-    return false
-end tendClickClose
-
--- Whether the window is gone: Mail's window wid, or, with no id, the
--- one window named nm.
-on tendGone(wid, nm, pos)
-    -- Mail can keep a window it closed in its list, neither visible nor
-    -- miniaturized (a minimized one is miniaturized), long after System
-    -- Events stops listing it (Observation 10). Closed: not listed, or
-    -- listed so and no longer in System Events at its place.
-    if wid is not 0 then
-        tell application "Mail"
-            if not (exists window id wid) then return true
-            if (visible of window id wid) or (miniaturized of window id wid) then return false
-        end tell
-        return (my tendIndexOf(nm, pos)) is 0
-    end if
-    tell application "System Events"
-        tell application process "Mail"
-            return not (exists window nm)
-        end tell
-    end tell
-end tendGone
-"""
-)
 
 
-@dataclass(frozen=True)
-class _WindowSnapshot:
-    """Mail's process and the ids of its windows, read before a compose
-    window is opened, so a window that opens without its opening script
-    reporting it can still be told apart (``_adopt_unreported_windows``)."""
-
-    mail_pid: int
-    window_ids: frozenset[int]
 
 
-def _refuse_overlong_body(body: str) -> None:
-    """Refuse a caller's message body longer than ``sanitize_input``
-    carries. Every body reaches Mail's pasteboard through it, and it cuts
-    at SANITIZE_MAX_LENGTH without a word, so a longer body would go out
-    or be saved shortened. Called where a body enters the connector
-    (``create_draft``, ``_send_html_email``), before anything is looked
-    up or composed."""
-    if len(body) > SANITIZE_MAX_LENGTH:
-        raise ValueError(
-            f"body is {len(body)} characters; a message body carries at "
-            f"most {SANITIZE_MAX_LENGTH}. Nothing was composed, saved or "
-            "sent."
-        )
 
 
-def _existing_files(attachment_paths: list[Path] | None) -> list[Path]:
-    """The files a caller asked to attach, each checked to exist before
-    anything is composed; ``FileNotFoundError`` names the first that
-    does not."""
-    files = [Path(p) for p in attachment_paths or []]
-    for f in files:
-        if not f.is_file():
-            raise FileNotFoundError(f"attachment not found: {f}")
-    return files
 
 
-# The mailbox a composition's ending is looked up in: the draft a save
-# made, or the copy a send filed. Its ids are taken before the window
-# opens, and the ending is the entry with the window's subject whose id
-# was not among them. The subject alone matched an older message of the
-# same subject: a send's files were checked on a Sent copy sent hours
-# before, and reported missing from a message that carried them.
-_ENDING_MAILBOX: dict[WindowOperation, str] = {
-    "save": "drafts mailbox",
-    "send": "sent mailbox",
-}
 
 
-@dataclass(frozen=True)
-class _ComposeWindow:
-    """An open compose window, as the composition's opening script
-    reports it: the window's name, the subject and recipients Mail holds
-    for its message after every override, and the ids of the mailbox its
-    ending is looked up in as they were before it opened (Drafts for a
-    save, Sent for a send; ``_ENDING_MAILBOX``). Then what identifies it
-    to the compose ledger: Mail's id for the window and Mail's process
-    id (None when Mail did not say), and the ledger record it was entered
-    under (None when the ledger could not be written)."""
-
-    name: str
-    subject: str
-    to: list[str]
-    cc: list[str]
-    bcc: list[str]
-    before_ids: list[int]
-    window_id: int | None = None
-    mail_pid: int | None = None
-    record_id: str | None = None
 
 
-def _compose_window_from_report(report: dict[str, Any]) -> _ComposeWindow:
-    """The opening script's ``resultData`` as a ``_ComposeWindow``; Mail's
-    ``missing value`` groups arrive as empty lists, and an id of 0 is no
-    id."""
-    groups = {
-        group: [str(a) for a in report.get(group) or []]
-        for group in ("to", "cc", "bcc")
-    }
-    return _ComposeWindow(
-        name=str(report["window"]),
-        subject=str(report["subject"]),
-        to=groups["to"],
-        cc=groups["cc"],
-        bcc=groups["bcc"],
-        before_ids=[int(i) for i in report.get("before_ids") or []],
-        window_id=int(report.get("window_id") or 0) or None,
-        mail_pid=int(report.get("mail_pid") or 0) or None,
-    )
+
 
 
 # What a send Mail accepted finds of the copy it filed in Sent. Exactly
@@ -468,104 +198,17 @@ def _compose_window_from_report(report: dict[str, Any]) -> _ComposeWindow:
 # has no files to be missing, and an id is never returned unverified.
 
 
-@dataclass(frozen=True)
-class _SentCopy:
-    """The copy a send filed in Sent: the one message in Sent with the
-    window's subject whose id was not there before the window opened.
-    ``rfc_message_id`` is bare, as the read tools emit it."""
-
-    mail_id: str
-    rfc_message_id: str
-    attachment_names: tuple[str, ...]
 
 
-@dataclass(frozen=True)
-class _SentCopyUnidentified:
-    """A send whose copy in Sent could not be told: none appeared in time,
-    more than one did, or looking failed; ``why`` says which. Mail accepted
-    the message either way: the verified send saw its window close after
-    Send with no sheet on it. Nothing after that has been seen of it."""
-
-    why: str
 
 
-def _sent_result(
-    copy: _SentCopy | _SentCopyUnidentified, *, files_pasted: bool
-) -> dict[str, Any]:
-    """What a send Mail accepted returns: the copy's Mail id, which
-    ``get_messages`` takes, and its RFC Message-ID; or, for a copy not
-    identified, no id and one warning saying why, and that the files,
-    when there were any, are unverified rather than missing."""
-    if isinstance(copy, _SentCopy):
-        return {
-            "draft_id": "",
-            "sent_message_id": copy.mail_id,
-            "sent_rfc_message_id": copy.rfc_message_id,
-        }
-    unverified = (
-        ", and the files it was sent with are unverified" if files_pasted else ""
-    )
-    return {
-        "draft_id": "",
-        "sent_message_id": "",
-        "sent_rfc_message_id": "",
-        "warnings": [
-            "Mail accepted the message (its compose window closed after "
-            "Send, with no sheet), but its copy in Sent could not be "
-            f"identified: {copy.why}. No id is returned{unverified}; look "
-            "in Sent and in Mail's Outbox before sending it again."
-        ],
-    }
 
 
-def _closing_of(raw: str, *, by: Closer, at: float) -> Closed | None:
-    """How a salvage's or a discard's outcome ended its window: "SALVAGED"
-    (with any note after it), "DISCARDED", or "NO_WINDOW" (it was gone
-    when the close came). None for anything else: the close failed, and
-    the window may still be open."""
-    if raw.startswith("SALVAGED"):
-        return Closed(how="salvaged", by=by, at=at)
-    if raw == "DISCARDED":
-        return Closed(how="discarded", by=by, at=at)
-    if raw == "NO_WINDOW":
-        return Closed(how="gone", by=by, at=at)
-    return None
 
 
-def _composition_closing(raw: str, *, failure: str) -> LeftOpen | Closed:
-    """How a composition's window ended, by what its own salvage or
-    discard reported; a close that failed leaves it open, with
-    ``failure``."""
-    now = time.time()
-    closed = _closing_of(raw, by="composition", at=now)
-    return closed if closed is not None else LeftOpen(failure=failure, at=now)
 
 
-# MCP-tool field name → Mail.app AppleScript `rule type` enum identifier.
-# Verified against Mail.app's running rules: 'from header', 'subject header',
-# 'message content' all confirmed live. Other values follow the same naming
-# convention per Mail.app's AppleScript dictionary; verified via integration
-# test on live rule creation.
-_RULE_FIELD_MAP = {
-    "from": "from header",
-    "to": "to header",
-    "subject": "subject header",
-    "body": "message content",
-    "any_recipient": "any recipient",
-    "header_name": "header key",
-}
 
-# MCP-tool operator name → Mail.app AppleScript `qualifier` enum identifier.
-# 'does contain value', 'equal to value', 'begins with value' verified live
-# against the user's existing rules. Others follow Mail.app's documented
-# naming.
-_RULE_OPERATOR_MAP = {
-    "contains": "does contain value",
-    "does_not_contain": "does not contain value",
-    "begins_with": "begins with value",
-    "ends_with": "ends with value",
-    "equals": "equal to value",
-}
 
 
 
@@ -947,134 +590,8 @@ class AppleMailConnector:
         result = self._run_applescript(script)
         return cast(list[dict[str, Any]], parse_applescript_json(result))
 
-    def _validate_rule_condition(self, cond: dict[str, Any]) -> None:
-        """Validate a single RuleCondition dict.
 
-        Required keys: field (in _RULE_FIELD_MAP), operator (in
-        _RULE_OPERATOR_MAP), value (non-empty str). header_name required
-        iff field == 'header_name'.
-        """
-        if "field" not in cond or cond["field"] not in _RULE_FIELD_MAP:
-            raise ValueError(
-                f"condition.field must be one of {sorted(_RULE_FIELD_MAP)}, "
-                f"got {cond.get('field')!r}"
-            )
-        if (
-            "operator" not in cond
-            or cond["operator"] not in _RULE_OPERATOR_MAP
-        ):
-            raise ValueError(
-                f"condition.operator must be one of "
-                f"{sorted(_RULE_OPERATOR_MAP)}, got {cond.get('operator')!r}"
-            )
-        if not cond.get("value") or not isinstance(cond["value"], str):
-            raise ValueError("condition.value must be a non-empty string")
-        if cond["field"] == "header_name":
-            if not cond.get("header_name"):
-                raise ValueError(
-                    "condition.header_name is required when field is "
-                    "'header_name'"
-                )
 
-    def _validate_rule_actions(self, actions: dict[str, Any]) -> None:
-        """Validate a RuleActions dict has at least one meaningful entry,
-        flag_color (if any) is valid, and forward_to emails are valid and
-        on the outbound allowlist.
-
-        A forwarding rule is a standing send, and this is the one place
-        both create_rule and update_rule pass through before any
-        AppleScript runs, so the allowlist gate sits here: a refused
-        rule touches nothing in Mail. Raises MailOutboundDisallowedError
-        (or OutboundAllowlistUnavailableError, fail closed) for the
-        forward_to that the policy does not admit."""
-        meaningful_keys = {
-            "move_to", "copy_to", "mark_read", "mark_flagged",
-            "delete", "forward_to",
-        }
-        # Strip falsy bools / empty containers — they're no-ops, not actions.
-        active = {
-            k: v for k, v in actions.items()
-            if k in meaningful_keys and v
-        }
-        if not active:
-            raise ValueError(
-                "actions must include at least one of "
-                f"{sorted(meaningful_keys)} with a truthy value"
-            )
-        if "flag_color" in actions and actions["flag_color"]:
-            # get_flag_index raises ValueError on bad input.
-            get_flag_index(actions["flag_color"])
-        if active.get("forward_to"):
-            for addr in active["forward_to"]:
-                if not isinstance(addr, str) or not validate_email(addr):
-                    raise ValueError(
-                        f"forward_to entries must be valid email "
-                        f"addresses; got {addr!r}"
-                    )
-            assert_forward_targets_allowed(active["forward_to"])
-        for mb_key in ("move_to", "copy_to"):
-            if mb_key in active:
-                ref = active[mb_key]
-                if (
-                    not isinstance(ref, dict)
-                    or not ref.get("account")
-                    or not ref.get("mailbox")
-                ):
-                    raise ValueError(
-                        f"actions.{mb_key} must be a dict with "
-                        f"'account' and 'mailbox' keys, got {ref!r}"
-                    )
-
-    def _build_action_lines(self, actions: dict[str, Any]) -> list[str]:
-        """Translate a validated RuleActions dict into AppleScript lines.
-
-        Each line operates on a variable named ``newRule`` (or ``r`` for
-        update_rule's reuse). Caller picks the target variable name and
-        substitutes.
-        """
-        lines: list[str] = []
-        if actions.get("move_to"):
-            mb_safe = escape_applescript_string(
-                sanitize_input(actions["move_to"]["mailbox"])
-            )
-            acct_clause = applescript_account_clause(
-                actions["move_to"]["account"]
-            )
-            lines.append("set should move message of newRule to true")
-            lines.append(
-                f'set move message of newRule to mailbox "{mb_safe}" '
-                f"of {acct_clause}"
-            )
-        if actions.get("copy_to"):
-            mb_safe = escape_applescript_string(
-                sanitize_input(actions["copy_to"]["mailbox"])
-            )
-            acct_clause = applescript_account_clause(
-                actions["copy_to"]["account"]
-            )
-            lines.append("set should copy message of newRule to true")
-            lines.append(
-                f'set copy message of newRule to mailbox "{mb_safe}" '
-                f"of {acct_clause}"
-            )
-        if actions.get("mark_read"):
-            lines.append("set mark read of newRule to true")
-        if actions.get("mark_flagged"):
-            lines.append("set mark flagged of newRule to true")
-            if actions.get("flag_color"):
-                idx = get_flag_index(actions["flag_color"])
-                lines.append(
-                    f"set mark flag index of newRule to {idx}"
-                )
-        if actions.get("delete"):
-            lines.append("set delete message of newRule to true")
-        if actions.get("forward_to"):
-            recipients = ", ".join(actions["forward_to"])
-            recipients_safe = escape_applescript_string(recipients)
-            lines.append(
-                f'set forward message of newRule to "{recipients_safe}"'
-            )
-        return lines
 
     def create_rule(
         self,
@@ -1113,8 +630,8 @@ class AppleMailConnector:
                 f"match_logic must be 'all' or 'any', got {match_logic!r}"
             )
         for cond in conditions:
-            self._validate_rule_condition(cond)
-        self._validate_rule_actions(actions)
+            validate_rule_condition(cond)
+        validate_rule_actions(actions)
 
         name_safe = escape_applescript_string(sanitize_input(name))
         all_conditions = "true" if match_logic == "all" else "false"
@@ -1122,8 +639,8 @@ class AppleMailConnector:
 
         condition_lines: list[str] = []
         for cond in conditions:
-            rule_type = _RULE_FIELD_MAP[cond["field"]]
-            qualifier = _RULE_OPERATOR_MAP[cond["operator"]]
+            rule_type = RULE_FIELD_MAP[cond["field"]]
+            qualifier = RULE_OPERATOR_MAP[cond["operator"]]
             expr_safe = escape_applescript_string(
                 sanitize_input(cond["value"])
             )
@@ -1145,7 +662,7 @@ class AppleMailConnector:
                     f"at end of rule conditions of newRule"
                 )
 
-        action_lines = self._build_action_lines(actions)
+        action_lines = build_action_lines(actions)
 
         body = (
             f'set newRule to make new rule with properties '
@@ -1229,7 +746,7 @@ class AppleMailConnector:
                 "conditions, delete the rule and recreate it with create_rule."
             )
         if actions is not None:
-            self._validate_rule_actions(actions)
+            validate_rule_actions(actions)
         if name is not None and (not isinstance(name, str) or not name):
             raise ValueError("name, if provided, must be a non-empty string")
 
@@ -1264,7 +781,7 @@ class AppleMailConnector:
                 'if forward message of newRule is not "" then '
                 'set forward message of newRule to ""',
             ])
-            body_parts.extend(self._build_action_lines(actions))
+            body_parts.extend(build_action_lines(actions))
         # `enabled` must come AFTER the action-reset block: setting enabled
         # before resets causes the reset to silently revert it (Tahoe quirk).
         if enabled is not None:
@@ -1280,12 +797,12 @@ class AppleMailConnector:
         if len(body_parts) == 1:
             # Only the rule lookup, no actual updates — caller passed nothing.
             return
-        tell_body = self._guarded_rule_mutation(rule_index, expected_name, body_parts)
+        tell_body = guarded_rule_mutation(rule_index, expected_name, body_parts)
         script = wrap_as_json_script(tell_body, timeout=self.timeout)
         outcome = cast(
             dict[str, Any], parse_applescript_json(self._run_applescript(script))
         )
-        self._raise_if_rule_changed(rule_index, expected_name, outcome)
+        raise_if_rule_changed(rule_index, expected_name, outcome)
 
     def _check_supported_actions(self, rule_index: int) -> None:
         """Verify a rule's existing actions are all in our schema.
@@ -1370,62 +887,17 @@ class AppleMailConnector:
             raise MailRuleNotFoundError(
                 f"rule_index must be 1-based and positive, got {rule_index}"
             )
-        tell_body = self._guarded_rule_mutation(
+        tell_body = guarded_rule_mutation(
             rule_index, expected_name, [f"delete rule {rule_index}"]
         )
         script = wrap_as_json_script(tell_body, timeout=self.timeout)
         outcome = cast(
             dict[str, Any], parse_applescript_json(self._run_applescript(script))
         )
-        self._raise_if_rule_changed(rule_index, expected_name, outcome)
+        raise_if_rule_changed(rule_index, expected_name, outcome)
         return cast(str, outcome["name"])
 
-    @staticmethod
-    def _guarded_rule_mutation(
-        rule_index: int, expected_name: str | None, statements: list[str]
-    ) -> str:
-        """AppleScript that applies ``statements`` to ``rule rule_index``
-        only if its name is still ``expected_name``.
 
-        The name is read and compared inside the same tell block as the
-        mutation. The block sets ``resultData`` to ``{name, applied}``
-        for :func:`wrap_as_json_script`; ``applied`` is false when the
-        name did not match and nothing ran. With no ``expected_name``
-        the statements run unconditionally.
-        """
-        body = "\n".join("            " + stmt for stmt in statements)
-        if expected_name is None:
-            return f'''
-        tell application "Mail"
-            set currentName to name of rule {rule_index}
-{body}
-            set resultData to {{|name|:currentName, |applied|:true}}
-        end tell
-        '''
-        name_safe = escape_applescript_string(expected_name)
-        return f'''
-        tell application "Mail"
-            set currentName to name of rule {rule_index}
-            if currentName is "{name_safe}" then
-{body}
-                set resultData to {{|name|:currentName, |applied|:true}}
-            else
-                set resultData to {{|name|:currentName, |applied|:false}}
-            end if
-        end tell
-        '''
-
-    @staticmethod
-    def _raise_if_rule_changed(
-        rule_index: int, expected_name: str | None, outcome: dict[str, Any]
-    ) -> None:
-        if outcome.get("applied") is True:
-            return
-        raise MailRuleChangedError(
-            rule_index,
-            expected_name=expected_name or "",
-            actual_name=cast(str, outcome.get("name", "")),
-        )
 
     def list_mailboxes(self, account: str) -> list[dict[str, Any]]:
         """List all mailboxes for an account.
@@ -2653,45 +2125,6 @@ class AppleMailConnector:
             flagged=cast(bool, flagged),
         )
 
-    @staticmethod
-    def _build_flag_actions(
-        flagged: bool | None,
-        flag_color: str | None,
-    ) -> list[str]:
-        """Translate the (flagged, flag_color) patch into AppleScript
-        action strings. Pulled out of update_message in #174 to keep
-        that method below the CC ≤ 20 threshold.
-
-        Order of precedence: ``flagged=False`` always clears regardless
-        of color; ``flag_color`` set wins over bare ``flagged=True``;
-        bare ``flagged=True`` defaults to red (#185 fix).
-        """
-        from .utils import get_flag_index, validate_flag_color
-
-        if flagged is False:
-            return [
-                "set flag index of msg to -1",
-                "set flagged status of msg to false",
-            ]
-        if flag_color is not None:
-            if not validate_flag_color(flag_color):
-                raise ValueError(f"Invalid flag color: {flag_color}")
-            flag_index = get_flag_index(flag_color)
-            flagged_status = "true" if flag_color != "none" else "false"
-            return [
-                f"set flag index of msg to {flag_index}",
-                f"set flagged status of msg to {flagged_status}",
-            ]
-        if flagged is True:
-            # No color → default red. flag index 0 (red) sets bare \\Flagged
-            # on the IMAP server with no $MailFlagBit* keyword — same state
-            # the #152 IMAP fast path produces, ensuring path-independent
-            # rendering in Mail.app.
-            return [
-                f"set flag index of msg to {get_flag_index('red')}",
-                "set flagged status of msg to true",
-            ]
-        return []
 
     def _try_imap_fast_paths(
         self,
@@ -2975,38 +2408,6 @@ class AppleMailConnector:
 
         return thread
 
-    @staticmethod
-    def _destination_names(
-        attachments: list[dict[str, Any]],
-        selected_zero_based: list[int],
-        save_directory: Path,
-        overwrite: bool,
-    ) -> list[str]:
-        """What each selected attachment will be called on disk, and that
-        those names are free to take.
-
-        Each declared name is reduced to a safe filename (sender-controlled
-        text never reaches a path expression), the batch is made distinct
-        so two attachments sharing a name land in two files, and unless
-        ``overwrite`` is set every name is checked against the directory
-        before anything is written. Raises ``FileExistsError`` naming the
-        taken files and saying how to replace them.
-        """
-        names = distinct_filenames([
-            safe_attachment_filename(
-                attachments[i].get("name"), f"attachment-{i + 1}"
-            )
-            for i in selected_zero_based
-        ])
-        if overwrite:
-            return names
-        taken = [n for n in names if (save_directory / n).exists()]
-        if taken:
-            raise FileExistsError(
-                "already in the directory: " + ", ".join(taken)
-                + "; nothing was written. Pass overwrite=True to replace it."
-            )
-        return names
 
     def save_attachments(
         self,
@@ -3147,7 +2548,7 @@ class AppleMailConnector:
         # `attachment-N` fallback: an unreadable name arrives here as a
         # non-string and takes the same fallback, and pass 1 has already
         # emitted its own warning about it.
-        safe_names = self._destination_names(
+        safe_names = destination_names(
             attachments, selected_zero_based, save_directory, overwrite
         )
         safe_names_literal = ", ".join(
@@ -3306,7 +2707,7 @@ class AppleMailConnector:
             target = "true" if read_status else "false"
             actions.append(f"set read status of msg to {target}")
 
-        actions.extend(self._build_flag_actions(flagged, flag_color))
+        actions.extend(build_flag_actions(flagged, flag_color))
 
         # Move (always last — IMAP STORE requires source folder).
         if destination_mailbox is not None:
@@ -4087,642 +3488,37 @@ class AppleMailConnector:
             )
         return resolved
 
-    @staticmethod
-    def _validate_compose_args(
-        seed: str,
-        seed_id: str | None,
-        to: list[str] | None,
-        subject: str | None,
-    ) -> None:
-        """Validate the per-seed argument requirements of a composition,
-        where a caller's arguments enter the connector (``create_draft``,
-        ``_send_html_email``). Raises ValueError with a specific message
-        on the first violation. (#193)
-        """
-        if seed not in ("new", "reply", "forward"):
-            raise ValueError(
-                f"seed must be 'new', 'reply', or 'forward'; got {seed!r}"
-            )
-        if seed in ("reply", "forward"):
-            if not seed_id:
-                raise ValueError(f"seed_id is required for seed={seed!r}")
-        else:  # seed == "new"
-            if not to:
-                raise ValueError("'to' is required when seed='new'")
-            if not subject:
-                raise ValueError("'subject' is required when seed='new'")
 
-    @staticmethod
-    def _build_creation_block(
-        seed: str,
-        seed_id_safe: str | None,
-        reply_all: bool,
-        subject_safe: str | None,
-    ) -> str:
-        """Per-seed AppleScript fragment that produces ``theMessage`` in a
-        visible compose window, which is where every message the
-        connector composes is written (``_compose``).
 
-        A fresh message is ``make new outgoing message`` with
-        ``visible:true``, its subject, and the one-space body seed
-        (``_BODY_SEED``), which the composition pastes over.
 
-        A reply or forward is Mail's own verb (``reply`` / ``reply to
-        all`` / ``forward``) with ``opening window true``, after the
-        cross-account ``whose id is "{seed_id_safe}"`` lookup.
-        ``seed_id_safe`` is expected to be Mail's internal id — callers
-        route RFC 5322 ids through ``_maybe_resolve_rfc_seed_id`` first
-        (#205). Opened without a window, what Mail wrote is not readable
-        before send, and any edit of it through the dictionary replaced
-        the quote or forwarded message and dropped a forward's
-        attachments (measured 2026-09-26, see ``_compose``).
-        """
-        if seed == "new":
-            return (
-                f'set theMessage to make new outgoing message with properties '
-                f'{{subject:"{subject_safe}", visible:true, content:"{_BODY_SEED}"}}'
-            )
-        if seed == "reply":
-            verb = "reply to all" if reply_all else "reply"
-        else:  # forward
-            verb = "forward"
-        return f"""
-            set origMsg to missing value
-            repeat with acc in accounts
-                try
-                    repeat with mb in mailboxes of acc
-                        try
-                            set origMsg to first message of mb whose id is "{seed_id_safe}"
-                            exit repeat
-                        end try
-                    end repeat
-                end try
-                if origMsg is not missing value then exit repeat
-            end repeat
-            if origMsg is missing value then error "SEED_NOT_FOUND"
-            set theMessage to {verb} origMsg opening window true
-        """
 
-    @staticmethod
-    def _as_verified_send_block() -> str:
-        """AppleScript fragment: verified Send click with mechanical
-        read-back (Phase 0 of PLAN-html-reply-send, grounded in
-        docs/reference/UI_GROUNDING_MAIL_SEND.md).
 
-        Caller must set ``composeName``, the compose window's exact AX
-        name, beforehand.
 
-        The fragment sets ``sendOutcome`` to one of:
-          "SENT" | "WINDOW_NOT_FOUND:…" | "NO_SEND_BUTTON:…" |
-          "SEND_DISABLED:…" | "SHEET:…" | "WINDOW_STILL_OPEN:…"
-        After the click it polls the window, once a second for 15 s: gone
-        is SENT, since Mail closes the window when it takes the message;
-        a sheet on it is SHEET:… with the sheet's text; still open with no
-        sheet at the end is WINDOW_STILL_OPEN:…, not sent, which the
-        caller's salvage saves to Drafts. It never returns early, so
-        callers can run cleanup (e.g. clipboard restore) before returning
-        ``sendOutcome``.
 
-        Why each check exists (observed live, 2026-07-20, unless noted):
-          - window resolved BY NAME — ``window 1`` may be the viewer;
-          - ``enabled`` gate — clicking a disabled Send button is a silent
-            no-op (the vanished-send mechanism);
-          - sheet surfacing — a mid-send sheet means NOT dispatched; its
-            static texts go into the outcome instead of a blind Cancel;
-          - the window gone, and nothing about Sent. This block once also
-            waited for a message with the subject in Sent. For a subject
-            Sent already held, any earlier message satisfied that; for a
-            new one, a copy slower than 15 s would make a message that
-            went read as not sent, inviting a second send. That is read
-            from the code (2026-09-27), not seen happen. Which copy the
-            send filed is looked for afterwards, by identity
-            (``_find_sent_copy``).
-        """
-        return """
-        set sendOutcome to missing value
-        set sendClicked to false
-        set readyState to ""
-        -- Precondition with bounded wait: after a reopen, Mail populates
-        -- recipients asynchronously and Send stays disabled until then —
-        -- clicking early is a silent no-op (the vanished-send mechanism).
-        repeat 10 times
-            set readyState to ""
-            tell application "System Events"
-                tell application process "Mail"
-                    if not (exists window composeName) then
-                        set readyState to "WINDOW_NOT_FOUND:" & ((name of windows) as text)
-                    else
-                        set tbBtns to (buttons of (first toolbar of window composeName) whose description is "Send")
-                        if (count of tbBtns) is 0 then
-                            set readyState to "NO_SEND_BUTTON:" & composeName
-                        else
-                            set sendBtn to item 1 of tbBtns
-                            if not (enabled of sendBtn) then
-                                set readyState to "SEND_DISABLED"
-                            else
-                                click sendBtn
-                                set sendClicked to true
-                            end if
-                        end if
-                    end if
-                end tell
-            end tell
-            if sendClicked then exit repeat
-            delay 1
-        end repeat
-        if not sendClicked then
-            if readyState is "SEND_DISABLED" then
-                set sendOutcome to "SEND_DISABLED:Send never became enabled within 10s on " & composeName & " (recipients missing or not yet populated)"
-            else
-                set sendOutcome to readyState
-            end if
-        end if
-        if sendOutcome is missing value then
-            repeat 15 times
-                delay 1
-                set winOpen to false
-                set sheetInfo to ""
-                tell application "System Events"
-                    tell application process "Mail"
-                        if exists window composeName then
-                            set winOpen to true
-                            if exists (first sheet of window composeName) then
-                                try
-                                    -- NB: "st" is a reserved AppleScript token; do not shorten this name.
-                                    repeat with sheetTextEl in static texts of (first sheet of window composeName)
-                                        set sheetInfo to sheetInfo & (value of sheetTextEl) & " | "
-                                    end repeat
-                                end try
-                                set sheetInfo to "SHEET:" & sheetInfo
-                            end if
-                        end if
-                    end tell
-                end tell
-                if sheetInfo is not "" then
-                    set sendOutcome to sheetInfo
-                    exit repeat
-                end if
-                if not winOpen then
-                    set sendOutcome to "SENT"
-                    exit repeat
-                end if
-            end repeat
-            if sendOutcome is missing value then
-                set sendOutcome to "WINDOW_STILL_OPEN:no sheet, and still open 15s after Send was clicked on " & composeName
-            end if
-        end if
-        """
 
-    @staticmethod
-    def _as_new_compose_window_block() -> str:
-        """AppleScript fragment: name the compose window just opened (by
-        a reply or forward verb, or by ``make new outgoing message``),
-        by comparing Mail's window names before and after, counting each
-        name. A name already open does not hide a new window of the same
-        name: a draft saved through the dictionary, as this connector's
-        once were, leaves its window behind
-        (docs/research/icloud-draft-resync.md, Observation 5), and a
-        plain set difference then saw no new window at all (2026-09-26).
-
-        Needs ``beforeNames`` (System Events' ``name of windows`` of Mail)
-        set before the window is opened; sets ``newName``. Errors NO_COMPOSE_WINDOW
-        when no window appeared within 5 s, and
-        COMPOSE_WINDOW_NOT_UNIQUE when the new window shares its name
-        with one already open: every later step (paste, read-back,
-        verified send, discard, save) addresses the window by name, so it
-        could act on the other one. That window is left open, not closed,
-        since which of the two is the new one cannot be told by name.
-        """
-        return """
--- Identify the new compose window by comparing counted names (bounded poll).
-set newName to ""
-set sameNamed to 0
-repeat 10 times
-    delay 0.5
-    tell application "System Events"
-        tell application process "Mail"
-            set afterNames to name of windows
-        end tell
-    end tell
-    repeat with n in afterNames
-        set nm to (n as text)
-        set afterCount to 0
-        repeat with m in afterNames
-            if (m as text) is nm then set afterCount to afterCount + 1
-        end repeat
-        set beforeCount to 0
-        repeat with m in beforeNames
-            if (m as text) is nm then set beforeCount to beforeCount + 1
-        end repeat
-        if afterCount > beforeCount then
-            set newName to nm
-            set sameNamed to afterCount
-            exit repeat
-        end if
-    end repeat
-    if newName is not "" then exit repeat
-end repeat
-if newName is "" then error "NO_COMPOSE_WINDOW: no compose window appeared within 5 s"
-if sameNamed > 1 then error "COMPOSE_WINDOW_NOT_UNIQUE: Mail opened a compose window named " & newName & " while another window of that name was open, so it cannot be addressed safely and was left open; close the other window of that name and retry"
-"""
-
-    @staticmethod
-    def _paste_probe_strings(body: str, plain: bool = False) -> tuple[str, str]:
-        """Compute the paste read-back probes for a body.
-
-        Returns ``(snippet, raw_marker)``:
-          - ``snippet``: first chunk of the TAG-STRIPPED text content —
-            after a successful paste this text must be readable in the
-            WebArea (arrival check). Empty when the HTML has no text
-            content (checks degrade gracefully).
-          - ``raw_marker``: first chunk of the raw source when it starts
-            with a tag — if this appears LITERALLY in the WebArea, the
-            paste degraded to plain text (the 2026-07-21 raw-``<p>``
-            regression; see docs/reference/UI_GROUNDING_MAIL_SEND.md).
-
-        A ``plain`` body is its own text: the snippet is the text itself
-        and there is no raw marker, since angle brackets in it are text.
-        """
-        if plain:
-            return " ".join(body.split())[:24].strip(), ""
-        text = re.sub(r"<[^>]+>", " ", body)
-        text = " ".join(text.split())
-        snippet = text[:24].strip()
-        raw_marker = body.strip()[:16] if body.lstrip().startswith("<") else ""
-        return snippet, raw_marker
-
-    @staticmethod
-    def _text_paste_fill(body: str, plain: bool) -> str:
-        """AppleScript that puts ``body`` on the pasteboard ``pb``: as
-        HTML, or as plain text when ``plain``."""
-        body_safe = escape_applescript_string(sanitize_input(body))
-        flavor = "public.utf8-plain-text" if plain else "public.html"
-        return (
-            f'set theBody to "{body_safe}"\n'
-            "set bodyNSString to current application's NSString's "
-            "stringWithString:theBody\n"
-            "set bodyData to bodyNSString's dataUsingEncoding:"
-            "(current application's NSUTF8StringEncoding)\n"
-            "pb's clearContents()\n"
-            f'pb\'s setData:bodyData forType:"{flavor}"'
-        )
-
-    @staticmethod
-    def _files_paste_fill(attachment_paths: list[Path]) -> str:
-        """AppleScript that puts the files on the pasteboard ``pb`` as
-        file URLs, which Mail pastes into a compose body as attachments,
-        as it does a drag from Finder."""
-        paths_safe = ", ".join(
-            f'"{escape_applescript_string(str(Path(p).resolve()))}"'
-            for p in attachment_paths
-        )
-        return (
-            "set fileURLs to current application's NSMutableArray's array()\n"
-            f"repeat with apath in {{{paths_safe}}}\n"
-            "    (fileURLs's addObject:(current application's NSURL's "
-            "fileURLWithPath:(apath as text)))\n"
-            "end repeat\n"
-            "pb's clearContents()\n"
-            "pb's writeObjects:fileURLs"
-        )
-
-    @staticmethod
-    def _build_paste_script(
-        *,
-        window_name: str,
-        fill: str,
-        placement: _PastePlacement,
-        undo_first: bool,
-    ) -> str:
-        """Full osascript source: paste into the named compose window's
-        body whatever ``fill`` puts on the pasteboard (``_text_paste_fill``
-        or ``_files_paste_fill``), at ``placement`` (``_PASTE_CARET_KEYS``):
-
-          1. readiness — poll until the body WebArea EXISTS (window-name
-             alone races WebKit initialization);
-          2. focus — ``set focused`` then VERIFY AXFocusedUIElement is the
-             WebArea (a click can leave focus in the To field, sending
-             cmd+v to the wrong control);
-          3. caret, paste, then restore the clipboard IMMEDIATELY
-             (shortest possible hold; restore also runs on every error
-             path).
-
-        Returns "PASTED_UNVERIFIED" — what the paste did is read back in
-        a SEPARATE osascript run (``_build_readback_script``,
-        ``_build_attachment_ax_verify_script``): within one process
-        System Events serves a stale AX subtree after WebKit re-renders,
-        so an in-script read-back sees nothing (observed live).
-        ``undo_first`` prepends cmd+z for the retry attempt.
-        """
-        win_safe = escape_applescript_string(window_name)
-        undo_block = (
-            'keystroke "z" using command down\n            delay 0.5'
-            if undo_first
-            else ""
-        )
-        caret_keys = _PASTE_CARET_KEYS[placement]
-        return f"""
-use framework "AppKit"
-use framework "Foundation"
-use scripting additions
-
-set composeName to "{win_safe}"
-
-set pb to current application's NSPasteboard's generalPasteboard()
-set savedTypes to (pb's types()) as list
-set savedPairs to {{}}
-repeat with t in savedTypes
-    set theData to (pb's dataForType:(t as text))
-    if theData is not missing value then
-        set end of savedPairs to {{pbType:(t as text), pbData:theData}}
-    end if
-end repeat
-
-{fill}
-
-try
-    tell application "Mail" to activate
-    set bodyArea to missing value
-    repeat 15 times
-        tell application "System Events"
-            tell application process "Mail"
-                if exists window composeName then
-                    set w to window composeName
-                    repeat with g in groups of w
-                        try
-                            set sa to scroll area 1 of group 1 of g
-                            set waList to (UI elements of sa whose role is "AXWebArea")
-                            if (count of waList) > 0 then
-                                set bodyArea to item 1 of waList
-                                exit repeat
-                            end if
-                        end try
-                    end repeat
-                end if
-            end tell
-        end tell
-        if bodyArea is not missing value then exit repeat
-        delay 0.5
-    end repeat
-    if bodyArea is missing value then error "NO_BODY_AREA:webarea never appeared in " & composeName
-    set focusOK to false
-    tell application "System Events"
-        tell application process "Mail"
-            if exists menu item "Make Rich Text" of menu "Format" of menu bar 1 then
-                click menu item "Make Rich Text" of menu "Format" of menu bar 1
-                delay 0.3
-            end if
-            repeat 5 times
-                set focused of bodyArea to true
-                delay 0.3
-                try
-                    if role of (value of attribute "AXFocusedUIElement" of it) is "AXWebArea" then
-                        set focusOK to true
-                        exit repeat
-                    end if
-                end try
-                click bodyArea
-                delay 0.3
-            end repeat
-        end tell
-    end tell
-    if not focusOK then error "PASTE_FOCUS_FAILED:body area would not take keyboard focus in " & composeName
-    tell application "System Events"
-        tell application process "Mail"
-            {undo_block}
-            {caret_keys}
-            keystroke "v" using command down
-            delay 0.8
-        end tell
-    end tell
-on error errText
-    pb's clearContents()
-    repeat with pair in savedPairs
-        pb's setData:(pbData of pair) forType:(pbType of pair)
-    end repeat
-    return errText
-end try
-
-pb's clearContents()
-repeat with pair in savedPairs
-    pb's setData:(pbData of pair) forType:(pbType of pair)
-end repeat
-
-return "PASTED_UNVERIFIED"
-"""
-
-    @staticmethod
-    def _as_close_compose_block(mode: _CloseMode, *, require_empty: bool = False) -> str:
-        """AppleScript fragment: close one compose window, saving it as a
-        draft (``mode`` "save") or not ("discard"), and read back that it
-        closed. Needs ``closeId`` (Mail's id for the window, 0 when there
-        is none) and ``closeName`` (its name) set before. Sets
-        ``closeOutcome`` to "SALVAGED" (with a note on Mail's send-error
-        sheet when there was one) or "DISCARDED"; "NO_WINDOW" when it was
-        gone already; or "SALVAGE_FAILED:…" / "DISCARD_FAILED:…", with
-        nothing closed unless it says so.
-
-        By id, the window is exactly Mail's window ``closeId``, still
-        named ``closeName``, found in System Events' list by its name and
-        position (``tendIndexOf``) however many windows share its name,
-        and closed only when no other visible window of its name stands
-        in the same place; it is verified closed by that id being gone.
-        With no id, only when ``closeName`` is the only window of its
-        name: a window addressed by name is the first of the name, which
-        could be someone else's.
-
-        Every window reference is an index written out from ``window i``
-        (Observation 7). The close button and the sheet go through Mail's
-        UI: both dictionary discards (``close … saving no``, ``delete
-        outgoing message``) fail silently (observed live 2026-07-20). The
-        "Don’t Save" button's name carries a curly apostrophe (U+2019).
-
-        ``require_empty`` (a discard by tending): the window must still
-        read provably empty, every header field blank, the body empty and
-        no sheet, in this script, right before the click, so nothing typed
-        into it since it was read is thrown away.
-
-        A send Mail could not make through the account's server leaves a
-        sheet on the window, "Cannot send message using the server …",
-        whose buttons are Try Later, Try With Selected Server, Connection
-        Doctor, Edit SMTP Server List and Edit Message (seen 2026-09-27),
-        and no Save. On a save, found (by its Edit Message button), its
-        text is read, Edit Message pressed, and the window then closed
-        with Save as any other; the outcome carries the text, as
-        "(Mail's send-error sheet: …)", so the caller's error says why
-        Mail did not send. It cannot be provoked on demand, and no live
-        test has met it.
-        """
-        failed = _CLOSE_FAILED[mode]
-        done = "SALVAGED" if mode == "save" else "DISCARDED"
-        sheet_button = "Save" if mode == "save" else "Don’t Save"
-        empty_check = (
-            f"""
-if closeOutcome is "" then
-    set fieldValues to my tendFieldValues(closeIdx)
-    set stillEmpty to ((count of fieldValues) > 0)
-    repeat with v in fieldValues
-        if not my tendIsBlank(contents of v) then set stillEmpty to false
-    end repeat
-    tell application "System Events"
-        tell application process "Mail"
-            if exists sheet 1 of window closeIdx then set stillEmpty to false
-        end tell
-    end tell
-    if stillEmpty then set stillEmpty to ((bodyState of (my tendBodyRead(closeIdx))) is "empty")
-    if not stillEmpty then set closeOutcome to "{failed}no longer empty; left open"
-end if
-"""
-            if require_empty
-            else ""
-        )
-        send_error_sheet = (
-            f"""
-if closeOutcome is "" then
-    tell application "System Events"
-        tell application process "Mail"
-            if exists sheet 1 of window closeIdx then
-                if exists button "Edit Message" of sheet 1 of window closeIdx then
-                    set sheetText to ""
-                    try
-                        repeat with sheetVal in (value of static texts of sheet 1 of window closeIdx)
-                            set sheetText to sheetText & ((contents of sheetVal) as text) & " | "
-                        end repeat
-                    end try
-                    set sheetNote to " (Mail's send-error sheet: " & sheetText & ")"
-                    click button "Edit Message" of sheet 1 of window closeIdx
-                end if
-            end if
-        end tell
-    end tell
-    if sheetNote is not "" then
-        repeat 10 times
-            delay 0.3
-            set closeIdx to my tendIndexOf(closeName, closePos)
-            if closeIdx is less than or equal to 0 then exit repeat
-            tell application "System Events"
-                tell application process "Mail"
-                    set sheetUp to exists sheet 1 of window closeIdx
-                end tell
-            end tell
-            if not sheetUp then exit repeat
-        end repeat
-        if closeIdx is less than or equal to 0 then set closeOutcome to "{failed}the window was lost after its send-error sheet" & sheetNote
-    end if
-end if
-"""
-            if mode == "save"
-            else ""
-        )
-        return f"""
-set closeOutcome to ""
-set closePos to {{}}
-set closeIdx to 0
-set sheetNote to ""
-if closeId is not 0 then
-    set idName to ""
-    tell application "Mail"
-        try
-            set idName to name of window id closeId
-            set idBounds to bounds of window id closeId
-        on error
-            set closeOutcome to "NO_WINDOW"
-        end try
-    end tell
-    if closeOutcome is "" and idName is not closeName then set closeOutcome to "{failed}Mail's window " & closeId & " is now named " & idName & "; left open"
-    if closeOutcome is "" then
-        set closePos to {{item 1 of idBounds, item 2 of idBounds}}
-        tell application "Mail"
-            set allNames to name of every window
-            set allBounds to bounds of every window
-            set allVisible to visible of every window
-        end tell
-        set twins to 0
-        repeat with j from 1 to (count of allNames)
-            if (item j of allVisible) and (item j of allNames) is closeName then
-                set b to item j of allBounds
-                -- Assigned before it is compared: a list literal of
-                -- `item n of b` compared with `is` is false (Observation 9).
-                set bPos to {{item 1 of b, item 2 of b}}
-                if bPos is closePos then set twins to twins + 1
-            end if
-        end repeat
-        if twins is not 1 then set closeOutcome to "{failed}" & twins & " visible windows named " & closeName & " stand where Mail's window " & closeId & " does, so which to close cannot be told; none was closed"
-    end if
-else
-    tell application "System Events"
-        tell application process "Mail"
-            set nameCount to count of (windows whose name is closeName)
-            set allNames to name of windows
-            set allPos to position of windows
-        end tell
-    end tell
-    if nameCount is 0 then
-        set closeOutcome to "NO_WINDOW"
-    else if nameCount > 1 then
-        set closeOutcome to "{failed}" & nameCount & " windows are named " & closeName & ", so which to close cannot be told by name; none was closed"
-    else
-        repeat with j from 1 to (count of allNames)
-            if (item j of allNames) is closeName then set closePos to item j of allPos
-        end repeat
-    end if
-end if
-if closeOutcome is "" then
-    set closeIdx to my tendIndexOf(closeName, closePos)
-    if closeIdx is 0 then set closeOutcome to "{failed}System Events lists no window named " & closeName & " in its place; none was closed"
-    if closeIdx < 0 then set closeOutcome to "{failed}System Events lists more than one window named " & closeName & " in its place; none was closed"
-end if
-{empty_check}{send_error_sheet}
-if closeOutcome is "" then
-    try
-        if not my tendClickClose(closeIdx) then error "the window has no close button"
-        delay 0.8
-        if not my tendGone(closeId, closeName, closePos) then
-            set closeIdx to my tendIndexOf(closeName, closePos)
-            if closeIdx > 0 then
-                tell application "System Events"
-                    tell application process "Mail"
-                        if exists sheet 1 of window closeIdx then
-                            click button "{sheet_button}" of sheet 1 of window closeIdx
-                            delay 0.8
-                        end if
-                    end tell
-                end tell
-            end if
-        end if
-        if my tendGone(closeId, closeName, closePos) then
-            set closeOutcome to "{done}" & sheetNote
-        else
-            set closeOutcome to "{failed}window still open" & sheetNote
-        end if
-    on error errMsg
-        set closeOutcome to "{failed}" & errMsg & sheetNote
-    end try
-end if
-"""
 
     def _build_close_script(
         self,
         window_name: str,
         window_id: int | None,
-        mode: _CloseMode,
+        mode: CloseMode,
         *,
         require_empty: bool = False,
     ) -> str:
-        """Full osascript source: ``_as_close_compose_block`` on one window,
+        """Full osascript source: ``as_close_compose_block`` on one window,
         returning its outcome."""
         return (
             f"set closeId to {int(window_id or 0)}\n"
             f'set closeName to "{escape_applescript_string(window_name)}"\n'
-            + self._as_close_compose_block(mode, require_empty=require_empty)
+            + as_close_compose_block(mode, require_empty=require_empty)
             + "\nreturn closeOutcome\n"
-            + _WINDOW_HANDLERS
+            + WINDOW_HANDLERS
         )
 
     def _close_compose_window(
-        self, window_name: str, window_id: int | None, mode: _CloseMode
+        self, window_name: str, window_id: int | None, mode: CloseMode
     ) -> str:
-        """Close one compose window (``_as_close_compose_block``); what the
+        """Close one compose window (``as_close_compose_block``); what the
         block read back, or "SALVAGE_FAILED:" / "DISCARD_FAILED:" with the
         error when the script itself failed."""
         try:
@@ -4730,7 +3526,7 @@ end if
                 self._build_close_script(window_name, window_id, mode)
             ).strip()
         except MailAppleScriptError as exc:
-            return f"{_CLOSE_FAILED[mode]}{exc}"
+            return f"{CLOSE_FAILED[mode]}{exc}"
 
     def _salvage_compose_to_draft(
         self, window_name: str, window_id: int | None = None
@@ -4749,7 +3545,7 @@ end if
         """
         return self._close_compose_window(window_name, window_id, "save")
 
-    def _salvage(self, window: _ComposeWindow) -> str:
+    def _salvage(self, window: ComposeWindow) -> str:
         """Salvage a composition's own window, by Mail's id for it when
         the opening script found one."""
         return self._salvage_compose_to_draft(window.name, window.window_id)
@@ -4815,12 +3611,12 @@ else
     end tell
 end if
 """
-        return wrap_as_json_script(body, timeout=self.timeout) + _WINDOW_HANDLERS
+        return wrap_as_json_script(body, timeout=self.timeout) + WINDOW_HANDLERS
 
     def _build_tend_close_script(self, action: TendAction) -> str:
         """Full osascript source: close the window a tending pass decided
         on, by Mail's id for it: salvaged to Drafts, or discarded only
-        while it still reads empty (``_as_close_compose_block``)."""
+        while it still reads empty (``as_close_compose_block``)."""
         if action.action == "salvage":
             return self._build_close_script(action.window_name, action.window_id, "save")
         return self._build_close_script(
@@ -4938,7 +3734,7 @@ end if
                 failed.append((name, str(exc)))
                 rest = tuple(a.window_name for a in actions[index + 1:])
                 return tuple(closed), tuple(failed), rest
-            closing = _closing_of(outcome, by="tending", at=time.time())
+            closing = closing_of(outcome, by="tending", at=time.time())
             if closing is None:
                 failed.append((name, outcome))
                 continue
@@ -4957,68 +3753,13 @@ end if
             return False
         return True
 
-    @staticmethod
-    def _build_readback_script(window_name: str) -> str:
-        """Full osascript source: read the compose body's text content.
-
-        Runs as its OWN osascript process — a fresh process gets a fresh
-        AX snapshot; the pasting process reads a stale (empty) subtree
-        after WebKit re-renders on paste (observed live 2026-07-22).
-        Returns the concatenated static-text content, or
-        "READBACK_NO_AREA" when the window/WebArea can't be resolved.
-        """
-        win_safe = escape_applescript_string(window_name)
-        return f"""
-tell application "System Events"
-    tell application process "Mail"
-        if not (exists window "{win_safe}") then return "READBACK_NO_AREA"
-        set bodyArea to missing value
-        repeat with g in groups of window "{win_safe}"
-            try
-                set sa to scroll area 1 of group 1 of g
-                set waList to (UI elements of sa whose role is "AXWebArea")
-                if (count of waList) > 0 then
-                    set bodyArea to item 1 of waList
-                    exit repeat
-                end if
-            end try
-        end repeat
-        if bodyArea is missing value then return "READBACK_NO_AREA"
-        -- Pasted HTML nests as AXGroup > AXStaticText (typed text sits
-        -- directly under the WebArea) — descend three levels.
-        set seenText to ""
-        try
-            repeat with l1 in UI elements of bodyArea
-                if role of l1 is "AXStaticText" then
-                    set seenText to seenText & (value of l1) & " "
-                else
-                    try
-                        repeat with l2 in UI elements of l1
-                            if role of l2 is "AXStaticText" then
-                                set seenText to seenText & (value of l2) & " "
-                            else
-                                try
-                                    repeat with l3 in UI elements of l2
-                                        if role of l3 is "AXStaticText" then set seenText to seenText & (value of l3) & " "
-                                    end repeat
-                                end try
-                            end if
-                        end repeat
-                    end try
-                end if
-            end repeat
-        end try
-        return seenText
-    end tell
-end tell
-"""
 
     def _paste_verified(
         self,
         *,
-        window: _ComposeWindow,
+        window: ComposeWindow,
         body: str,
-        placement: _PastePlacement,
+        placement: PastePlacement,
         plain: bool,
     ) -> None:
         """Paste ``body`` into the compose window at ``placement``
@@ -5033,12 +3774,12 @@ end tell
         failure the window is salvaged to Drafts and
         ``MailAppleScriptError`` names what the read-back saw.
         """
-        snippet, raw_marker = self._paste_probe_strings(body, plain=plain)
-        fill = self._text_paste_fill(body, plain)
+        snippet, raw_marker = paste_probe_strings(body, plain=plain)
+        fill = text_paste_fill(body, plain)
 
         for attempt in (1, 2):
             paste_result = self._run_applescript(
-                self._build_paste_script(
+                build_paste_script(
                     window_name=window.name,
                     fill=fill,
                     placement=placement,
@@ -5052,7 +3793,7 @@ end tell
                     window_outcome=salvage,
                 )
             seen = self._run_applescript(
-                self._build_readback_script(window.name)
+                build_readback_script(window.name)
             ).strip()
             # Normalize whitespace: styled runs (<b>…) split AX static
             # texts, so the joined read-back carries doubled spaces.
@@ -5072,7 +3813,7 @@ end tell
                 )
 
     def _paste_attachments(
-        self, window: _ComposeWindow, attachment_paths: list[Path]
+        self, window: ComposeWindow, attachment_paths: list[Path]
     ) -> None:
         """Paste the files at the end of the compose window's body,
         then wait for each to show in the window's AX tree. On any
@@ -5088,16 +3829,16 @@ end tell
         does, so the same verification reads both.
         """
         outcome = self._run_applescript(
-            self._build_paste_script(
+            build_paste_script(
                 window_name=window.name,
-                fill=self._files_paste_fill(attachment_paths),
+                fill=files_paste_fill(attachment_paths),
                 placement="end",
                 undo_first=False,
             )
         ).strip()
         if outcome == "PASTED_UNVERIFIED":
             outcome = self._run_applescript(
-                self._build_attachment_ax_verify_script(
+                build_attachment_ax_verify_script(
                     window_name=window.name,
                     filenames=[Path(p).name for p in attachment_paths],
                 )
@@ -5110,47 +3851,15 @@ end tell
                 window_outcome=salvage,
             )
 
-    @staticmethod
-    def _gate_named_recipients(
-        seed: str,
-        to: list[str] | None,
-        cc: list[str] | None,
-        bcc: list[str] | None,
-    ) -> None:
-        """The outbound allowlist on a send's recipients as the caller
-        named them, before Mail is touched; ``MailOutboundDisallowedError``
-        on failure. A reply's group left None is Mail's to fill from the
-        message replied to, which nothing here can see: it is judged with
-        every other recipient once the window holds it
-        (``_gate_compose_recipients``). No other seed derives a recipient,
-        so what it names is everyone it sends to, and it must name
-        someone."""
-        if seed != "reply":
-            assert_recipients_allowed_for_send(to, cc, bcc, seed=seed)
-            return
-        named = [addr for group in (to, cc, bcc) for addr in group or []]
-        if named:
-            assert_recipients_allowed_for_send(named, None, None)
 
-    @staticmethod
-    def _gate_compose_recipients(window: _ComposeWindow) -> None:
-        """HARD POLICY GATE on the recipients an open compose window will
-        send to, as read back from the outgoing-message model after every
-        override: those the caller named and those Mail derived. No
-        exceptions. ``MailOutboundDisallowedError`` on failure, before
-        anything is pasted or sent; the composition then discards the
-        window (``_compose``)."""
-        assert_recipients_allowed_for_send(
-            window.to or None, window.cc or None, window.bcc or None, seed="new"
-        )
 
-    def _send_compose_window(self, window: _ComposeWindow) -> None:
+    def _send_compose_window(self, window: ComposeWindow) -> None:
         """Run the verified send on the compose window; on any outcome but
         SENT the window is salvaged to Drafts and the outcome raised."""
         win_safe = escape_applescript_string(window.name)
         send_script = (
             f'set composeName to "{win_safe}"\n'
-            + self._as_verified_send_block()
+            + as_verified_send_block()
             + "\nreturn sendOutcome"
         )
         result = self._run_applescript(send_script).strip()
@@ -5232,8 +3941,8 @@ end tell
             else ("forward", forward_of) if forward_of is not None
             else ("new", None)
         )
-        self._validate_compose_args(seed, seed_id, to, subject)
-        _refuse_overlong_body(body)
+        validate_compose_args(seed, seed_id, to, subject)
+        refuse_overlong_body(body)
         return self._compose(
             seed=seed,
             seed_id=self._maybe_resolve_rfc_seed_id(seed, seed_id),
@@ -5250,40 +3959,24 @@ end tell
         )
 
     def _sent_ending(
-        self, window: _ComposeWindow, files: list[Path]
+        self, window: ComposeWindow, files: list[Path]
     ) -> dict[str, Any]:
         """What a send Mail accepted returns, by the copy it filed in
         Sent (``_find_sent_copy``): found, it must carry every file the
         composition pasted, by name, and its ids are returned; not
         identified, no id is returned, with a warning saying why
-        (``_sent_result``)."""
+        (``sent_result``)."""
         copy = self._find_sent_copy(window.subject, window.before_ids)
-        if isinstance(copy, _SentCopy):
-            self._check_sent_attachments(copy, [f.name for f in files])
+        if isinstance(copy, SentMessageCopy):
+            check_sent_attachments(copy, [f.name for f in files])
         else:
             logger.warning("a send's copy in Sent was not identified: %s", copy.why)
-        return _sent_result(copy, files_pasted=bool(files))
+        return sent_result(copy, files_pasted=bool(files))
 
-    @staticmethod
-    def _check_sent_attachments(copy: _SentCopy, names: list[str]) -> None:
-        """The copy a send filed must carry every file the composition
-        pasted, by name. It may carry more: a forward's has the
-        original's files as well. A file missing raises, saying the
-        message WAS sent, so the caller inspects that copy before sending
-        again."""
-        carried = list(copy.attachment_names)
-        missing = list((Counter(names) - Counter(carried)).elements())
-        if missing:
-            raise MailAppleScriptError(
-                f"send with attachments: message WAS sent, but the sent "
-                f"copy lacks {missing} of the files attached (it carries "
-                f"{carried}) — inspect that copy in Sent (id "
-                f"{copy.mail_id}) before resending."
-            )
 
     def _find_sent_copy(
         self, subject: str, before_ids: list[int]
-    ) -> _SentCopy | _SentCopyUnidentified:
+    ) -> SentMessageCopy | SentMessageCopyUnidentified:
         """The copy a send filed in Sent: the one message in Sent with
         ``subject`` whose id is not among ``before_ids``, taken before its
         window opened. Looked for at once, then every
@@ -5301,15 +3994,15 @@ end tell
                 if len(new) == 1:
                     return self._read_sent_copy(new[0])
                 if new:
-                    return _SentCopyUnidentified(
+                    return SentMessageCopyUnidentified(
                         f"{len(new)} messages with its subject reached Sent "
                         "while it was composed and sent, and which is its "
                         "copy cannot be told"
                     )
         except (MailError, ValueError) as exc:
-            return _SentCopyUnidentified(f"looking for it in Sent failed: {exc}")
+            return SentMessageCopyUnidentified(f"looking for it in Sent failed: {exc}")
         waited = self._SENT_APPEAR_POLLS * self._SENT_APPEAR_INTERVAL_S
-        return _SentCopyUnidentified(
+        return SentMessageCopyUnidentified(
             f"no new message with its subject appeared in Sent within {waited:g}s"
         )
 
@@ -5325,7 +4018,7 @@ end tell
 """, timeout=self.timeout))
         return [int(i) for i in cast(list[Any], parse_applescript_json(raw))]
 
-    def _read_sent_copy(self, mail_id: int) -> _SentCopy:
+    def _read_sent_copy(self, mail_id: int) -> SentMessageCopy:
         """The message in Sent with Mail's id ``mail_id``: its RFC
         Message-ID (bare) and the names of its files."""
         raw = self._run_applescript(wrap_as_json_script(f"""
@@ -5339,99 +4032,12 @@ tell application "Mail"
 end tell
 """, timeout=self.timeout))
         record = cast(dict[str, Any], parse_applescript_json(raw))
-        return _SentCopy(
+        return SentMessageCopy(
             mail_id=str(record["id"]),
             rfc_message_id=str(record["message_id"]).strip().strip("<>"),
             attachment_names=tuple(str(n) for n in record["attachment_names"]),
         )
 
-    @staticmethod
-    def _build_attachment_ax_verify_script(
-        *,
-        window_name: str,
-        filenames: list[str],
-    ) -> str:
-        """AppleScript: poll the compose window until every attachment
-        shows up in the body WebArea as an element whose description
-        carries the filename, or time out. Returns "ATTACHMENTS_VERIFIED"
-        or "ATTACH_MISSING:<filename>".
-
-        Mail shows a file one of two ways, whether it was attached
-        through the dictionary or pasted: an image inline, as an AXImage
-        described by its file name, and anything else as an AXButton
-        described "name.ext, N KB" (both measured 2026-09-27,
-        docs/research/icloud-draft-resync.md, Observation 10; the button
-        form first live 2026-08-24). Either role is accepted.
-
-        Walks the same groups → scroll area → AXWebArea path as the
-        paste script and descends recursively from there. NEVER uses
-        ``entire contents`` — it silently returns an empty list on
-        compose windows more often than not (observed live 2026-08-24;
-        one lucky success during exploration, empty on every retry).
-        The WebArea is re-located on every poll: WebKit re-renders
-        invalidate stale element references."""
-        win_safe = escape_applescript_string(window_name)
-        names_safe = ", ".join(
-            f'"{escape_applescript_string(n)}"' for n in filenames
-        )
-        return f"""
-on searchAttachment(el, fname, depthLeft)
-    tell application "System Events"
-        try
-            set r to role of el
-            if (r is "AXButton" or r is "AXImage") and ((description of el) as text) contains fname then return true
-        end try
-        if depthLeft > 0 then
-            try
-                repeat with c in UI elements of el
-                    if my searchAttachment(c, fname, depthLeft - 1) then return true
-                end repeat
-            end try
-        end if
-        return false
-    end tell
-end searchAttachment
-
-tell application "Mail" to activate
-delay 0.3
-set missingName to ""
-repeat with fname in {{{names_safe}}}
-    set foundIt to false
-    repeat 10 times
-        tell application "System Events"
-            tell application process "Mail"
-                if exists window "{win_safe}" then
-                    set bodyArea to missing value
-                    repeat with g in groups of window "{win_safe}"
-                        try
-                            set sa to scroll area 1 of group 1 of g
-                            set waList to (UI elements of sa whose role is "AXWebArea")
-                            if (count of waList) > 0 then
-                                set bodyArea to item 1 of waList
-                                exit repeat
-                            end if
-                        end try
-                    end repeat
-                    if bodyArea is not missing value then
-                        set foundIt to my searchAttachment(bodyArea, fname as text, 6)
-                    end if
-                end if
-            end tell
-        end tell
-        if foundIt then exit repeat
-        delay 0.5
-    end repeat
-    if not foundIt then
-        set missingName to fname as text
-        exit repeat
-    end if
-end repeat
-if missingName is "" then
-    return "ATTACHMENTS_VERIFIED"
-else
-    return "ATTACH_MISSING:" & missingName
-end if
-"""
 
     def create_draft(
         self,
@@ -5504,8 +4110,8 @@ end if
                 message WAS sent when the error says so (its Sent copy
                 lacks a file it was sent with).
         """
-        self._validate_compose_args(seed, seed_id, to, subject)
-        _refuse_overlong_body(body)
+        validate_compose_args(seed, seed_id, to, subject)
+        refuse_overlong_body(body)
 
         # HARD POLICY GATE — the actual-send enforcement perimeter for the
         # outbound recipient allowlist. Any code path that reaches this
@@ -5578,7 +4184,7 @@ end if
              its ids (``_sent_ending``). Or save: close the window with
              Save and find the draft it became. Either ending is the entry
              with the window's subject whose id the opening script did
-             not see (``_ENDING_MAILBOX``).
+             not see (``ENDING_MAILBOX``).
 
         Why every message goes this way, all measured on 2026-09-26 and
         -27. Opened without a window, Mail's reply or forward exposes no
@@ -5597,13 +4203,13 @@ end if
 
         Checked before anything is composed: on a send, every recipient
         the caller named passes the outbound allowlist, and a seed that
-        derives none names someone (``_gate_named_recipients``,
+        derives none names someone (``gate_named_recipients``,
         ``MailOutboundDisallowedError``), here as well as at every
         caller, since the connector is the hard block on a path by which
         mail leaves; every attachment exists (``FileNotFoundError``); and
         ``from_account`` names an account (``MailAccountNotFoundError``).
         The body's length was refused where it entered the connector
-        (``_refuse_overlong_body``). A later failure salvages the window
+        (``refuse_overlong_body``). A later failure salvages the window
         to Drafts and raises ``MailAppleScriptError``, which says so when
         the message was in fact sent.
 
@@ -5614,8 +4220,8 @@ end if
         tending's to close (``tend_compose_windows``).
         """
         if send_now:
-            self._gate_named_recipients(seed, to, cc, bcc)
-        files = _existing_files(attachment_paths)
+            gate_named_recipients(seed, to, cc, bcc)
+        files = existing_files(attachment_paths)
         sender = (
             self._resolve_account_to_sender(from_account)
             if from_account is not None
@@ -5635,10 +4241,10 @@ end if
         with self._window_lifecycle(window) as end_window:
             if send_now:
                 try:
-                    self._gate_compose_recipients(window)
+                    gate_compose_recipients(window)
                 except MailOutboundDisallowedError as exc:
                     end_window(
-                        _composition_closing(
+                        composition_closing(
                             self._discard_compose_window(window.name, window.window_id),
                             failure=f"recipients refused: {exc}",
                         )
@@ -5664,7 +4270,7 @@ end if
 
     @contextmanager
     def _window_lifecycle(
-        self, window: _ComposeWindow
+        self, window: ComposeWindow
     ) -> Iterator[Callable[[LeftOpen | Closed], None]]:
         """Record how the composition's window ends, exactly once, through
         the function it yields. What the body does not record itself is
@@ -5682,7 +4288,7 @@ end if
             yield _end
         except MailComposeWindowError as exc:
             if not ended:
-                _end(_composition_closing(exc.window_outcome, failure=str(exc)))
+                _end(composition_closing(exc.window_outcome, failure=str(exc)))
             raise
         except BaseException as exc:
             if not ended:
@@ -5690,7 +4296,7 @@ end if
             raise
 
     def _record_window_end(
-        self, window: _ComposeWindow, state: LeftOpen | Closed
+        self, window: ComposeWindow, state: LeftOpen | Closed
     ) -> None:
         """Write how a composition's window ended. A window left open
         wakes tending (``on_window_left_open``). The mail has already been
@@ -5709,7 +4315,7 @@ end if
 
     def _fill_compose(
         self,
-        window: _ComposeWindow,
+        window: ComposeWindow,
         *,
         seed: str,
         body: str,
@@ -5771,22 +4377,6 @@ end if
                 ) from e
             raise
 
-    @staticmethod
-    def _recipient_override_block(kind: str, addrs: list[str] | None) -> str:
-        """AppleScript that clears and re-populates one recipient group of
-        ``theMessage``: None keeps what Mail derived (``""``), ``[]``
-        clears it, a list replaces it."""
-        if addrs is None:
-            return ""
-        list_str = ", ".join(
-            f'"{escape_applescript_string(sanitize_input(a))}"' for a in addrs
-        )
-        return f"""
-                delete (every {kind} recipient of theMessage)
-                repeat with addr in {{{list_str}}}
-                    make new {kind} recipient at end of {kind} recipients of theMessage with properties {{address:addr}}
-                end repeat
-            """
 
     def _draft_headers_block(
         self,
@@ -5810,7 +4400,7 @@ end if
             subject_safe = escape_applescript_string(sanitize_input(subject))
             parts.append(f'set subject of theMessage to "{subject_safe}"')
         for kind, addrs in (("to", to), ("cc", cc), ("bcc", bcc)):
-            parts.append(self._recipient_override_block(kind, addrs))
+            parts.append(recipient_override_block(kind, addrs))
         # The SECURITY_CHECKLIST two-step idiom (sanitize_input then
         # escape_applescript_string) applies even though the resolver
         # pulls from Mail.app's own account list — the convention exists
@@ -5836,11 +4426,11 @@ end if
         operation: WindowOperation,
     ) -> str:
         """AppleScript body for ``wrap_as_json_script``: open the compose
-        window (``_build_creation_block``), name it by window-set diff,
+        window (``build_creation_block``), name it by window-set diff,
         apply the headers (``_draft_headers_block``), and set
         ``resultData`` to what the window holds: its name, subject and
         recipients, and the ids of the mailbox the ``operation``'s ending
-        is looked up in, taken before it opened (``_ENDING_MAILBOX``), so
+        is looked up in, taken before it opened (``ENDING_MAILBOX``), so
         a save finds the draft it made and a send the copy it filed.
 
         Mail retitles a compose window the moment its subject is set
@@ -5870,17 +4460,17 @@ end if
             if subject is not None
             else None
         )
-        creation_block = self._build_creation_block(
+        creation_block = build_creation_block(
             seed, seed_id_safe, reply_all, subject_safe,
         )
         headers_block = self._draft_headers_block(
             seed=seed, to=to, cc=cc, bcc=bcc, subject=subject, sender=sender,
         )
         snapshot = (
-            f"set beforeIds to (id of every message of {_ENDING_MAILBOX[operation]})"
+            f"set beforeIds to (id of every message of {ENDING_MAILBOX[operation]})"
         )
         renamed = (
-            self._as_new_compose_window_block()
+            as_new_compose_window_block()
             if seed != "new" and subject is not None
             else ""
         )
@@ -5900,7 +4490,7 @@ end tell
 set newName to ""
 set failure to ""
 try
-{self._as_new_compose_window_block()}
+{as_new_compose_window_block()}
 on error errMsg number errNum
     if newName is "" then error errMsg number errNum
     set failure to errMsg
@@ -5960,7 +4550,7 @@ end if
         subject: str | None,
         sender: str | None,
         operation: WindowOperation,
-    ) -> _ComposeWindow:
+    ) -> ComposeWindow:
         """Open the compose window ``_build_open_compose_script``
         describes, record it in the compose ledger, and return what the
         script reported; a seed that is gone is
@@ -5984,7 +4574,7 @@ end if
                 wrap_as_json_script(script, timeout=self.timeout), seed_id
             )
             report = cast(dict[str, Any], parse_applescript_json(raw))
-            window = _compose_window_from_report(report)
+            window = compose_window_from_report(report)
         except MailMessageNotFoundError:
             raise  # SEED_NOT_FOUND: raised before any window is asked for
         except (MailAppleScriptError, ValueError, KeyError, TypeError) as exc:
@@ -6018,7 +4608,7 @@ end if
         return window
 
     def _record_window_open(
-        self, window: _ComposeWindow, *, operation: WindowOperation, seed: Seed
+        self, window: ComposeWindow, *, operation: WindowOperation, seed: Seed
     ) -> str | None:
         """Record a window the connector just opened; its record id, or
         None when the ledger could not be written (logged: the window is
@@ -6042,7 +4632,7 @@ end if
     _ADOPT_WAIT_S = 10.0
     _ADOPT_POLL_S = 0.5
 
-    def _mail_window_snapshot(self) -> _WindowSnapshot:
+    def _mail_window_snapshot(self) -> WindowSnapshot:
         """Mail's process id and the ids of all its windows, read before a
         composition opens its window. Opens nothing."""
         raw = self._run_applescript(
@@ -6061,13 +4651,13 @@ end tell
             )
         )
         report = cast(dict[str, Any], parse_applescript_json(raw))
-        return _WindowSnapshot(
+        return WindowSnapshot(
             mail_pid=int(report["pid"]),
             window_ids=frozenset(int(i) for i in report.get("ids") or []),
         )
 
     def _build_adopt_script(
-        self, snapshot: _WindowSnapshot, expected_name: str | None
+        self, snapshot: WindowSnapshot, expected_name: str | None
     ) -> str:
         """Full osascript source: poll, for up to ``_ADOPT_WAIT_S``, for
         compose windows of the same Mail process whose ids were not in
@@ -6121,11 +4711,11 @@ tell application "Mail"
     set resultData to {{|same_pid|:samePid, |found|:found}}
 end tell
 """
-        return wrap_as_json_script(body, timeout=self.timeout) + _WINDOW_HANDLERS
+        return wrap_as_json_script(body, timeout=self.timeout) + WINDOW_HANDLERS
 
     def _adopt_unreported_windows(
         self,
-        snapshot: _WindowSnapshot,
+        snapshot: WindowSnapshot,
         *,
         expected_name: str | None,
         operation: WindowOperation,
@@ -6156,7 +4746,7 @@ end tell
             window_id = int(found["id"])
             if window_id in claimed:
                 continue
-            window = _ComposeWindow(
+            window = ComposeWindow(
                 name=str(found["name"]), subject="", to=[], cc=[], bcc=[],
                 before_ids=[], window_id=window_id, mail_pid=snapshot.mail_pid,
             )
@@ -6168,7 +4758,7 @@ end tell
             adopted += 1
         return adopted
 
-    def _save_compose_window_as_draft(self, window: _ComposeWindow) -> str:
+    def _save_compose_window_as_draft(self, window: ComposeWindow) -> str:
         """Close the compose window with Save, then find the draft it
         became: the Drafts entry with the window's subject that was not
         among the ids Drafts held before it opened, polled for and then

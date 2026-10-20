@@ -36,11 +36,8 @@ from typing import Any
 import pytest
 
 from apple_mail_mcp.compose_ledger import ComposeLedger
-from apple_mail_mcp.mail_connector import (
-    AppleMailConnector,
-    _SentCopy,
-    _SentCopyUnidentified,
-)
+from apple_mail_mcp.compose_window import SentMessageCopy, SentMessageCopyUnidentified
+from apple_mail_mcp.mail_connector import AppleMailConnector
 from apple_mail_mcp.script_blocks import wrap_as_json_script
 from apple_mail_mcp.utils import escape_applescript_string, parse_applescript_json
 
@@ -176,7 +173,7 @@ end tell
 
     found = connector._find_sent_copy(subject, [i for i in everything if i != target])
     print(f"left out {target}: found {found}")
-    assert isinstance(found, _SentCopy)
+    assert isinstance(found, SentMessageCopy)
     assert found.mail_id == str(target)
 
     connector._SENT_APPEAR_POLLS = 0  # one look: nothing new will come
@@ -185,4 +182,4 @@ end tell
     finally:
         del connector._SENT_APPEAR_POLLS
     print(f"left out nothing: {nothing}")
-    assert isinstance(nothing, _SentCopyUnidentified)
+    assert isinstance(nothing, SentMessageCopyUnidentified)

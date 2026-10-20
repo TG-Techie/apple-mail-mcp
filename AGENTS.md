@@ -155,7 +155,8 @@ Load these skills when working in their domains:
 ## Key Files
 
 - `src/apple_mail_mcp/mail_connector.py` — Core AppleScript client, the project's largest module (its line count is deliberately not recorded here, for the same reason as the test counts above)
-- `src/apple_mail_mcp/script_blocks.py` and `search_script.py` — the AppleScript fragments the connector's scripts share, and the search script, as pure text builders that never touch Mail
+- `src/apple_mail_mcp/script_blocks.py`, `search_script.py`, `compose_script.py` and `rule_script.py` — the AppleScript the connector runs, built as pure text (the shared fragments, the search, a composition, a rule); none of them touches Mail, so tests read their output without a mocked `osascript`
+- `src/apple_mail_mcp/compose_window.py` — a compose window and a sent copy as the connector reads them back, and the checks made on a composition's arguments, recipients and sent copy
 - `src/apple_mail_mcp/server.py` — the FastMCP instance, the connector, confirmation, the error envelope and `main`
 - `src/apple_mail_mcp/tools/` — the MCP tools, one module per domain
 - `src/apple_mail_mcp/security.py` — Input validation, audit logging, confirmation flows

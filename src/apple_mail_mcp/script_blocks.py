@@ -418,3 +418,43 @@ def take_links(record: dict[str, Any]) -> list[str]:
     links, warnings = links_from_source(source, message_id=message_id)
     record["links"] = links
     return warnings
+
+
+def build_flag_actions(
+    flagged: bool | None,
+    flag_color: str | None,
+) -> list[str]:
+    """Translate the (flagged, flag_color) patch into AppleScript
+    action strings. Pulled out of update_message in #174 to keep
+    that method below the CC ≤ 20 threshold.
+
+    Order of precedence: ``flagged=False`` always clears regardless
+    of color; ``flag_color`` set wins over bare ``flagged=True``;
+    bare ``flagged=True`` defaults to red (#185 fix).
+    """
+    from .utils import get_flag_index, validate_flag_color
+
+    if flagged is False:
+        return [
+            "set flag index of msg to -1",
+            "set flagged status of msg to false",
+        ]
+    if flag_color is not None:
+        if not validate_flag_color(flag_color):
+            raise ValueError(f"Invalid flag color: {flag_color}")
+        flag_index = get_flag_index(flag_color)
+        flagged_status = "true" if flag_color != "none" else "false"
+        return [
+            f"set flag index of msg to {flag_index}",
+            f"set flagged status of msg to {flagged_status}",
+        ]
+    if flagged is True:
+        # No color → default red. flag index 0 (red) sets bare \\Flagged
+        # on the IMAP server with no $MailFlagBit* keyword — same state
+        # the #152 IMAP fast path produces, ensuring path-independent
+        # rendering in Mail.app.
+        return [
+            f"set flag index of msg to {get_flag_index('red')}",
+            "set flagged status of msg to true",
+        ]
+    return []

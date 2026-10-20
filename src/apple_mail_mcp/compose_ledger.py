@@ -14,7 +14,7 @@ else's.
 A window is identified by Mail's own window ``id`` within one Mail
 process (``mail_pid``): names repeat (eighteen "New Message" windows at
 once, 2026-09-27), and a relaunched Mail gives the windows it restores
-new ids. The name is kept as ``_as_new_compose_window_block`` found it,
+new ids. The name is kept as ``as_new_compose_window_block`` found it,
 since every step addresses the window by name.
 
 A record's life, one file per window at ``<root>/<record_id>.json``::

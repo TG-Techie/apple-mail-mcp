@@ -37,8 +37,9 @@ from apple_mail_mcp.compose_tending import (
     inventory_from_report,
     plan_tending,
 )
+from apple_mail_mcp.compose_window import ComposeWindow
 from apple_mail_mcp.exceptions import MailAppleScriptError
-from apple_mail_mcp.mail_connector import AppleMailConnector, _ComposeWindow
+from apple_mail_mcp.mail_connector import AppleMailConnector
 from apple_mail_mcp.utils import parse_applescript_json
 
 from .conftest import TEST_DRAFT_SUBJECT_PREFIX
@@ -294,7 +295,7 @@ class TestWindowsNobodyRecorded:
 
             edited_at = time.time()
             connector._paste_verified(
-                window=_ComposeWindow(
+                window=ComposeWindow(
                     name=subject, subject=subject, to=[], cc=[], bcc=[],
                     before_ids=[], window_id=mine,
                 ),

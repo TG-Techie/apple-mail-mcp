@@ -77,7 +77,7 @@ LeftReason = Literal[
 ]
 
 # How Mail shows an attached file in a compose body: an image inline as
-# an AXImage, anything else as an AXButton (``_build_attachment_ax_verify_script``).
+# an AXImage, anything else as an AXButton (``build_attachment_ax_verify_script``).
 _ATTACHMENT_ROLES = frozenset({"AXButton", "AXImage"})
 _FINGERPRINT_LEN = 64
 
