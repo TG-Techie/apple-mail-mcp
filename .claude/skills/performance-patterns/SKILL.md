@@ -18,7 +18,7 @@ description: Use when optimizing Apple Mail MCP operations, diagnosing slow quer
 | `search_messages`, AppleScript path | ~1 s for 50 rows, ~0.5 s for 10, ~0.3 s for a subject filter matching nothing; ~1.5 s for a text filter that read a day's bodies for 20 rows, when no body was slow | Test account's INBOX, 2026-09-27; see "How the search reads" |
 | `get_message` (single) | <1s | Direct ID lookup |
 | `draft_send` | ~1-2s, plus a draft read and removal | The ~1-2s is Mail.app compose + send; reading the draft first and removing it after are further `osascript` calls |
-| `update_message` (bulk read/flag) | ~1-2s | Single script for N messages via `_bulk_repeat_block` |
+| `update_message` (bulk read/flag) | ~1-2s | Single script for N messages via `bulk_repeat_block` |
 | `update_message` (move) | ~1-3s | Varies by account type (Gmail slower) |
 | `save_attachments` | ~2-5s | Depends on attachment count/size |
 
@@ -54,12 +54,12 @@ Five other older messages cost 0.85-6.4 s each on the one read of them measured,
 
 ## How the search reads
 
-`AppleMailConnector._search_messages_applescript` builds on those numbers:
+The search script (`search_script.py`, run by `AppleMailConnector._search_messages_applescript`) builds on those numbers:
 
 - **Each filter's property** (subject, sender, read and flagged status, date received) is read for the whole mailbox in one event and tested in the script. This cost grows with the mailbox, as the old loop's `messages of mb` read already did.
-- **Each row property**, and each kind of recipient, is read once per run of matched positions (`<prop> of messages runStart thru runEnd of mailboxRef`). A run takes in up to 8 unmatched positions between two matches (`_SEARCH_RUN_GAP`): a range read's fixed ~10 ms is about what 8 more messages at 1.3 ms cost, so a wider gap is cheaper as a new run. This cost grows with the rows returned.
+- **Each row property**, and each kind of recipient, is read once per run of matched positions (`<prop> of messages runStart thru runEnd of mailboxRef`). A run takes in up to 8 unmatched positions between two matches (`SEARCH_RUN_GAP`): a range read's fixed ~10 ms is about what 8 more messages at 1.3 ms cost, so a wider gap is cheaper as a new run. This cost grows with the rows returned.
 - **Attachments** have no cheap bulk form and are asked one message at a time, through a reference by id, only of messages the other filters kept.
-- **Body and text** read the content over runs of the positions the other filters kept (`content of messages a thru b`), and only those: a run takes in no position they dropped (`_SEARCH_CONTENT_RUN_GAP` is 0), since the cheapest body costs about the event a gap would save and a dear one costs seconds. The kept positions wait until they are as many as the matches still wanted, or 50 (`_SEARCH_CONTENT_BATCH`), or the scan ends, so no body is read past the limit and no one read holds more than 50. A text filter's subject and sender are read for the whole mailbox, like a filter's property, rather than two events for each message.
+- **Body and text** read the content over runs of the positions the other filters kept (`content of messages a thru b`), and only those: a run takes in no position they dropped (`SEARCH_CONTENT_RUN_GAP` is 0), since the cheapest body costs about the event a gap would save and a dear one costs seconds. The kept positions wait until they are as many as the matches still wanted, or 50 (`SEARCH_CONTENT_BATCH`), or the scan ends, so no body is read past the limit and no one read holds more than 50. A text filter's subject and sender are read for the whole mailbox, like a filter's property, rather than two events for each message.
 - **Fallbacks:** a bulk read that fails is warned about and redone one message at a time. The lists must line up by position (each as long as the id list, a content run's ids, read after its bodies, the ones the filters kept, each row's id the one the filters matched, the first and last matched ids read again at the end); when they do not, the mailbox changed under the reads and the search runs again one message at a time, with a warning.
 - **The limit** is a counter that ends the scan; with no filter the rows are the first `limit` positions, read as one run.
 

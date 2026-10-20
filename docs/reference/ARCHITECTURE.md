@@ -128,7 +128,7 @@ operation log become fleet-wide.
 
 **Structured responses:** Every tool returns `{"success": bool, ...}`. Errors include `error` (message) and `error_type` (category). No exceptions reach the LLM.
 
-**JSON output via ASObjC:** AppleScript results are serialized with `NSJSONSerialization` (`_wrap_as_json_script` in `mail_connector.py`) and parsed on the Python side with `parse_applescript_json` (`utils.py`). Record keys that collide with AppleScript selectors (e.g. `name`) must be written `|name|:` in the AppleScript literal or NSDictionary conversion silently drops them — see the applescript-mail skill.
+**JSON output via ASObjC:** AppleScript results are serialized with `NSJSONSerialization` (`wrap_as_json_script` in `script_blocks.py`) and parsed on the Python side with `parse_applescript_json` (`utils.py`). Record keys that collide with AppleScript selectors (e.g. `name`) must be written `|name|:` in the AppleScript literal or NSDictionary conversion silently drops them — see the applescript-mail skill.
 
 **IMAP fast paths, AppleScript as the universal fallback:** for move-only, read-only, flag-only, and delete patches where the caller supplies both `account` and `source_mailbox`, `mail_connector.py` tries direct IMAP (via `imap_connector.py`, credentials from `keychain.py`) before falling back to the AppleScript `whose`-clause scan. Any IMAP-specific failure (missing Keychain entry, login error, unsupported capability, transient OS error) falls straight through to AppleScript rather than surfacing to the caller.
 

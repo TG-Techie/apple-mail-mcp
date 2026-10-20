@@ -92,7 +92,7 @@ quoted original and a forward's own attachments.
 
 ## AppleScript Gotchas
 
-**JSON output from AppleScript:** Scripts emit JSON via ASObjC + `NSJSONSerialization` (wrap with `_wrap_as_json_script`, parse with `parse_applescript_json`). Always quote the `name` record key as `|name|:` — the bare form is silently dropped during NSDictionary conversion. Coerce `missing value` to safe defaults (`{}` / `0`) before serializing. See applescript-mail skill for details. Observed 2026-09-27: a `resultData` holding `|mv_in_record|:missing value` and `|mv_in_list|:{1, missing value, "x"}`, run through `_wrap_as_json_script`, came back as `"mv_in_list":[1,null,"x"],"mv_in_record":null`; when the rejection happens is not established, so coercing stays the safe practice.
+**JSON output from AppleScript:** Scripts emit JSON via ASObjC + `NSJSONSerialization` (wrap with `wrap_as_json_script` from `script_blocks.py`, parse with `parse_applescript_json`). Always quote the `name` record key as `|name|:` — the bare form is silently dropped during NSDictionary conversion. Coerce `missing value` to safe defaults (`{}` / `0`) before serializing. See applescript-mail skill for details. Observed 2026-09-27: a `resultData` holding `|mv_in_record|:missing value` and `|mv_in_list|:{1, missing value, "x"}`, run through `wrap_as_json_script`, came back as `"mv_in_list":[1,null,"x"],"mv_in_record":null`; when the rejection happens is not established, so coercing stays the safe practice.
 
 **Gmail mode:** Gmail's label-based system doesn't support standard IMAP move. The `update_message` tool has a `gmail_mode` parameter that uses copy+delete instead of move.
 
@@ -155,6 +155,7 @@ Load these skills when working in their domains:
 ## Key Files
 
 - `src/apple_mail_mcp/mail_connector.py` — Core AppleScript client, the project's largest module (its line count is deliberately not recorded here, for the same reason as the test counts above)
+- `src/apple_mail_mcp/script_blocks.py` and `search_script.py` — the AppleScript fragments the connector's scripts share, and the search script, as pure text builders that never touch Mail
 - `src/apple_mail_mcp/server.py` — the FastMCP instance, the connector, confirmation, the error envelope and `main`
 - `src/apple_mail_mcp/tools/` — the MCP tools, one module per domain
 - `src/apple_mail_mcp/security.py` — Input validation, audit logging, confirmation flows

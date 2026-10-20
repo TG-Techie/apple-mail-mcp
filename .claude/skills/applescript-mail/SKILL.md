@@ -7,9 +7,9 @@ description: Use when writing, modifying, or debugging ANY AppleScript that inte
 
 ## Emitting JSON from AppleScript
 
-Scripts emit JSON via ASObjC + `NSJSONSerialization` (not pipe-delimited text). Use the `_wrap_as_json_script(body)` helper in `mail_connector.py` and parse responses with `parse_applescript_json(result)` from `utils.py`.
+Scripts emit JSON via ASObjC + `NSJSONSerialization` (not pipe-delimited text). Use the `wrap_as_json_script(body)` helper in `script_blocks.py` and parse responses with `parse_applescript_json(result)` from `utils.py`.
 
-**Tell-block contract:** the body passed to `_wrap_as_json_script` must contain a `tell application "Mail" ... end tell` block and assign the final value to a variable named `resultData` (list, record, or scalar).
+**Tell-block contract:** the body passed to `wrap_as_json_script` must contain a `tell application "Mail" ... end tell` block and assign the final value to a variable named `resultData` (list, record, or scalar).
 
 **Record key gotcha — always quote `name`:** Use `|name|:(name of acc)`, never `name:(name of acc)`. The bare form collides with NSObject's `name` selector and the key is silently dropped during NSDictionary conversion, leaving records without their name field.
 
@@ -19,7 +19,7 @@ set accEmails to email addresses of acc
 if accEmails is missing value then set accEmails to {}
 ```
 
-Observed 2026-09-27, against that rule: a record `{|mv_in_record|:missing value, |mv_in_list|:{1, missing value, "x"}}` returned through `_wrap_as_json_script` inside a Mail tell block came back as `"mv_in_list":[1,null,"x"],"mv_in_record":null`, not an error. When the rejection does happen is not established, so keep coercing; that is the safe practice until someone finds the case.
+Observed 2026-09-27, against that rule: a record `{|mv_in_record|:missing value, |mv_in_list|:{1, missing value, "x"}}` returned through `wrap_as_json_script` inside a Mail tell block came back as `"mv_in_list":[1,null,"x"],"mv_in_record":null`, not an error. When the rejection does happen is not established, so keep coercing; that is the safe practice until someone finds the case.
 
 **Error propagation:** Do NOT wrap the tell-body in `try / on error` when you want typed exceptions (`MailAccountNotFoundError`, `MailMessageNotFoundError`, etc.). Let AppleScript errors bubble via stderr — `_run_applescript` maps them to the right exception type.
 
