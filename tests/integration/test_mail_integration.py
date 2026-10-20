@@ -1662,7 +1662,7 @@ class TestRuleCRUDIntegration:
             # on macOS Tahoe has a recursion bug in
             # removeFromCriteriaAtIndex: that crashes Mail on any path that
             # removes a rule condition. The connector refuses `conditions=`
-            # with MailUnsupportedRuleActionError; see test_mail_connector
+            # with MailUnsupportedRuleActionError; see test_connector_rules
             # for unit coverage of the refusal.
             renamed = self.TEST_RULE_NAME + " v2"
             connector.update_rule(

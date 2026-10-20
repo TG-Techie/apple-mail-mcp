@@ -4,7 +4,7 @@ and a tending pass reads the windows and closes, by Mail's id for each,
 the ones the ledger says are the connector's and abandoned, and any whose
 content has not changed for the stale period
 (docs/research/compose-window-tending.md). Mail is answered script by
-script, as in test_mail_connector.py."""
+script, as in test_connector_compose.py."""
 
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ from apple_mail_mcp.exceptions import (
 )
 from apple_mail_mcp.mail_connector import AppleMailConnector
 
-from .test_mail_connector import _compose_outcomes, _scripted
+from .test_connector_compose import _compose_outcomes, _scripted
 
 PID = 77701
 WINDOW_ID = 2900
