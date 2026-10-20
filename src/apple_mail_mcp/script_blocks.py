@@ -287,8 +287,10 @@ def recipient_read_block(
     ``warnings_var`` (which the caller initialises), so an unreadable
     list is reported rather than passed off as an empty one, and one
     bad kind does not take the others with it. A recipient without a
-    display name has Mail's ``missing value`` as its name, which JSON
-    cannot carry; it becomes ``""``, as does a missing address.
+    display name has Mail's ``missing value`` as its name; it becomes
+    ``""``, as does a missing address, so the field is always a string
+    (a ``missing value`` left in a record came back as JSON ``null``, not
+    an error, in the check of 2026-09-27 recorded in AGENTS.md).
 
     With ``from_runs``, the search's bulk path is the caller: each kind
     was read for a run of messages at once into ``<key>Run`` (reached
