@@ -61,7 +61,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from apple_mail_mcp.mail_connector import AppleMailConnector, _wrap_as_json_script
+from apple_mail_mcp.mail_connector import AppleMailConnector
+from apple_mail_mcp.script_blocks import wrap_as_json_script
 from apple_mail_mcp.utils import escape_applescript_string, parse_applescript_json
 
 PREFIX = "ZZZ-AMM-INTEG-spike-"
@@ -337,7 +338,7 @@ tell application "Mail"
     set resultData to {{|window|:newName, |before_ids|:beforeIds}}
 end tell
 '''
-    raw = connector._run_applescript(_wrap_as_json_script(body, timeout=connector.timeout))
+    raw = connector._run_applescript(wrap_as_json_script(body, timeout=connector.timeout))
     return dict(parse_applescript_json(raw))
 
 

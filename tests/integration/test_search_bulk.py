@@ -42,8 +42,9 @@ from typing import Any, cast
 
 import pytest
 
-from apple_mail_mcp import mail_connector
-from apple_mail_mcp.mail_connector import AppleMailConnector, _wrap_as_json_script
+from apple_mail_mcp import search_script
+from apple_mail_mcp.mail_connector import AppleMailConnector
+from apple_mail_mcp.script_blocks import wrap_as_json_script
 from apple_mail_mcp.utils import escape_applescript_string, parse_applescript_json
 
 from .conftest import TEST_DRAFT_SUBJECT_PREFIX
@@ -91,7 +92,7 @@ tell application "Mail"
 end tell
 """
     raw = AppleMailConnector(timeout=120)._run_applescript(
-        _wrap_as_json_script(body, timeout=120)
+        wrap_as_json_script(body, timeout=120)
     )
     name = str(cast(dict[str, Any], parse_applescript_json(raw))["name"])
     if not name:
@@ -119,7 +120,7 @@ tell application "Mail"
     end repeat
 end tell
 """
-    raw = connector._run_applescript(_wrap_as_json_script(body, timeout=120))
+    raw = connector._run_applescript(wrap_as_json_script(body, timeout=120))
     return [str(i) for i in cast(list[Any], parse_applescript_json(raw))]
 
 
@@ -182,7 +183,7 @@ tell application "Mail"
     end if
 end tell
 """
-    raw = connector._run_applescript(_wrap_as_json_script(body, timeout=120))
+    raw = connector._run_applescript(wrap_as_json_script(body, timeout=120))
     day = str(cast(dict[str, Any], parse_applescript_json(raw))["day"])
     if not day:
         pytest.skip(f"{mailbox!r} is empty")
@@ -241,7 +242,7 @@ class TestTheRowsAreMailsOwn:
         trash = _trash_name(test_account)
         criteria = {"subject_contains": TEST_DRAFT_SUBJECT_PREFIX, "limit": _MARKED_LIMIT}
         merged, _ = _search(connector, test_account, trash, **criteria)
-        monkeypatch.setattr(mail_connector, "_SEARCH_RUN_GAP", 0)
+        monkeypatch.setattr(search_script, "SEARCH_RUN_GAP", 0)
         split, warnings = _search(connector, test_account, trash, **criteria)
         assert warnings == []
         assert split == merged
@@ -344,7 +345,7 @@ class TestTheFallbacksGiveTheSameRows:
             subject_contains=TEST_DRAFT_SUBJECT_PREFIX, limit=_MARKED_LIMIT,
         )
         assert broken == intact
-        assert warnings == [mail_connector._SEARCH_OUT_OF_LINE_WARNING]
+        assert warnings == [search_script.SEARCH_OUT_OF_LINE_WARNING]
 
 
 class TestTheContentIsReadInBulk:
@@ -406,7 +407,7 @@ class TestTheContentIsReadInBulk:
         assert warnings == []
         if len(whole) < 2:
             pytest.skip(f"fewer than two INBOX messages since {since} match")
-        monkeypatch.setattr(mail_connector, "_SEARCH_CONTENT_BATCH", 1)
+        monkeypatch.setattr(search_script, "SEARCH_CONTENT_BATCH", 1)
         one_by_one, warnings = _search(connector, test_account, "INBOX", **criteria)
         assert warnings == []
         _assert_same_rows(one_by_one, whole)

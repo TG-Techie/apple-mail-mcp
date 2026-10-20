@@ -34,7 +34,8 @@ from typing import Any, cast
 import pytest
 
 from apple_mail_mcp.links import MAX_LINKS
-from apple_mail_mcp.mail_connector import AppleMailConnector, _wrap_as_json_script
+from apple_mail_mcp.mail_connector import AppleMailConnector
+from apple_mail_mcp.script_blocks import wrap_as_json_script
 from apple_mail_mcp.utils import escape_applescript_string, parse_applescript_json
 
 from .conftest import TEST_DRAFT_SUBJECT_PREFIX
@@ -137,7 +138,7 @@ tell application "Mail"
     end repeat
 end tell
 """
-    raw = connector._run_applescript(_wrap_as_json_script(body, timeout=120))
+    raw = connector._run_applescript(wrap_as_json_script(body, timeout=120))
     found = cast(Any, parse_applescript_json(raw))
     if not found:
         pytest.skip(

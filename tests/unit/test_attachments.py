@@ -80,7 +80,7 @@ class TestGetAttachments:
         connector.get_attachments("12345")
         script = mock_run.call_args[0][0]
         # The VALUE is now a pre-read variable (each property is read
-        # under its own try — see _attachment_walk_block); the KEY must
+        # under its own try — see attachment_walk_block); the KEY must
         # still be pipe-quoted, which is what this guard is about.
         assert "|name|:attName" in script
         assert ", name:" not in script

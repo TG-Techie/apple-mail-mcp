@@ -40,8 +40,8 @@ from apple_mail_mcp.mail_connector import (
     AppleMailConnector,
     _SentCopy,
     _SentCopyUnidentified,
-    _wrap_as_json_script,
 )
+from apple_mail_mcp.script_blocks import wrap_as_json_script
 from apple_mail_mcp.utils import escape_applescript_string, parse_applescript_json
 
 from .conftest import TEST_DRAFT_SUBJECT_PREFIX
@@ -79,7 +79,7 @@ def module_trash(connector: AppleMailConnector) -> Iterator[MailTrash]:
 def _sent_record(connector: AppleMailConnector, mail_id: str) -> dict[str, Any]:
     """The message in Sent with Mail's id ``mail_id``, read on its own:
     its subject, Message-ID and file names."""
-    raw = connector._run_applescript(_wrap_as_json_script(f"""
+    raw = connector._run_applescript(wrap_as_json_script(f"""
 tell application "Mail"
     set m to first message of sent mailbox whose id is "{escape_applescript_string(mail_id)}"
     set attNames to name of every mail attachment of m
@@ -92,7 +92,7 @@ end tell
 
 def _sent_ids(connector: AppleMailConnector) -> list[int]:
     """Mail's ids for every message in Sent, every account's."""
-    raw = connector._run_applescript(_wrap_as_json_script(
+    raw = connector._run_applescript(wrap_as_json_script(
         'tell application "Mail"\n'
         "    set resultData to (id of every message of sent mailbox)\n"
         "end tell",
@@ -154,7 +154,7 @@ def test_the_look_finds_the_one_id_its_snapshot_lacks(
     id. With nothing left out it finds nothing, though the subject is in
     Sent: an older copy of a subject is never taken for a new one."""
     prefix = escape_applescript_string(TEST_DRAFT_SUBJECT_PREFIX)
-    raw = connector._run_applescript(_wrap_as_json_script(f"""
+    raw = connector._run_applescript(wrap_as_json_script(f"""
 tell application "Mail"
     set resultData to {{}}
     set marked to (messages of sent mailbox whose subject begins with "{prefix}")

@@ -32,8 +32,8 @@ from apple_mail_mcp.mail_connector import (
     AppleMailConnector,
     _ComposeWindow,
     _WindowSnapshot,
-    _wrap_as_json_script,
 )
+from apple_mail_mcp.script_blocks import wrap_as_json_script
 from apple_mail_mcp.utils import SANITIZE_MAX_LENGTH
 
 
@@ -926,7 +926,7 @@ class TestAppleMailConnector:
         assert "|port|:(port of acctRef)" in script
         assert "|user_name|:(user name of acctRef)" in script
         assert "|email_addresses|:acctEmails" in script
-        # Must assign to resultData for _wrap_as_json_script to serialize.
+        # Must assign to resultData for wrap_as_json_script to serialize.
         assert "set resultData to" in script
 
     @patch.object(AppleMailConnector, "_run_applescript")
@@ -4752,14 +4752,14 @@ class TestSearchReadsInBulk:
         the matches still wanted, so no body is read past the point
         where the limit is reached; and at most a batch of them at a
         time, however high the limit."""
-        from apple_mail_mcp.mail_connector import _SEARCH_CONTENT_BATCH
+        from apple_mail_mcp.search_script import SEARCH_CONTENT_BATCH
 
         bulk = self._bulk(
             self._script(mock_run, connector, body_contains="budget", limit=10)
         )
         assert (
             "if candCount > 0 and (candCount >= 10 - matchCount or "
-            f"candCount >= {_SEARCH_CONTENT_BATCH} or i = total) then" in bulk
+            f"candCount >= {SEARCH_CONTENT_BATCH} or i = total) then" in bulk
         )
         assert bulk.count("if matchCount >= 10 then exit repeat") == 1
 
@@ -4767,13 +4767,13 @@ class TestSearchReadsInBulk:
     def test_a_content_run_takes_in_no_position_the_criteria_dropped(
         self, mock_run: MagicMock, connector: AppleMailConnector
     ) -> None:
-        from apple_mail_mcp.mail_connector import _SEARCH_CONTENT_RUN_GAP
+        from apple_mail_mcp.search_script import SEARCH_CONTENT_RUN_GAP
 
-        assert _SEARCH_CONTENT_RUN_GAP == 0
+        assert SEARCH_CONTENT_RUN_GAP == 0
         bulk = self._bulk(self._script(mock_run, connector, body_contains="budget"))
         assert (
             f"if (item (candLast + 1) of candsRef) - runEnd > "
-            f"{_SEARCH_CONTENT_RUN_GAP + 1} then exit repeat" in bulk
+            f"{SEARCH_CONTENT_RUN_GAP + 1} then exit repeat" in bulk
         )
 
     @patch.object(AppleMailConnector, "_run_applescript")
@@ -4924,10 +4924,10 @@ class TestSearchReadsInBulk:
     def test_a_run_absorbs_a_short_gap(
         self, mock_run: MagicMock, connector: AppleMailConnector
     ) -> None:
-        from apple_mail_mcp.mail_connector import _SEARCH_RUN_GAP
+        from apple_mail_mcp.search_script import SEARCH_RUN_GAP
 
         bulk = self._bulk(self._script(mock_run, connector, subject_contains="q3"))
-        assert f"else if idx - runEnd > {_SEARCH_RUN_GAP + 1} then" in bulk
+        assert f"else if idx - runEnd > {SEARCH_RUN_GAP + 1} then" in bulk
 
     @patch.object(AppleMailConnector, "_run_applescript")
     def test_the_fallback_warnings_reach_the_caller(
@@ -5029,7 +5029,7 @@ class TestDualEmitRfcMessageId:
         mail) yields `rfc_message_id: null` from AppleScript →
         `None` in the Python row. Mocked here at the parsed-JSON
         layer; the AppleScript-side missing-value coercion is handled
-        by NSJSONSerialization in `_wrap_as_json_script`."""
+        by NSJSONSerialization in `wrap_as_json_script`."""
         mock_run.return_value = (
             '[{"id": "200", "rfc_message_id": null,'
             '"subject": "draft", "sender": "", "date_received": "Tue",'
@@ -5945,7 +5945,7 @@ class TestComposition:
 
 class TestWrapAsJsonScript:
     def test_wrapper_contains_framework_directive(self) -> None:
-        script = _wrap_as_json_script(
+        script = wrap_as_json_script(
             'tell application "Mail"\n    set resultData to {}\nend tell',
             timeout=60,
         )
@@ -5953,7 +5953,7 @@ class TestWrapAsJsonScript:
         assert "use scripting additions" in script
 
     def test_wrapper_appends_json_serialization(self) -> None:
-        script = _wrap_as_json_script(
+        script = wrap_as_json_script(
             'tell application "Mail"\n    set resultData to {}\nend tell',
             timeout=60,
         )
@@ -5962,12 +5962,12 @@ class TestWrapAsJsonScript:
 
     def test_wrapper_preserves_body(self) -> None:
         body = 'tell application "Mail"\n    set resultData to {name:"INBOX"}\nend tell'
-        script = _wrap_as_json_script(body, timeout=60)
+        script = wrap_as_json_script(body, timeout=60)
         assert body in script
 
     def test_wrapper_orders_framework_before_body_before_epilogue(self) -> None:
         body = 'tell application "Mail"\n    set resultData to {name:"INBOX"}\nend tell'
-        script = _wrap_as_json_script(body, timeout=60)
+        script = wrap_as_json_script(body, timeout=60)
         framework_idx = script.index('use framework "Foundation"')
         body_idx = script.index(body)
         epilogue_idx = script.index("NSJSONSerialization")
@@ -5980,7 +5980,7 @@ class TestWrapAsJsonScript:
 
     def test_wrapper_includes_with_timeout_clause(self) -> None:
         body = 'tell application "Mail"\n    set resultData to {}\nend tell'
-        script = _wrap_as_json_script(body, timeout=180)
+        script = wrap_as_json_script(body, timeout=180)
         assert "with timeout of 180 seconds" in script
         assert "end timeout" in script
 
@@ -5988,7 +5988,7 @@ class TestWrapAsJsonScript:
         """The tell block must be inside the with-timeout block — putting it
         outside leaves the AppleEvent default of 60 s in force."""
         body = 'tell application "Mail"\n    set resultData to {}\nend tell'
-        script = _wrap_as_json_script(body, timeout=180)
+        script = wrap_as_json_script(body, timeout=180)
         with_idx = script.index("with timeout of 180 seconds")
         body_idx = script.index(body)
         end_timeout_idx = script.index("end timeout")
@@ -5997,7 +5997,7 @@ class TestWrapAsJsonScript:
     @pytest.mark.parametrize("timeout", [30, 60, 120, 300, 600])
     def test_wrapper_emits_caller_supplied_timeout(self, timeout: int) -> None:
         body = 'tell application "Mail"\n    set resultData to {}\nend tell'
-        script = _wrap_as_json_script(body, timeout=timeout)
+        script = wrap_as_json_script(body, timeout=timeout)
         assert f"with timeout of {timeout} seconds" in script
 
 

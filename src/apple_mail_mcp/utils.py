@@ -7,6 +7,10 @@ import re
 from collections.abc import Iterable
 from typing import Any
 
+# Strict ISO 8601 YYYY-MM-DD: the search's date_from/date_to filters reject
+# anything else, to keep AppleScript injection out of the date clause.
+ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
 _UUID_RE = re.compile(
     r"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
 )
@@ -366,11 +370,11 @@ def get_flag_index(color: str) -> int:
 def parse_applescript_json(result: str) -> Any:
     """Parse JSON emitted by an AppleScript helper, or raise on ERROR: prefix.
 
-    AppleScript scripts wrapped with _wrap_as_json_script return either:
+    AppleScript scripts wrapped with wrap_as_json_script return either:
     - A JSON-serialized string (list, dict, or scalar), or
     - "ERROR: <message>" when the tell-block catches an error.
 
-    Note: the "ERROR:" prefix is a sentinel only valid because _wrap_as_json_script
+    Note: the "ERROR:" prefix is a sentinel only valid because wrap_as_json_script
     returns list/dict payloads — a bare JSON string starting with "ERROR:" would be
     misread. Wrapped scripts must never return a bare-string top-level value.
 

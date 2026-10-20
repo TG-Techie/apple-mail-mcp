@@ -23,7 +23,6 @@ See ``docs/plans/2026-04-23-imap-connector-design.md``.
 from __future__ import annotations
 
 import logging
-import re
 import threading
 import time
 from collections.abc import Iterator
@@ -46,16 +45,9 @@ from .exceptions import (
     MailMessageNotFoundError,
 )
 from .links import links_from_source
-from .utils import format_address, format_recipients
+from .utils import ISO_DATE_RE, format_address, format_recipients
 
 logger = logging.getLogger(__name__)
-
-# Strict ISO 8601 YYYY-MM-DD. Duplicated from mail_connector to break an
-# otherwise-circular import: mail_connector.search_messages delegates to
-# this module, so mail_connector has to import from imap_connector, and a
-# reverse dependency would deadlock. The regex is trivial; duplication is
-# preferable to reshuffling the module layout.
-_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 CONNECT_TIMEOUT_S: float = 3.0
 """Per invariant 4 in imap-auth-options-decision.md: ≤3s so offline
@@ -223,7 +215,7 @@ _IMAP_MONTHS = (
 
 
 def _iso_to_imap_date(iso: str, field: str) -> str:
-    if not _ISO_DATE_RE.match(iso):
+    if not ISO_DATE_RE.match(iso):
         raise ValueError(
             f"{field} must be ISO 8601 YYYY-MM-DD, got: {iso!r}"
         )
@@ -233,7 +225,7 @@ def _iso_to_imap_date(iso: str, field: str) -> str:
 
 def _iso_to_imap_before(iso: str, field: str) -> str:
     """Upper-bound helper: IMAP BEFORE is exclusive; pass date + 1 day."""
-    if not _ISO_DATE_RE.match(iso):
+    if not ISO_DATE_RE.match(iso):
         raise ValueError(
             f"{field} must be ISO 8601 YYYY-MM-DD, got: {iso!r}"
         )

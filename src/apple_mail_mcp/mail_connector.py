@@ -12,7 +12,6 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import date as _date
-from datetime import timedelta as _timedelta
 from email.utils import parseaddr
 from pathlib import Path
 from typing import IO, Any, Literal, cast
@@ -66,23 +65,30 @@ from .exceptions import (
 )
 from .imap_connector import ImapConnectionPool, ImapConnector
 from .keychain import get_imap_password
-from .links import (
-    MAX_SOURCE_BYTES,
-    links_from_source,
-    source_too_large_warning,
-    source_unreadable_warning,
-)
 from .outbound_allowlist import (
     assert_forward_targets_allowed,
     assert_recipients_allowed_for_send,
 )
+from .script_blocks import (
+    RECIPIENT_FIELDS,
+    SOURCE_FIELDS,
+    attachment_walk_block,
+    bulk_repeat_block,
+    recipient_read_block,
+    render_recipients,
+    source_read_block,
+    take_links,
+    wrap_as_json_script,
+)
+from .search_script import (
+    search_criteria,
+    search_script_body,
+)
 from .utils import (
     SANITIZE_MAX_LENGTH,
     applescript_account_clause,
-    applescript_iso_date_statements,
     distinct_filenames,
     escape_applescript_string,
-    format_recipients,
     get_flag_index,
     parse_applescript_json,
     safe_attachment_filename,
@@ -106,10 +112,6 @@ _IMAP_FALLBACK_EXCS: tuple[type[Exception], ...] = (
 )
 
 logger = logging.getLogger(__name__)
-
-# Strict ISO 8601 YYYY-MM-DD — search_messages's date_from/date_to filters
-# reject anything else to prevent AppleScript injection via the date clause.
-_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 # Threshold (seconds) above which the AppleScript search path emits an
 # INFO-level recommendation to enable IMAP delegation. Calibrated against
@@ -566,1147 +568,6 @@ _RULE_OPERATOR_MAP = {
 }
 
 
-def _wrap_as_json_script(body: str, *, timeout: int) -> str:
-    """Wrap a tell-block body with ASObjC imports and an NSJSONSerialization return.
-
-    The `body` must:
-      - Contain a `tell application "Mail" ... end tell` block.
-      - Assign the final result to an AppleScript variable named `resultData`
-        inside that tell block.
-      - Handle failures EITHER by letting AppleScript errors propagate via
-        stderr (preserves _run_applescript's typed exception mapping, e.g.,
-        MailAccountNotFoundError) OR by catching them in a try block and
-        returning "ERROR: <message>" (surfaces as MailAppleScriptError on
-        the Python side). Use the stderr path when the caller relies on
-        typed exceptions; use the "ERROR:" path otherwise.
-
-    The wrapper:
-      - Prepends `use framework "Foundation"` and `use scripting additions`.
-      - Wraps the body in `with timeout of {timeout} seconds ... end timeout`
-        so Mail's default 60 s AppleEvent timeout does not fire before the
-        connector's subprocess timeout — see issue #227. Without this,
-        per-message property fetches on Exchange/EWS mailboxes (server-
-        bound, not local) trip `AppleEvent timed out (-1712)` and leave the
-        scripting bridge in `Connection is invalid (-609)` for ~30 s.
-      - After the tell block, serializes `resultData` via NSJSONSerialization
-        and returns the resulting NSString as text. The serializer runs in
-        the ASObjC bridge (no AppleEvent) so it is intentionally OUTSIDE the
-        timeout block — but `resultData` is still visible because AppleScript
-        `with timeout` is a control construct, not a scope.
-
-    Args:
-        body: AppleScript tell-block source setting `resultData`.
-        timeout: AppleEvent timeout in seconds for the wrapped tell block.
-            Callers should pass ``self.timeout`` so the in-script timeout
-            matches the subprocess-level kill timer.
-
-    Returns:
-        Full AppleScript source ready for osascript.
-    """
-    return (
-        'use framework "Foundation"\n'
-        "use scripting additions\n"
-        "\n"
-        f"with timeout of {timeout} seconds\n"
-        f"{body}\n"
-        "end timeout\n"
-        "\n"
-        "set jsonData to (current application's NSJSONSerialization's "
-        "dataWithJSONObject:resultData options:0 |error|:(missing value))\n"
-        "return (current application's NSString's alloc()'s "
-        "initWithData:jsonData encoding:4) as text\n"
-    )
-
-
-def _bulk_repeat_block(
-    *,
-    account: str | None,
-    source_mailbox: str | None,
-    actions: list[str],
-    counter_var: str,
-) -> str:
-    """Emit the AppleScript repeat block for a bulk-mutation operation.
-
-    When `account` and `source_mailbox` are both provided, emits a narrow
-    O(N) loop scoped to a single mailbox. When both are None, falls back
-    to the legacy O(N × accounts × mailboxes) cross-scan for backwards
-    compatibility; that scan stops at the first mailbox that holds an id,
-    so a message filed under several Gmail labels is acted on and counted
-    once. Any partial-pair raises ValueError — a mailbox name without an
-    account is ambiguous (the same name can exist across multiple
-    accounts).
-
-    Args:
-        account: Account name or UUID, or None.
-        source_mailbox: Source mailbox name, or None.
-        actions: One or more AppleScript statements to run inside the
-            loop AFTER `set msg to first message ... whose id is msgId`.
-            The counter increment is appended automatically.
-        counter_var: Name of the AppleScript counter variable (e.g.
-            "updateCount", "moveCount") that gets incremented per success.
-
-    Returns:
-        AppleScript fragment ready to interpolate into a `tell application
-        "Mail"` block.
-
-    Raises:
-        ValueError: If exactly one of `account`/`source_mailbox` is given.
-    """
-    if (account is None) != (source_mailbox is None):
-        missing = "source_mailbox" if account is not None else "account"
-        raise ValueError(
-            f"account and source_mailbox must be provided together; "
-            f"missing {missing}"
-        )
-
-    if account is not None and source_mailbox is not None:
-        # Narrow path: single mailbox, single loop. O(N).
-        action_indent = " " * 20
-        action_lines = "\n".join(action_indent + a for a in actions)
-        account_clause = applescript_account_clause(account)
-        mb_safe = escape_applescript_string(sanitize_input(source_mailbox))
-        return (
-            f'            set sourceMb to mailbox "{mb_safe}" of {account_clause}\n'
-            f"            repeat with msgId in idList\n"
-            f"                try\n"
-            f"                    set msg to first message of sourceMb whose id is msgId\n"
-            f"{action_lines}\n"
-            f"                    set {counter_var} to {counter_var} + 1\n"
-            f"                end try\n"
-            f"            end repeat"
-        )
-
-    # Cross-scan path (legacy / backwards compat). O(N × M × K).
-    #
-    # Each id contributes at most once. Gmail exposes every label as a
-    # mailbox and files one message under each label it carries, so the
-    # same message matches in INBOX, All Mail and every user label. Without
-    # leaving the scan on the first match, the actions ran and the counter
-    # bumped once per label: update_message on one message returned 2, and
-    # the count is the only success signal these tools have. Mail's numeric
-    # `id` is unique per message, so the first match is the right one.
-    #
-    # `exit repeat` leaves only the innermost loop, hence the flag: it ends
-    # the mailbox loop directly and the account loop on the next check.
-    action_indent = " " * 28
-    action_lines = "\n".join(action_indent + a for a in actions)
-    return (
-        f"            repeat with msgId in idList\n"
-        f"                set matched to false\n"
-        f"                repeat with acc in accounts\n"
-        f"                    repeat with mb in mailboxes of acc\n"
-        f"                        try\n"
-        f"                            set msg to first message of mb whose id is msgId\n"
-        f"{action_lines}\n"
-        f"                            set {counter_var} to {counter_var} + 1\n"
-        f"                            set matched to true\n"
-        f"                            exit repeat\n"
-        f"                        end try\n"
-        f"                    end repeat\n"
-        f"                    if matched then exit repeat\n"
-        f"                end repeat\n"
-        f"            end repeat"
-    )
-
-
-# Attachment-record properties, in emitted order:
-#   (AppleScript property expression, JSON key, AppleScript variable,
-#    AppleScript literal used as the on-failure default)
-# Each is read under its OWN try block -- see _attachment_walk_block.
-_ATTACHMENT_PROPS: tuple[tuple[str, str, str, str], ...] = (
-    ("name of att", "name", "attName", '""'),
-    ("MIME type of att", "mime_type", "attMime", '""'),
-    ("file size of att", "size", "attSize", "0"),
-    ("downloaded of att", "downloaded", "attDown", "false"),
-)
-
-
-def _attachment_walk_block(
-    *,
-    message_var: str,
-    warnings_var: str,
-    indent: int,
-    list_var: str = "attList",
-) -> str:
-    """Emit the AppleScript that walks ``mail attachments of <message_var>``
-    and builds one record per attachment.
-
-    TWO layers of guard, for two DIFFERENT observed failures:
-
-    1. **Per-property guard (inner).** Every property is read into its own
-       variable under its own ``try``; the record is assembled from those
-       variables. Observed 2026-08-27 against the iCloud test account's INBOX
-       messages 1463-1466: ``MIME type of att`` raises
-       errAEEventNotHandled (-10000) while ``name`` / ``file size`` /
-       ``downloaded`` of the SAME attachment read cleanly. Because the
-       record used to be built from four inline property reads in one
-       expression, that single bad property aborted the whole walk and a
-       perfectly saveable PDF surfaced as "no attachments". Probe output
-       and re-check commands: docs/research/attachment-property-10000.md.
-
-    2. **Whole-walk guard (outer).** ``mail attachments of <msg>`` can
-       itself raise -10000 on some inline-image multipart layouts. That
-       guard predates this one and is preserved, including its exact
-       warning wording.
-
-    On-failure defaults are empty/zero -- never a guess. A MIME type is
-    deliberately NOT inferred from the filename extension: the record
-    reports what Mail.app actually returned, and the warning says why it
-    is blank.
-
-    Args:
-        message_var: AppleScript variable holding the message.
-        warnings_var: AppleScript variable holding the warnings list.
-            Must already be initialized by the caller.
-        indent: Leading spaces for the emitted block.
-        list_var: AppleScript variable to build; initialized here.
-
-    Returns:
-        AppleScript fragment ready to interpolate.
-    """
-    pad = " " * indent
-    lines: list[str] = []
-    lines.append(f"{pad}set {list_var} to {{}}")
-    lines.append(f"{pad}try")
-    lines.append(f"{pad}    repeat with att in mail attachments of {message_var}")
-    for prop_expr, _key, var, default in _ATTACHMENT_PROPS:
-        prop_label = prop_expr.replace(" of att", "")
-        lines.append(f"{pad}        set {var} to {default}")
-        lines.append(f"{pad}        try")
-        lines.append(f"{pad}            set {var} to ({prop_expr})")
-        lines.append(f"{pad}        on error errMsg number errNum")
-        lines.append(
-            f"{pad}            set end of {warnings_var} to "
-            f'("attachment property {prop_label} unreadable for message " & '
-            f"(id of {message_var} as text) & \": \" & errMsg & "
-            f'" (error " & errNum & ")")'
-        )
-        lines.append(f"{pad}        end try")
-    record_fields = ", ".join(
-        f"|{key}|:{var}" for _e, key, var, _d in _ATTACHMENT_PROPS
-    )
-    lines.append(f"{pad}        set attRecord to {{{record_fields}}}")
-    lines.append(f"{pad}        set end of {list_var} to attRecord")
-    lines.append(f"{pad}    end repeat")
-    lines.append(f"{pad}on error errMsg number errNum")
-    lines.append(f"{pad}    set {list_var} to {{}}")
-    lines.append(
-        f"{pad}    set end of {warnings_var} to "
-        f'("attachment enumeration failed for message " & '
-        f"(id of {message_var} as text) & \": \" & errMsg & "
-        f'" (error " & errNum & ")")'
-    )
-    lines.append(f"{pad}end try")
-    return "\n".join(lines)
-
-
-# A message's recipient elements, in emitted order:
-#   (Mail element, JSON key, AppleScript list variable)
-_RECIPIENT_KINDS: tuple[tuple[str, str, str], ...] = (
-    ("to recipients", "to", "toList"),
-    ("cc recipients", "cc", "ccList"),
-    ("bcc recipients", "bcc", "bccList"),
-)
-
-# The fields a message record takes from _recipient_read_block's lists.
-_RECIPIENT_FIELDS = ", ".join(
-    f"|{key}|:{var}" for _element, key, var in _RECIPIENT_KINDS
-)
-
-
-def _recipient_read_block(
-    *,
-    message_var: str,
-    warnings_var: str,
-    indent: int,
-    id_expr: str | None = None,
-    from_runs: bool = False,
-) -> str:
-    """Emit the AppleScript that reads ``<message_var>``'s to, cc and bcc
-    recipients into ``toList``, ``ccList`` and ``bccList``: one
-    ``{|name|, |address|}`` record per recipient, which Python renders
-    with ``format_address`` (``_render_recipients``) exactly as the
-    IMAP path renders an ENVELOPE address.
-
-    One Apple event per kind. ``properties of <kind> of <msg>`` returns
-    every recipient of that kind at once, and name and address are then
-    read from the local records. Measured on the test account: about
-    16 ms per event, where the six ``name of`` / ``address of`` reads of
-    the same three lists took about 100 ms. ``recipients of <msg>``
-    would be one event for all three, but it does not tell them apart:
-    read that way, a Cc recipient reported its class as ``to
-    recipient``.
-
-    Each kind is read under its own ``try``. A failure leaves that list
-    empty and appends a warning naming the kind and the message to
-    ``warnings_var`` (which the caller initialises), so an unreadable
-    list is reported rather than passed off as an empty one, and one
-    bad kind does not take the others with it. A recipient without a
-    display name has Mail's ``missing value`` as its name, which JSON
-    cannot carry; it becomes ``""``, as does a missing address.
-
-    With ``from_runs``, the search's bulk path is the caller: each kind
-    was read for a run of messages at once into ``<key>Run`` (reached
-    through ``<key>RunRef``), and ``<key>RunRead`` says whether that
-    read worked. The message's list is then item ``j`` of the run's,
-    and only when the run's read failed is it read for the one
-    message, under the same guard.
-
-    Args:
-        message_var: AppleScript variable holding the message.
-        warnings_var: AppleScript list variable collecting warnings.
-        indent: Leading spaces for the emitted block.
-        id_expr: AppleScript text expression for the message's id in a
-            warning; by default it is read from the message.
-        from_runs: Take each list from the search's run reads.
-
-    Returns:
-        AppleScript fragment ready to interpolate. The message record
-        takes the lists with ``_RECIPIENT_FIELDS``.
-    """
-    pad = " " * indent
-    id_text = id_expr or f"(id of {message_var} as text)"
-    lines: list[str] = []
-    for element, key, var in _RECIPIENT_KINDS:
-        one_message = f"set rcpts to properties of {element} of {message_var}"
-        source = (
-            [
-                f"{pad}    if {key}RunRead then",
-                f"{pad}        set rcpts to item j of {key}RunRef",
-                f"{pad}    else",
-                f"{pad}        {one_message}",
-                f"{pad}    end if",
-            ]
-            if from_runs
-            else [f"{pad}    {one_message}"]
-        )
-        lines += [
-            f"{pad}set {var} to {{}}",
-            f"{pad}try",
-            *source,
-            f"{pad}    repeat with rcpt in rcpts",
-            f"{pad}        set rcptName to name of rcpt",
-            f'{pad}        if rcptName is missing value then set rcptName to ""',
-            f"{pad}        set rcptAddress to address of rcpt",
-            f'{pad}        if rcptAddress is missing value then set rcptAddress to ""',
-            f"{pad}        set end of {var} to {{|name|:rcptName, |address|:rcptAddress}}",
-            f"{pad}    end repeat",
-            f"{pad}on error errMsg number errNum",
-            f"{pad}    set {var} to {{}}",
-            f"{pad}    set end of {warnings_var} to "
-            f'("{key} recipients unreadable for message " & '
-            f'{id_text} & ": " & errMsg & '
-            f'" (error " & errNum & ")")',
-            f"{pad}end try",
-        ]
-    return "\n".join(lines)
-
-
-def _render_recipients(record: dict[str, Any]) -> None:
-    """Replace the recipient records a script emitted with the row's
-    strings, in place: each ``{name, address}`` through
-    ``format_address``, the renderer the IMAP rows use.
-
-    A record without one of the keys is left without it. Every script
-    that reads recipients emits all three, so there is nothing to
-    render, and an empty list here would say the message has no
-    recipients when nothing was read.
-    """
-    for _element, key, _var in _RECIPIENT_KINDS:
-        if key in record:
-            record[key] = format_recipients(
-                (str(r.get("name") or ""), str(r.get("address") or ""))
-                for r in record[key] or []
-            )
-
-
-# The record fields ``_source_read_block`` fills, which ``_take_links``
-# turns into the row's ``links``.
-_SOURCE_FIELDS = (
-    "|source|:msgSource, |source_size|:msgSourceSize, |source_error|:msgSourceError"
-)
-
-
-def _source_read_block(*, message_var: str, indent: int) -> str:
-    """Emit the AppleScript that reads ``<message_var>``'s raw source into
-    ``msgSource``, for ``include_links``.
-
-    Two events: ``message size``, then ``source`` only when the size is
-    within ``MAX_SOURCE_BYTES``, so an oversized message is never
-    carried through JSON. Both under their own ``try``: the lookup loops
-    that call this treat any error as "not in this mailbox", so an
-    unreadable source would otherwise become "message not found". The
-    error goes to ``msgSourceError`` for ``_take_links`` to report.
-    """
-    pad = " " * indent
-    lines = [
-        'set msgSource to ""',
-        "set msgSourceSize to 0",
-        'set msgSourceError to ""',
-        "try",
-        f"    set msgSourceSize to message size of {message_var}",
-        "    if msgSourceSize is missing value then set msgSourceSize to 0",
-        f"    if msgSourceSize ≤ {MAX_SOURCE_BYTES} then",
-        f"        set msgSource to source of {message_var}",
-        '        if msgSource is missing value then set msgSource to ""',
-        "    end if",
-        "on error errMsg number errNum",
-        '    set msgSource to ""',
-        '    set msgSourceError to (errMsg & " (error " & errNum & ")")',
-        "end try",
-    ]
-    return "\n".join(pad + line for line in lines)
-
-
-def _take_links(record: dict[str, Any]) -> list[str]:
-    """Replace the source fields a script emitted (``_SOURCE_FIELDS``)
-    with the row's ``links``, in place, and return any warnings: the
-    source could not be read, was over ``MAX_SOURCE_BYTES``, or had
-    more links than are returned."""
-    source = str(record.pop("source", "") or "")
-    size = int(record.pop("source_size", 0) or 0)
-    error = str(record.pop("source_error", "") or "")
-    message_id = str(record.get("id", ""))
-    if error:
-        record["links"] = []
-        return [source_unreadable_warning(message_id, error)]
-    if size > MAX_SOURCE_BYTES:
-        record["links"] = []
-        return [source_too_large_warning(message_id, size)]
-    links, warnings = links_from_source(source, message_id=message_id)
-    record["links"] = links
-    return warnings
-
-
-# The property a body or text criterion reads.
-_CONTENT = "content"
-
-
-@dataclass(frozen=True)
-class _SearchCriterion:
-    """One search predicate, as the script tests a message against it.
-
-    ``prop`` is the message property the test reads, and says where the
-    bulk path reads it:
-
-    - a property Mail answers for every message at once (``subject``,
-      ``date received``): read for the whole mailbox in one event;
-    - ``content`` (``_CONTENT``): read for a run of the positions the
-      other criteria kept, in one event, and only for those;
-    - None, when the test needs the message itself (its attachments):
-      asked one message at a time, of a message the others kept.
-
-    ``also`` names further properties the test reads, each read for the
-    whole mailbox like a ``prop`` (a text search tests the subject and
-    the sender beside the content). ``excludes`` renders the AppleScript
-    condition that drops a message, given the expression for the value
-    of ``prop`` and then one for each of ``also``, or the expression for
-    the message itself when ``prop`` is None.
-    """
-
-    prop: str | None
-    excludes: Callable[..., str]
-    also: tuple[str, ...] = ()
-
-
-def _condition(
-    criterion: _SearchCriterion, value: Callable[[str], str], message: str
-) -> str:
-    """``criterion.excludes`` rendered with ``value(p)`` as each
-    property's value, or with ``message`` when the test asks the
-    message itself."""
-    if criterion.prop is None:
-        return criterion.excludes(message)
-    return criterion.excludes(
-        value(criterion.prop), *(value(p) for p in criterion.also)
-    )
-
-
-def _mailbox_wide_props(criteria: list[_SearchCriterion]) -> list[str]:
-    """The properties the criteria read for the whole mailbox, each
-    once, in the order the criteria name them."""
-    props: list[str] = []
-    for c in criteria:
-        if c.prop is not None and c.prop != _CONTENT:
-            props.append(c.prop)
-        props += c.also
-    return list(dict.fromkeys(props))
-
-
-def _does_not_contain(text: str) -> Callable[[str], str]:
-    safe = escape_applescript_string(sanitize_input(text))
-    return lambda value: f'{value} does not contain "{safe}"'
-
-
-def _is_not(flag: bool) -> Callable[[str], str]:
-    target = "true" if flag else "false"
-    return lambda value: f"{value} is not {target}"
-
-
-def _search_criteria(
-    *,
-    sender_contains: str | None,
-    subject_contains: str | None,
-    read_status: bool | None,
-    is_flagged: bool | None,
-    date_from: str | None,
-    date_to: str | None,
-    has_attachment: bool | None,
-    body_contains: str | None,
-    text_contains: str | None,
-) -> tuple[list[_SearchCriterion], list[str]]:
-    """Translate search predicates into the criteria the script tests.
-
-    Returns ``(criteria, date_setup)``: one criterion per active
-    predicate, and the date-cutoff statements that must run once before
-    any message is tested. Pure: no Mail access, so the translation is
-    testable on its own.
-
-    Raises:
-        ValueError: If date_from or date_to is not ISO 8601 YYYY-MM-DD.
-    """
-    criteria: list[_SearchCriterion] = []
-    date_setup: list[str] = []
-
-    if sender_contains:
-        criteria.append(_SearchCriterion("sender", _does_not_contain(sender_contains)))
-    if subject_contains:
-        criteria.append(
-            _SearchCriterion("subject", _does_not_contain(subject_contains))
-        )
-    if read_status is not None:
-        criteria.append(_SearchCriterion("read status", _is_not(read_status)))
-    if is_flagged is not None:
-        criteria.append(_SearchCriterion("flagged status", _is_not(is_flagged)))
-
-    if date_from is not None:
-        if not _ISO_DATE_RE.match(date_from):
-            raise ValueError(
-                f"date_from must be ISO 8601 YYYY-MM-DD, got: {date_from!r}"
-            )
-        date_setup.append(
-            applescript_iso_date_statements("dateFromCutoff", date_from)
-        )
-        criteria.append(
-            _SearchCriterion("date received", lambda v: f"{v} < dateFromCutoff")
-        )
-
-    if date_to is not None:
-        if not _ISO_DATE_RE.match(date_to):
-            raise ValueError(
-                f"date_to must be ISO 8601 YYYY-MM-DD, got: {date_to!r}"
-            )
-        # Upper bound is exclusive of the day AFTER date_to, so the full
-        # day of date_to is included.
-        next_day = (
-            _date.fromisoformat(date_to) + _timedelta(days=1)
-        ).isoformat()
-        date_setup.append(
-            applescript_iso_date_statements("dateToCutoff", next_day)
-        )
-        criteria.append(
-            _SearchCriterion("date received", lambda v: f"{v} >= dateToCutoff")
-        )
-
-    if has_attachment is not None:
-        compare = "= 0" if has_attachment else "> 0"
-        criteria.append(_SearchCriterion(
-            None, lambda m: f"(count of mail attachments of {m}) {compare}"
-        ))
-
-    # Body / text filters (#145). AppleScript `contains` is
-    # case-insensitive by default, matching IMAP `SEARCH BODY`/`TEXT`
-    # semantics. Reading the content is the expensive part — see #146
-    # for the proactive warning surfaced before this script runs.
-    if body_contains:
-        criteria.append(_SearchCriterion(_CONTENT, _does_not_contain(body_contains)))
-
-    if text_contains:
-        # `text_contains` is the IMAP `TEXT` predicate — substring match
-        # against headers + body. AppleScript can't easily address all
-        # headers in a per-msg property; we approximate with content +
-        # subject + sender (the practical cases). Recipients omitted —
-        # callers who need recipient matching should use `sender_contains`
-        # or future params. Documented in TOOLS.md.
-        text_safe = escape_applescript_string(sanitize_input(text_contains))
-        criteria.append(_SearchCriterion(
-            _CONTENT,
-            lambda content, subject, sender: (
-                f'not ({content} contains "{text_safe}" or '
-                f'{subject} contains "{text_safe}" or '
-                f'{sender} contains "{text_safe}")'
-            ),
-            also=("subject", "sender"),
-        ))
-    return criteria, date_setup
-
-
-# What a search row reads from Mail besides its id and recipients, in
-# the order its record lists them: (Mail property, JSON key, whether the
-# value is coerced to text).
-_SEARCH_ROW_PROPERTIES: tuple[tuple[str, str, bool], ...] = (
-    ("message id", "rfc_message_id", False),
-    ("subject", "subject", False),
-    ("sender", "sender", False),
-    ("date received", "date_received", True),
-    ("read status", "read_status", False),
-    ("flagged status", "flagged", False),
-)
-
-# The bulk path reads a row property once per run of matched mailbox
-# positions, and a run takes in up to this many unmatched positions
-# between two matches rather than ending. Reading a property over a
-# range cost about 10 ms per event plus 1.3 ms per message on the test
-# account (2026-09-27), so a gap this wide costs about what one more
-# event would.
-_SEARCH_RUN_GAP = 8
-
-# The content, unlike a row property, is read only for the positions
-# the other criteria kept: a run of body reads takes in no position they
-# dropped. What a body costs is its message's, not the event's. Measured
-# on the test account's INBOX (2026-09-27), read-only: over 20 short
-# bodies Mail had read lately, one range read cost 116-127 ms (about
-# 6 ms a message) and a range of one per message 330-342 ms, so each
-# further event cost about 11 ms; over 20 older ones, 5-6 s whichever
-# way they were read (215-315 ms a message); five others cost 0.85-6.4 s
-# each on the one read of them measured; and one, whose body came back
-# empty, cost from 17 ms to 10.7 s a read, alone or in a range, between
-# reads seconds apart. So the cheapest body a gap would take in costs
-# about the event it saves, and a dear one costs seconds for a message
-# no criterion wanted.
-_SEARCH_CONTENT_RUN_GAP = 0
-
-# The kept positions wait for their bodies until there are as many as
-# matches still wanted (so no body is read past the limit), or this
-# many (so no one read holds more bodies than this, whatever the
-# limit), or the scan reaches the mailbox's end. Beside 50 bodies, the
-# one more event a batch costs (about 11 ms) is small.
-_SEARCH_CONTENT_BATCH = 50
-
-_SEARCH_OUT_OF_LINE_WARNING = (
-    "the search's bulk reads did not line up (the mailbox changed while "
-    "they ran, or its ids could not be read in bulk); searched it one "
-    "message at a time instead"
-)
-
-
-def _as_var(prop: str) -> str:
-    """``date received`` → ``dateReceived``: a variable stem for a property."""
-    first, *rest = prop.split()
-    return first + "".join(word.capitalize() for word in rest)
-
-
-def _indented(lines: list[str], by: int) -> list[str]:
-    pad = " " * by
-    return [pad + line if line else line for line in lines]
-
-
-def _block_lines(block: str) -> list[str]:
-    """A block emitted at indent 0 by one of the helpers above, as lines."""
-    return block.split("\n")
-
-
-def _search_record(
-    *,
-    id_expr: str,
-    value: Callable[[str, str, bool], str],
-    include_attachments: bool,
-) -> str:
-    """The AppleScript record literal for one search row.
-
-    ``value(prop, stem, as_text)`` is the expression for a row
-    property's field, coerced to text when ``as_text``.
-    """
-    fields = [f"|id|:{id_expr}"] + [
-        f"|{key}|:{value(prop, _as_var(prop), as_text)}"
-        for prop, key, as_text in _SEARCH_ROW_PROPERTIES
-    ]
-    fields.append(_RECIPIENT_FIELDS)
-    if include_attachments:
-        fields.append("|attachments|:attList")
-    return "{" + ", ".join(fields) + "}"
-
-
-def _one_at_a_time_search_lines(
-    criteria: list[_SearchCriterion], *, limit: str, include_attachments: bool
-) -> list[str]:
-    """The search one message at a time: every message's criteria and
-    row read with an event per property. What the search did before it
-    read in bulk, and what the bulk path gives way to when its lists do
-    not line up.
-
-    Iterate forward: Mail returns ``messages of mailbox`` newest-first,
-    so a limited search short-circuits on the newest messages. (It once
-    ran backwards, returning the oldest, while its comment claimed
-    newest-first; measuring caught it, reading did not.)
-
-    A message whose criteria cannot be read is left out with a warning
-    rather than failing the search; an unreadable recipient list or
-    attachment walk leaves the row with that list empty and a warning.
-    """
-    checks = [
-        f"if {_condition(c, lambda p: f'({p} of msg)', 'msg')} then set includeThis to false"
-        for c in criteria
-    ]
-    row: list[str] = []
-    if include_attachments:
-        row += _block_lines(_attachment_walk_block(
-            message_var="msg", warnings_var="warnList", indent=0
-        ))
-    row += _block_lines(_recipient_read_block(
-        message_var="msg", warnings_var="warnList", indent=0
-    ))
-    record = _search_record(
-        id_expr="(id of msg as text)",
-        value=lambda prop, _stem, as_text: (
-            f"({prop} of msg as text)" if as_text else f"({prop} of msg)"
-        ),
-        include_attachments=include_attachments,
-    )
-    return [
-        "set msgs to messages of mailboxRef",
-        "set total to count of msgs",
-        "set matchCount to 0",
-        "repeat with i from 1 to total",
-        f"    if matchCount >= {limit} then exit repeat",
-        "    set msg to item i of msgs",
-        "    set includeThis to true",
-        "    try",
-        *_indented(checks, 8),
-        "    on error errMsg number errNum",
-        "        set includeThis to false",
-        "        try",
-        '            set end of warnList to ("filter check failed for message " & (id of msg as text) & ": " & errMsg & " (error " & errNum & ")")',
-        "        on error",
-        '            set end of warnList to ("filter check failed for message at index " & i & ": " & errMsg & " (error " & errNum & ")")',
-        "        end try",
-        "    end try",
-        "    if includeThis then",
-        *_indented(row, 8),
-        f"        set end of resultData to {record}",
-        "        set matchCount to matchCount + 1",
-        "    end if",
-        "end repeat",
-    ]
-
-
-def _bulk_read_lines(*, target: str, expr: str, what: str, flag: str, where: str) -> list[str]:
-    """Read ``expr`` into ``target`` under a guard: ``flag`` says
-    whether it worked, and a failure is a warning naming ``what`` and
-    ``where``, after which the caller reads one message at a time.
-    ``target`` starts empty, so a reference to it is always valid."""
-    return [
-        f"set {target} to {{}}",
-        f"set {flag} to false",
-        "try",
-        f"    set {target} to {expr}",
-        f"    set {flag} to true",
-        "on error errMsg number errNum",
-        f'    set end of warnList to ("{what} could not be read in bulk{where}: " & errMsg & " (error " & errNum & "); read one message at a time")',
-        "end try",
-    ]
-
-
-def _first_positions_lines(*, limit: str) -> list[str]:
-    """With no criteria the matches are the first ``limit`` positions,
-    and nothing is read for the whole mailbox but its count."""
-    return [
-        "set total to count of messages of mailboxRef",
-        "set matched to {}",
-        "set matchCount to 0",
-        "repeat with i from 1 to total",
-        f"    if matchCount >= {limit} then exit repeat",
-        "    set end of matched to i",
-        "    set matchCount to matchCount + 1",
-        "end repeat",
-    ]
-
-
-def _one_message_line(index: str) -> str:
-    """Make ``msgRef`` a reference to the message at ``index`` of the id
-    list, by its id: making it costs no event, reading through it does."""
-    return (
-        "set msgRef to a reference to («class mssg» id "
-        f"(item {index} of allIdsRef) of mailboxRef)"
-    )
-
-
-def _value_expr(prop: str) -> str:
-    """The variable ``_value_lines`` sets for ``prop``."""
-    return _as_var(prop) + "Value"
-
-
-def _value_lines(prop: str, index: str) -> list[str]:
-    """Set ``prop``'s value for the message at ``index``: from its list
-    for the whole mailbox, or from the message when that read failed."""
-    return [
-        f"if {_as_var(prop)}InBulk then",
-        f"    set {_value_expr(prop)} to item {index} of {_as_var(prop)}AllRef",
-        "else",
-        f"    {_one_message_line(index)}",
-        f"    set {_value_expr(prop)} to ({prop} of msgRef)",
-        "end if",
-    ]
-
-
-def _mailbox_read_lines(props: list[str]) -> list[str]:
-    """Read the ids, and each of ``props``, for the whole mailbox, each
-    in one event. Every list must be as long as the id list; one that
-    is not means the mailbox changed between the reads."""
-    lines = [
-        "set allIds to id of messages of mailboxRef",
-        "set allIdsRef to a reference to allIds",
-        "set total to count of allIds",
-    ]
-    for prop in props:
-        stem = _as_var(prop)
-        lines += _bulk_read_lines(
-            target=f"{stem}All", expr=f"{prop} of messages of mailboxRef",
-            what=prop, flag=f"{stem}InBulk", where="",
-        ) + [
-            f"set {stem}AllRef to a reference to {stem}All",
-            f"if {stem}InBulk and (count of {stem}All) is not total then set aligned to false",
-        ]
-    return lines
-
-
-def _scan_check_lines(criteria: list[_SearchCriterion]) -> list[str]:
-    """Test the message at position ``i`` against the criteria the scan
-    decides: each on a property read for the whole mailbox against its
-    list, then each that asks the message itself, only while the others
-    keep it."""
-    checks: list[str] = []
-    for prop in dict.fromkeys(c.prop for c in criteria if c.prop):
-        checks += _value_lines(prop, "i") + [
-            f"if {_condition(c, _value_expr, 'msgRef')} then set includeThis to false"
-            for c in criteria if c.prop == prop
-        ]
-    by_message = [c for c in criteria if c.prop is None]
-    if by_message:
-        checks.append(f"if includeThis then {_one_message_line('i')}")
-    checks += [
-        f"if includeThis and ({_condition(c, _value_expr, 'msgRef')}) then set includeThis to false"
-        for c in by_message
-    ]
-    return checks
-
-
-def _content_run_lines() -> list[str]:
-    """From the kept position at ``candFirst`` of ``cands``, extend a run
-    to ``candLast`` over the kept positions that follow within
-    ``_SEARCH_CONTENT_RUN_GAP``; read the run's content in one event,
-    and then its ids, which must be as many and, message by message, the
-    ids the criteria kept, for the content read before them to be those
-    messages'. A content read that fails is warned about, and each
-    message's is read on its own; ids that do not line up leave
-    ``aligned`` false and end the tests."""
-    where = ' for mailbox positions " & runStart & "-" & runEnd & "'
-    return [
-        "set runStart to item candFirst of candsRef",
-        "set runEnd to runStart",
-        "set candLast to candFirst",
-        "repeat while candLast < candCount",
-        f"    if (item (candLast + 1) of candsRef) - runEnd > {_SEARCH_CONTENT_RUN_GAP + 1} then exit repeat",
-        "    set candLast to candLast + 1",
-        "    set runEnd to item candLast of candsRef",
-        "end repeat",
-        *_bulk_read_lines(
-            target="contentRun",
-            expr="content of messages runStart thru runEnd of mailboxRef",
-            what="content", flag="contentRunRead", where=where,
-        ),
-        "set contentRunRef to a reference to contentRun",
-        "if contentRunRead then",
-        "    try",
-        "        set runIds to id of messages runStart thru runEnd of mailboxRef",
-        "    on error",
-        "        set aligned to false",
-        "        exit repeat",
-        "    end try",
-        "    set runIdsRef to a reference to runIds",
-        "    if (count of runIds) is not (runEnd - runStart + 1) or (count of contentRun) is not (count of runIds) then",
-        "        set aligned to false",
-        "        exit repeat",
-        "    end if",
-        "end if",
-    ]
-
-
-def _content_test_lines(criteria: list[_SearchCriterion]) -> list[str]:
-    """Test the content criteria on the ``candCount`` kept positions in
-    ``cands``, a run of them at a time (``_content_run_lines``), and add
-    each position they keep to ``matched``. A message whose content, or
-    a property beside it, cannot be read is left out with a warning, as
-    in the scan. ``cands`` is emptied for the scan to fill again."""
-    also = list(dict.fromkeys(p for c in criteria for p in c.also))
-    candidate = [
-        "set idx to item k of candsRef",
-        "set includeThis to true",
-        "try",
-        "    if contentRunRead then",
-        "        set j to idx - runStart + 1",
-        "        if (item j of runIdsRef) is not (item idx of allIdsRef) then set aligned to false",
-        f"        set {_value_expr(_CONTENT)} to item j of contentRunRef",
-        "    else",
-        f"        {_one_message_line('idx')}",
-        f"        set {_value_expr(_CONTENT)} to ({_CONTENT} of msgRef)",
-        "    end if",
-        *_indented([line for p in also for line in _value_lines(p, "idx")], 4),
-        *[
-            f"    if includeThis and ({_condition(c, _value_expr, 'msgRef')}) then set includeThis to false"
-            for c in criteria
-        ],
-        "on error errMsg number errNum",
-        "    set includeThis to false",
-        '    set end of warnList to ("filter check failed for message " & ((item idx of allIdsRef) as text) & ": " & errMsg & " (error " & errNum & ")")',
-        "end try",
-        "if includeThis then",
-        "    set end of matched to idx",
-        "    set matchCount to matchCount + 1",
-        "end if",
-    ]
-    return [
-        "set candsRef to a reference to cands",
-        "set candFirst to 1",
-        "repeat while candFirst <= candCount",
-        *_indented(_content_run_lines(), 4),
-        "    repeat with k from candFirst to candLast",
-        *_indented(candidate, 8),
-        "    end repeat",
-        "    if not aligned then exit repeat",
-        "    set candFirst to candLast + 1",
-        "end repeat",
-        "set cands to {}",
-        "set candCount to 0",
-    ]
-
-
-def _bulk_match_lines(
-    criteria: list[_SearchCriterion], *, limit: str
-) -> list[str]:
-    """Find the matched positions. The scan reads each criterion's
-    property for the whole mailbox in one event and tests the values in
-    the script, and asks a message itself only for what has no bulk
-    form, only when the other criteria kept it. With a content
-    criterion, a position the scan keeps is a candidate: the candidates
-    wait in ``cands`` until they are as many as the matches still
-    wanted, or fill a batch, or the scan ends, and then their content is
-    read a run at a time and tested (``_content_test_lines``)."""
-    content = [c for c in criteria if c.prop == _CONTENT]
-    keep, count = ("cands", "candCount") if content else ("matched", "matchCount")
-    checks = _scan_check_lines([c for c in criteria if c.prop != _CONTENT])
-    kept = [f"set end of {keep} to i", f"set {count} to {count} + 1"]
-    scan = [
-        "set includeThis to true",
-        "try",
-        *_indented(checks, 4),
-        "on error errMsg number errNum",
-        "    set includeThis to false",
-        '    set end of warnList to ("filter check failed for message " & ((item i of allIdsRef) as text) & ": " & errMsg & " (error " & errNum & ")")',
-        "end try",
-        "if includeThis then",
-        *_indented(kept, 4),
-        "end if",
-    ] if checks else kept
-    flush = [
-        f"if candCount > 0 and (candCount >= {limit} - matchCount or candCount >= {_SEARCH_CONTENT_BATCH} or i = total) then",
-        *_indented(_content_test_lines(content), 4),
-        "    if not aligned then exit repeat",
-        "end if",
-    ] if content else []
-    return _mailbox_read_lines(_mailbox_wide_props(criteria)) + [
-        "set matched to {}",
-        "set matchCount to 0",
-        *(["set cands to {}", "set candCount to 0"] if content else []),
-        "if aligned then",
-        "    repeat with i from 1 to total",
-        f"        if matchCount >= {limit} then exit repeat",
-        *_indented(scan, 8),
-        *_indented(flush, 8),
-        "    end repeat",
-        "end if",
-    ]
-
-
-def _run_reads_lines(filter_props: list[str]) -> list[str]:
-    """Read each row property, and each kind of recipient, once for the
-    run ``runStart thru runEnd``. A property a criterion already read
-    for the whole mailbox is not read again. Each read's list must be as
-    long as the run's ids."""
-    lines: list[str] = []
-    where = ' for mailbox positions " & runStart & "-" & runEnd & "'
-    reads = [
-        (_as_var(prop), f"{prop} of messages runStart thru runEnd of mailboxRef", prop)
-        for prop, _key, _text in _SEARCH_ROW_PROPERTIES
-    ] + [
-        (key, f"properties of {element} of messages runStart thru runEnd of mailboxRef", element)
-        for element, key, _var in _RECIPIENT_KINDS
-    ]
-    for stem, expr, what in reads:
-        read = _bulk_read_lines(
-            target=f"{stem}Run", expr=expr, what=what, flag=f"{stem}RunRead", where=where,
-        ) + [
-            f"set {stem}RunRef to a reference to {stem}Run",
-            f"if {stem}RunRead and (count of {stem}Run) is not (count of runIds) then set aligned to false",
-        ]
-        if what in filter_props:
-            read = [f"set {stem}RunRead to false", f"if not {stem}InBulk then", *_indented(read, 4), "end if"]
-        lines += read
-    return lines
-
-
-def _row_value_lines(filter_props: list[str]) -> list[str]:
-    """Each row property's value for the message at position ``idx``
-    (item ``j`` of its run): from the criterion's list for the whole
-    mailbox, else from the run's list, else read from the message."""
-    lines: list[str] = []
-    for prop, _key, _text in _SEARCH_ROW_PROPERTIES:
-        stem = _as_var(prop)
-        sources = [(f"{stem}RunRead", f"item j of {stem}RunRef")]
-        if prop in filter_props:
-            sources.insert(0, (f"{stem}InBulk", f"item idx of {stem}AllRef"))
-        for n, (flag, expr) in enumerate(sources):
-            lines += [f"{'else if' if n else 'if'} {flag} then", f"    set {stem}Value to {expr}"]
-        lines += ["else", f"    set {stem}Value to ({prop} of msgRef)", "end if"]
-    return lines
-
-
-def _bulk_rows_lines(
-    *, filter_props: list[str], check_ids: bool, include_attachments: bool
-) -> list[str]:
-    """Build a row for each matched position, reading each property
-    once per run of positions rather than once per message.
-
-    Positions shift when a message arrives, moves or goes, and a list
-    read after the shift no longer lines up with one read before it.
-    So each row's id must be the one the criteria matched at its
-    position (``check_ids``), and once the rows are built the ids at
-    the first and last matched positions are read again; a mismatch
-    leaves ``aligned`` false and the caller searches one message at a
-    time instead.
-    """
-    row: list[str] = [
-        "set j to idx - runStart + 1",
-        "set msgId to item j of runIdsRef",
-    ]
-    if check_ids:
-        row.append("if msgId is not (item idx of allIdsRef) then set aligned to false")
-    row += [
-        "if k is 1 then set firstRowId to msgId",
-        "set lastRowId to msgId",
-        "set msgRef to a reference to («class mssg» id msgId of mailboxRef)",
-        *_row_value_lines(filter_props),
-        *_block_lines(_recipient_read_block(
-            message_var="msgRef", warnings_var="warnList", indent=0,
-            id_expr="(msgId as text)", from_runs=True,
-        )),
-    ]
-    if include_attachments:
-        row += _block_lines(_attachment_walk_block(
-            message_var="msgRef", warnings_var="warnList", indent=0
-        ))
-    record = _search_record(
-        id_expr="(msgId as text)",
-        value=lambda _prop, stem, as_text: (
-            f"({stem}Value as text)" if as_text else f"{stem}Value"
-        ),
-        include_attachments=include_attachments,
-    )
-    row += [f"set end of resultData to {record}", "set k to k + 1"]
-    return [
-        "if aligned and matchCount > 0 then",
-        "    set matchedRef to a reference to matched",
-        "    set runs to {}",
-        "    set runStart to 0",
-        "    set runEnd to 0",
-        "    repeat with k from 1 to matchCount",
-        "        set idx to item k of matchedRef",
-        "        if runStart is 0 then",
-        "            set runStart to idx",
-        f"        else if idx - runEnd > {_SEARCH_RUN_GAP + 1} then",
-        "            set end of runs to {runStart, runEnd}",
-        "            set runStart to idx",
-        "        end if",
-        "        set runEnd to idx",
-        "    end repeat",
-        "    set end of runs to {runStart, runEnd}",
-        "    set k to 1",
-        "    repeat with runBounds in runs",
-        "        set runStart to item 1 of runBounds",
-        "        set runEnd to item 2 of runBounds",
-        "        try",
-        "            set runIds to id of messages runStart thru runEnd of mailboxRef",
-        "        on error",
-        "            set aligned to false",
-        "            exit repeat",
-        "        end try",
-        "        set runIdsRef to a reference to runIds",
-        "        if (count of runIds) is not (runEnd - runStart + 1) then",
-        "            set aligned to false",
-        "            exit repeat",
-        "        end if",
-        *_indented(_run_reads_lines(filter_props), 8),
-        "        repeat while k <= matchCount",
-        "            set idx to item k of matchedRef",
-        "            if idx > runEnd then exit repeat",
-        *_indented(row, 12),
-        "        end repeat",
-        "        if not aligned then exit repeat",
-        "    end repeat",
-        "    if aligned then",
-        "        try",
-        "            if (id of message (item 1 of matched) of mailboxRef) is not firstRowId then set aligned to false",
-        "            if (id of message (item matchCount of matched) of mailboxRef) is not lastRowId then set aligned to false",
-        "        on error",
-        "            set aligned to false",
-        "        end try",
-        "    end if",
-        "end if",
-    ]
-
-
-def _search_script_body(
-    *,
-    account_clause: str,
-    mailbox_safe: str,
-    criteria: list[_SearchCriterion],
-    date_setup: list[str],
-    limit: str,
-    include_attachments: bool,
-) -> str:
-    """The tell block of the AppleScript search; see
-    ``AppleMailConnector._search_messages_applescript`` for the design
-    and the measurements behind it."""
-    filter_props = _mailbox_wide_props(criteria)
-    match = (
-        _bulk_match_lines(criteria, limit=limit)
-        if criteria
-        else _first_positions_lines(limit=limit)
-    )
-    body = [
-        f"set accountRef to {account_clause}",
-        f'set mailboxRef to mailbox "{mailbox_safe}" of accountRef',
-        *"\n".join(date_setup).splitlines(),
-        "set resultData to {}",
-        "set warnList to {}",
-        "set aligned to true",
-        *match,
-        *_bulk_rows_lines(
-            filter_props=filter_props,
-            check_ids=bool(criteria),
-            include_attachments=include_attachments,
-        ),
-        "if not aligned then",
-        "    set resultData to {}",
-        f'    set warnList to {{"{_SEARCH_OUT_OF_LINE_WARNING}"}}',
-        *_indented(_one_at_a_time_search_lines(
-            criteria, limit=limit, include_attachments=include_attachments
-        ), 4),
-        "end if",
-        "set resultData to {|messages|:resultData, |warnings|:warnList}",
-    ]
-    return 'tell application "Mail"\n' + "\n".join(_indented(body, 4)) + "\nend tell"
-
 
 class AppleMailConnector:
     """Interface to Apple Mail via AppleScript."""
@@ -1998,7 +859,7 @@ class AppleMailConnector:
         end tell
         """
 
-        script = _wrap_as_json_script(tell_body, timeout=self.timeout)
+        script = wrap_as_json_script(tell_body, timeout=self.timeout)
         result = self._run_applescript(script)
         accounts = cast(list[dict[str, Any]], parse_applescript_json(result))
         # Normalize empty-string full_name to None so callers don't have
@@ -2082,7 +943,7 @@ class AppleMailConnector:
         end tell
         """
 
-        script = _wrap_as_json_script(tell_body, timeout=self.timeout)
+        script = wrap_as_json_script(tell_body, timeout=self.timeout)
         result = self._run_applescript(script)
         return cast(list[dict[str, Any]], parse_applescript_json(result))
 
@@ -2420,7 +1281,7 @@ class AppleMailConnector:
             # Only the rule lookup, no actual updates — caller passed nothing.
             return
         tell_body = self._guarded_rule_mutation(rule_index, expected_name, body_parts)
-        script = _wrap_as_json_script(tell_body, timeout=self.timeout)
+        script = wrap_as_json_script(tell_body, timeout=self.timeout)
         outcome = cast(
             dict[str, Any], parse_applescript_json(self._run_applescript(script))
         )
@@ -2451,7 +1312,7 @@ class AppleMailConnector:
             set resultData to {{|run_script_set|:(run script of r is not missing value), |play_sound_set|:(play sound of r is not missing value), |redirect_set|:((redirect message of r) is not ""), |forward_text_set|:((forward text of r) is not ""), |reply_text_set|:((reply text of r) is not ""), |highlight_text|:(highlight text using color of r), |color_message|:((color message of r) as text)}}
         end tell
         '''
-        script = _wrap_as_json_script(tell_body, timeout=self.timeout)
+        script = wrap_as_json_script(tell_body, timeout=self.timeout)
         raw = self._run_applescript(script)
         parsed = cast(dict[str, Any], parse_applescript_json(raw))
 
@@ -2512,7 +1373,7 @@ class AppleMailConnector:
         tell_body = self._guarded_rule_mutation(
             rule_index, expected_name, [f"delete rule {rule_index}"]
         )
-        script = _wrap_as_json_script(tell_body, timeout=self.timeout)
+        script = wrap_as_json_script(tell_body, timeout=self.timeout)
         outcome = cast(
             dict[str, Any], parse_applescript_json(self._run_applescript(script))
         )
@@ -2528,7 +1389,7 @@ class AppleMailConnector:
 
         The name is read and compared inside the same tell block as the
         mutation. The block sets ``resultData`` to ``{name, applied}``
-        for :func:`_wrap_as_json_script`; ``applied`` is false when the
+        for :func:`wrap_as_json_script`; ``applied`` is false when the
         name did not match and nothing ran. With no ``expected_name``
         the statements run unconditionally.
         """
@@ -2594,7 +1455,7 @@ class AppleMailConnector:
         end tell
         '''
 
-        script = _wrap_as_json_script(tell_body, timeout=self.timeout)
+        script = wrap_as_json_script(tell_body, timeout=self.timeout)
         result = self._run_applescript(script)
         return cast(list[dict[str, Any]], parse_applescript_json(result))
 
@@ -2633,7 +1494,7 @@ class AppleMailConnector:
             set resultData to {{|host|:(server name of acctRef), |port|:(port of acctRef), |user_name|:(user name of acctRef), |email_addresses|:acctEmails}}
         end tell
         '''
-        script = _wrap_as_json_script(tell_body, timeout=self.timeout)
+        script = wrap_as_json_script(tell_body, timeout=self.timeout)
         raw = self._run_applescript(script)
         parsed = cast(dict[str, Any], parse_applescript_json(raw))
         email_addresses = cast(list[str], parsed.get("email_addresses") or [])
@@ -2894,7 +1755,7 @@ class AppleMailConnector:
         # only those, in batches no larger than the matches still
         # wanted, so no body is read that the limit does not need; what
         # a body costs is its message's, from milliseconds to seconds
-        # (see _SEARCH_CONTENT_RUN_GAP). A text criterion's subject and
+        # (see SEARCH_CONTENT_RUN_GAP). A text criterion's subject and
         # sender are read for the whole mailbox like a criterion's
         # property. Items of those lists are
         # reached through `a reference to` the list: at the script's
@@ -2919,7 +1780,7 @@ class AppleMailConnector:
         # The script returns {messages, warnings}; the Python side hands
         # the warnings to ``on_warning``, which ``search_messages`` lifts
         # into the response. NO SILENT ERRORS.
-        criteria, date_setup = _search_criteria(
+        criteria, date_setup = search_criteria(
             sender_contains=sender_contains,
             subject_contains=subject_contains,
             read_status=read_status,
@@ -2930,7 +1791,7 @@ class AppleMailConnector:
             body_contains=body_contains,
             text_contains=text_contains,
         )
-        tell_body = _search_script_body(
+        tell_body = search_script_body(
             account_clause=account_clause,
             mailbox_safe=mailbox_safe,
             criteria=criteria,
@@ -2939,7 +1800,7 @@ class AppleMailConnector:
             include_attachments=include_attachments,
         )
 
-        script = _wrap_as_json_script(tell_body, timeout=self.timeout)
+        script = wrap_as_json_script(tell_body, timeout=self.timeout)
         result = self._run_applescript(script)
         parsed = parse_applescript_json(result)
         # Result shape: {messages: [...], warnings: [...]}. Older
@@ -2959,7 +1820,7 @@ class AppleMailConnector:
             # might emit the bare-list form.
             messages = cast(list[dict[str, Any]], parsed)
         for message in messages:
-            _render_recipients(message)
+            render_recipients(message)
         return messages
 
     def get_message(
@@ -3117,7 +1978,7 @@ class AppleMailConnector:
             )
             id_where = f'whose message id is "{bracketed_safe}"'
 
-        att_walk = _attachment_walk_block(
+        att_walk = attachment_walk_block(
             message_var="foundMsg", warnings_var="attWarnings", indent=12
         )
 
@@ -3145,7 +2006,7 @@ class AppleMailConnector:
         end tell
         '''
 
-        script = _wrap_as_json_script(tell_body, timeout=self.timeout)
+        script = wrap_as_json_script(tell_body, timeout=self.timeout)
         try:
             result = self._run_applescript(script)
         except MailMessageNotFoundError as e:
@@ -3179,7 +2040,7 @@ class AppleMailConnector:
         is the price of having one source of truth for the guard.
 
         ``include_links`` reads the source in the same script
-        (``_source_read_block``), so it costs two Apple events and no
+        (``source_read_block``), so it costs two Apple events and no
         further ``osascript`` call.
         """
         message_id_safe = escape_applescript_string(sanitize_input(message_id))
@@ -3200,13 +2061,13 @@ class AppleMailConnector:
         )
         # Guarded: the lookup's own try below would otherwise turn an
         # unreadable recipient list into "message not found".
-        recipients_clause = _recipient_read_block(
+        recipients_clause = recipient_read_block(
             message_var="msg", warnings_var="recipWarnings", indent=24
         )
         source_clause = (
-            _source_read_block(message_var="msg", indent=24) if include_links else ""
+            source_read_block(message_var="msg", indent=24) if include_links else ""
         )
-        source_fields = f", {_SOURCE_FIELDS}" if include_links else ""
+        source_fields = f", {SOURCE_FIELDS}" if include_links else ""
 
         tell_body = f'''
         tell application "Mail"
@@ -3219,7 +2080,7 @@ class AppleMailConnector:
                         set recipWarnings to {{}}
 {recipients_clause}
 {source_clause}
-                        set resultData to {{|id|:(id of msg as text), |rfc_message_id|:(message id of msg), |subject|:(subject of msg), |sender|:(sender of msg), |date_received|:(date received of msg as text), |read_status|:(read status of msg), |flagged|:(flagged status of msg), |content|:msgContent, {_RECIPIENT_FIELDS}, |warnings|:recipWarnings{source_fields}}}
+                        set resultData to {{|id|:(id of msg as text), |rfc_message_id|:(message id of msg), |subject|:(subject of msg), |sender|:(sender of msg), |date_received|:(date received of msg as text), |read_status|:(read status of msg), |flagged|:(flagged status of msg), |content|:msgContent, {RECIPIENT_FIELDS}, |warnings|:recipWarnings{source_fields}}}
                         exit repeat
                     end try
                 end repeat
@@ -3232,13 +2093,13 @@ class AppleMailConnector:
         end tell
         '''
 
-        script = _wrap_as_json_script(tell_body, timeout=self.timeout)
+        script = wrap_as_json_script(tell_body, timeout=self.timeout)
         result = self._run_applescript(script)
         msg = cast(dict[str, Any], parse_applescript_json(result))
-        _render_recipients(msg)
+        render_recipients(msg)
         warnings = cast(list[str], msg.pop("warnings", None) or [])
         if include_links:
-            warnings += _take_links(msg)
+            warnings += take_links(msg)
 
         if include_attachments:
             attachments, attachment_warnings = (
@@ -3952,7 +2813,7 @@ class AppleMailConnector:
         end tell
         '''
 
-        anchor_script = _wrap_as_json_script(anchor_body, timeout=self.timeout)
+        anchor_script = wrap_as_json_script(anchor_body, timeout=self.timeout)
         try:
             anchor_raw = self._run_applescript(anchor_script)
         except MailMessageNotFoundError as e:
@@ -3997,7 +2858,7 @@ class AppleMailConnector:
         subject_safe = escape_applescript_string(sanitize_input(base_subject))
         # Guarded: the mailbox's try below would otherwise drop every
         # candidate in the mailbox over one unreadable recipient list.
-        recipients_clause = _recipient_read_block(
+        recipients_clause = recipient_read_block(
             message_var="m", warnings_var="recipWarnings", indent=24
         )
 
@@ -4020,7 +2881,7 @@ class AppleMailConnector:
                         end try
                         set recipWarnings to {{}}
 {recipients_clause}
-                        set candRecord to {{|id|:(id of m as text), |rfc_message_id|:(message id of m), |in_reply_to|:inReplyTo, |references_raw|:refs, |subject|:(subject of m), |sender|:(sender of m), |date_received|:(date received of m as text), |read_status|:(read status of m), |flagged|:(flagged status of m), {_RECIPIENT_FIELDS}, |warnings|:recipWarnings}}
+                        set candRecord to {{|id|:(id of m as text), |rfc_message_id|:(message id of m), |in_reply_to|:inReplyTo, |references_raw|:refs, |subject|:(subject of m), |sender|:(sender of m), |date_received|:(date received of m as text), |read_status|:(read status of m), |flagged|:(flagged status of m), {RECIPIENT_FIELDS}, |warnings|:recipWarnings}}
                         set end of resultData to candRecord
                     end repeat
                 on error
@@ -4030,7 +2891,7 @@ class AppleMailConnector:
         end tell
         '''
 
-        candidates_script = _wrap_as_json_script(candidates_body, timeout=self.timeout)
+        candidates_script = wrap_as_json_script(candidates_body, timeout=self.timeout)
         candidates_raw = self._run_applescript(candidates_script)
         candidates = cast(
             list[dict[str, Any]],
@@ -4107,7 +2968,7 @@ class AppleMailConnector:
             m.pop("in_reply_to", None)
             m.pop("references_raw", None)
             m.pop("references_parsed", None)
-            _render_recipients(m)
+            render_recipients(m)
             for warning in m.pop("warnings", None) or []:
                 if on_warning is not None:
                     on_warning(warning)
@@ -4337,7 +3198,7 @@ class AppleMailConnector:
         end tell
         '''
 
-        script = _wrap_as_json_script(tell_body, timeout=self.timeout)
+        script = wrap_as_json_script(tell_body, timeout=self.timeout)
         result = self._run_applescript(script)
         parsed = cast(dict[str, Any], parse_applescript_json(result))
         saved = int(parsed.get("saved") or 0)
@@ -4361,7 +3222,7 @@ class AppleMailConnector:
 
         Consolidates ``mark_as_read`` + ``flag_message`` + ``move_messages``
         (#135). Caller sets only the fields they want changed; tool applies
-        all of them in a single AppleScript pass via ``_bulk_repeat_block``.
+        all of them in a single AppleScript pass via ``bulk_repeat_block``.
 
         Order of operations: read-state and flag changes are applied first
         (in the source mailbox), then the move. IMAP requires the message
@@ -4455,7 +3316,7 @@ class AppleMailConnector:
             else:
                 actions.append("set mailbox of msg to destMailbox")
 
-        repeat_block = _bulk_repeat_block(
+        repeat_block = bulk_repeat_block(
             account=account if source_mailbox is not None else None,
             source_mailbox=source_mailbox,
             actions=actions,
@@ -4841,7 +3702,7 @@ class AppleMailConnector:
             for mid in message_ids
         )
 
-        repeat_block = _bulk_repeat_block(
+        repeat_block = bulk_repeat_block(
             account=account,
             source_mailbox=source_mailbox,
             actions=["delete msg"],
@@ -4899,13 +3760,13 @@ class AppleMailConnector:
             if include_content
             else 'set msgContent to ""'
         )
-        recipients_clause = _recipient_read_block(
+        recipients_clause = recipient_read_block(
             message_var="msg", warnings_var="recipWarnings", indent=16
         )
         source_clause = (
-            _source_read_block(message_var="msg", indent=16) if include_links else ""
+            source_read_block(message_var="msg", indent=16) if include_links else ""
         )
-        source_fields = f", {_SOURCE_FIELDS}" if include_links else ""
+        source_fields = f", {SOURCE_FIELDS}" if include_links else ""
 
         tell_body = f"""
         tell application "Mail"
@@ -4916,21 +3777,21 @@ class AppleMailConnector:
                 set recipWarnings to {{}}
 {recipients_clause}
 {source_clause}
-                set msgRecord to {{|id|:(id of msg as text), |subject|:(subject of msg), |sender|:(sender of msg), |date_received|:(date received of msg as text), |read_status|:(read status of msg), |flagged|:(flagged status of msg), |content|:msgContent, {_RECIPIENT_FIELDS}, |warnings|:recipWarnings{source_fields}}}
+                set msgRecord to {{|id|:(id of msg as text), |subject|:(subject of msg), |sender|:(sender of msg), |date_received|:(date received of msg as text), |read_status|:(read status of msg), |flagged|:(flagged status of msg), |content|:msgContent, {RECIPIENT_FIELDS}, |warnings|:recipWarnings{source_fields}}}
                 set end of resultData to msgRecord
             end repeat
         end tell
         """
 
-        script = _wrap_as_json_script(tell_body, timeout=self.timeout)
+        script = wrap_as_json_script(tell_body, timeout=self.timeout)
         result = self._run_applescript(script)
         messages = cast(list[dict[str, Any]], parse_applescript_json(result))
 
         for m in messages:
-            _render_recipients(m)
+            render_recipients(m)
             warnings = cast(list[str], m.pop("warnings", None) or [])
             if include_links:
-                warnings += _take_links(m)
+                warnings += take_links(m)
             if include_attachments:
                 attachments, attachment_warnings = (
                     self._selected_message_attachments(cast(str, m.get("id", "")))
@@ -5192,7 +4053,7 @@ class AppleMailConnector:
         end tell
         """
 
-        script = _wrap_as_json_script(tell_body, timeout=self.timeout)
+        script = wrap_as_json_script(tell_body, timeout=self.timeout)
         raw = self._run_applescript(script)
         data = parse_applescript_json(raw)
         if not isinstance(data, dict) or not data.get("found"):
@@ -5954,7 +4815,7 @@ else
     end tell
 end if
 """
-        return _wrap_as_json_script(body, timeout=self.timeout) + _WINDOW_HANDLERS
+        return wrap_as_json_script(body, timeout=self.timeout) + _WINDOW_HANDLERS
 
     def _build_tend_close_script(self, action: TendAction) -> str:
         """Full osascript source: close the window a tending pass decided
@@ -6457,7 +5318,7 @@ end tell
         subject is ``subject``: ids only, so a look stays cheap however
         often the subject was used before."""
         subject_safe = escape_applescript_string(subject)
-        raw = self._run_applescript(_wrap_as_json_script(f"""
+        raw = self._run_applescript(wrap_as_json_script(f"""
 tell application "Mail"
     set resultData to (id of every message of sent mailbox whose subject is "{subject_safe}")
 end tell
@@ -6467,7 +5328,7 @@ end tell
     def _read_sent_copy(self, mail_id: int) -> _SentCopy:
         """The message in Sent with Mail's id ``mail_id``: its RFC
         Message-ID (bare) and the names of its files."""
-        raw = self._run_applescript(_wrap_as_json_script(f"""
+        raw = self._run_applescript(wrap_as_json_script(f"""
 tell application "Mail"
     set m to first message of sent mailbox whose id is "{mail_id}"
     set rfcId to message id of m
@@ -6974,7 +5835,7 @@ end if
         sender: str | None,
         operation: WindowOperation,
     ) -> str:
-        """AppleScript body for ``_wrap_as_json_script``: open the compose
+        """AppleScript body for ``wrap_as_json_script``: open the compose
         window (``_build_creation_block``), name it by window-set diff,
         apply the headers (``_draft_headers_block``), and set
         ``resultData`` to what the window holds: its name, subject and
@@ -7120,7 +5981,7 @@ end if
         )
         try:
             raw = self._run_seeded_script(
-                _wrap_as_json_script(script, timeout=self.timeout), seed_id
+                wrap_as_json_script(script, timeout=self.timeout), seed_id
             )
             report = cast(dict[str, Any], parse_applescript_json(raw))
             window = _compose_window_from_report(report)
@@ -7185,7 +6046,7 @@ end if
         """Mail's process id and the ids of all its windows, read before a
         composition opens its window. Opens nothing."""
         raw = self._run_applescript(
-            _wrap_as_json_script(
+            wrap_as_json_script(
                 """
 tell application "System Events"
     tell application process "Mail"
@@ -7260,7 +6121,7 @@ tell application "Mail"
     set resultData to {{|same_pid|:samePid, |found|:found}}
 end tell
 """
-        return _wrap_as_json_script(body, timeout=self.timeout) + _WINDOW_HANDLERS
+        return wrap_as_json_script(body, timeout=self.timeout) + _WINDOW_HANDLERS
 
     def _adopt_unreported_windows(
         self,

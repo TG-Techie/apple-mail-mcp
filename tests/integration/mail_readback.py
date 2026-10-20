@@ -26,7 +26,8 @@ from typing import Any, cast
 import pytest
 
 from apple_mail_mcp.exceptions import MailAppleScriptError, MailDraftNotFoundError
-from apple_mail_mcp.mail_connector import AppleMailConnector, _wrap_as_json_script
+from apple_mail_mcp.mail_connector import AppleMailConnector
+from apple_mail_mcp.script_blocks import wrap_as_json_script
 from apple_mail_mcp.utils import escape_applescript_string, parse_applescript_json
 
 SENT_COPY_TIMEOUT_S = 30.0
@@ -144,7 +145,7 @@ tell application "Mail"
 end tell
 """
     raw = connector._run_applescript(
-        _wrap_as_json_script(body, timeout=connector.timeout)
+        wrap_as_json_script(body, timeout=connector.timeout)
     )
     return cast(list[dict[str, Any]], parse_applescript_json(raw))
 
@@ -249,7 +250,7 @@ tell application "Mail"
 end tell
 """
     raw = connector._run_applescript(
-        _wrap_as_json_script(body, timeout=connector.timeout)
+        wrap_as_json_script(body, timeout=connector.timeout)
     )
     data = cast(dict[str, Any], parse_applescript_json(raw))
     if not data.get("found"):
