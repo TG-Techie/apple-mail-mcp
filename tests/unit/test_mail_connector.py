@@ -16,6 +16,7 @@ from imapclient.exceptions import LoginError
 from apple_mail_mcp.compose_ledger import WindowOperation
 from apple_mail_mcp.compose_script import (
     build_attachment_ax_verify_script,
+    build_open_compose_script,
     build_paste_script,
     files_paste_fill,
     paste_probe_strings,
@@ -5697,7 +5698,7 @@ class TestAttachmentPropertyGuards:
 class TestComposition:
     """The one composition behind every draft the connector saves and
     every message it sends (``_compose``): the window it opens
-    (``_build_open_compose_script``), and the paste placements it
+    (``build_open_compose_script``), and the paste placements it
     uses. Each pin is a measurement: the loopback
     read-back of 2026-09-27 (docs/research/icloud-draft-resync.md,
     Observation 10), the re-save spike of the same day
@@ -5718,7 +5719,7 @@ class TestComposition:
         to: list[str] | None = None,
         operation: WindowOperation = "save",
     ) -> str:
-        return connector._build_open_compose_script(
+        return build_open_compose_script(
             seed=seed,
             seed_id=None if seed == "new" else "160989",
             reply_all=False,
@@ -5835,7 +5836,7 @@ class TestComposition:
     ) -> None:
         """A fresh message's subject is set as it is made, and a reply or
         forward without an override keeps Mail's: nothing retitles it."""
-        script = connector._build_open_compose_script(
+        script = build_open_compose_script(
             seed=seed, seed_id=None if seed == "new" else "160989",
             reply_all=False, to=["a@example.com"], cc=None, bcc=None,
             subject="Fresh" if seed == "new" else None, sender=None,

@@ -24,6 +24,7 @@ from apple_mail_mcp.compose_ledger import (
     Open,
     WindowRecord,
 )
+from apple_mail_mcp.compose_script import build_open_compose_script
 from apple_mail_mcp.compose_tending import RECORD_RETENTION_S, TEND_GRACE_S, SightingClock
 from apple_mail_mcp.compose_window import WindowSnapshot
 from apple_mail_mcp.exceptions import (
@@ -275,7 +276,7 @@ class TestEveryWindowIsRecordedWithHowItEnded:
 class TestTheOpenScriptIdentifiesItsWindow:
     @pytest.fixture
     def script(self, connector: AppleMailConnector) -> str:
-        return connector._build_open_compose_script(
+        return build_open_compose_script(
             seed="new", seed_id=None, reply_all=False, to=["a@example.com"],
             cc=None, bcc=None, subject="Hi", sender=None, operation="save",
         )

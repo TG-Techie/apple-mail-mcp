@@ -30,16 +30,15 @@ from .compose_script import (
     WINDOW_HANDLERS,
     CloseMode,
     PastePlacement,
-    as_close_compose_block,
-    as_new_compose_window_block,
     as_verified_send_block,
     build_attachment_ax_verify_script,
-    build_creation_block,
+    build_close_script,
+    build_open_compose_script,
     build_paste_script,
     build_readback_script,
+    build_tend_close_script,
     files_paste_fill,
     paste_probe_strings,
-    recipient_override_block,
     text_paste_fill,
 )
 from .compose_tending import (
@@ -54,7 +53,6 @@ from .compose_tending import (
     plan_tending,
 )
 from .compose_window import (
-    ENDING_MAILBOX,
     ComposeWindow,
     SentMessageCopy,
     SentMessageCopyUnidentified,
@@ -3497,23 +3495,6 @@ class AppleMailConnector:
 
 
 
-    def _build_close_script(
-        self,
-        window_name: str,
-        window_id: int | None,
-        mode: CloseMode,
-        *,
-        require_empty: bool = False,
-    ) -> str:
-        """Full osascript source: ``as_close_compose_block`` on one window,
-        returning its outcome."""
-        return (
-            f"set closeId to {int(window_id or 0)}\n"
-            f'set closeName to "{escape_applescript_string(window_name)}"\n'
-            + as_close_compose_block(mode, require_empty=require_empty)
-            + "\nreturn closeOutcome\n"
-            + WINDOW_HANDLERS
-        )
 
     def _close_compose_window(
         self, window_name: str, window_id: int | None, mode: CloseMode
@@ -3523,7 +3504,7 @@ class AppleMailConnector:
         error when the script itself failed."""
         try:
             return self._run_applescript(
-                self._build_close_script(window_name, window_id, mode)
+                build_close_script(window_name, window_id, mode)
             ).strip()
         except MailAppleScriptError as exc:
             return f"{CLOSE_FAILED[mode]}{exc}"
@@ -3613,15 +3594,6 @@ end if
 """
         return wrap_as_json_script(body, timeout=self.timeout) + WINDOW_HANDLERS
 
-    def _build_tend_close_script(self, action: TendAction) -> str:
-        """Full osascript source: close the window a tending pass decided
-        on, by Mail's id for it: salvaged to Drafts, or discarded only
-        while it still reads empty (``as_close_compose_block``)."""
-        if action.action == "salvage":
-            return self._build_close_script(action.window_name, action.window_id, "save")
-        return self._build_close_script(
-            action.window_name, action.window_id, "discard", require_empty=True
-        )
 
     def tend_compose_windows(
         self,
@@ -3728,7 +3700,7 @@ end if
             name = action.window_name
             try:
                 outcome = self._run_applescript(
-                    self._build_tend_close_script(action)
+                    build_tend_close_script(action)
                 ).strip()
             except MailAppleScriptError as exc:
                 failed.append((name, str(exc)))
@@ -4378,165 +4350,7 @@ end tell
             raise
 
 
-    def _draft_headers_block(
-        self,
-        *,
-        seed: str,
-        to: list[str] | None,
-        cc: list[str] | None,
-        bcc: list[str] | None,
-        subject: str | None,
-        sender: str | None,
-    ) -> str:
-        """AppleScript for every header the composition sets on
-        ``theMessage`` through the dictionary: the subject override
-        (reply and forward; a fresh message gets its subject at
-        creation), each recipient group, and ``sender`` (already
-        resolved), set LAST — set before the content and recipients, the
-        first saved copy of a draft carried no recipients
-        (docs/research/icloud-draft-resync.md, Observation 6)."""
-        parts = []
-        if seed != "new" and subject is not None:
-            subject_safe = escape_applescript_string(sanitize_input(subject))
-            parts.append(f'set subject of theMessage to "{subject_safe}"')
-        for kind, addrs in (("to", to), ("cc", cc), ("bcc", bcc)):
-            parts.append(recipient_override_block(kind, addrs))
-        # The SECURITY_CHECKLIST two-step idiom (sanitize_input then
-        # escape_applescript_string) applies even though the resolver
-        # pulls from Mail.app's own account list — the convention exists
-        # so we don't have to risk-assess each site individually, and the
-        # Display-Name <email> form from #158 broadened what characters
-        # can appear here. (#173)
-        if sender is not None:
-            sender_safe = escape_applescript_string(sanitize_input(sender))
-            parts.append(f'set sender of theMessage to "{sender_safe}"')
-        return "\n".join(part for part in parts if part)
 
-    def _build_open_compose_script(
-        self,
-        *,
-        seed: str,
-        seed_id: str | None,
-        reply_all: bool,
-        to: list[str] | None,
-        cc: list[str] | None,
-        bcc: list[str] | None,
-        subject: str | None,
-        sender: str | None,
-        operation: WindowOperation,
-    ) -> str:
-        """AppleScript body for ``wrap_as_json_script``: open the compose
-        window (``build_creation_block``), name it by window-set diff,
-        apply the headers (``_draft_headers_block``), and set
-        ``resultData`` to what the window holds: its name, subject and
-        recipients, and the ids of the mailbox the ``operation``'s ending
-        is looked up in, taken before it opened (``ENDING_MAILBOX``), so
-        a save finds the draft it made and a send the copy it filed.
-
-        Mail retitles a compose window the moment its subject is set
-        (measured 2026-09-27, docs/research/icloud-draft-resync.md,
-        Observation 12), and every later step addresses the window by
-        name. So a reply or forward whose subject is overridden is named
-        again, by the same diff, once the headers are on it; named only
-        before, it was addressed by a name no window had any more.
-
-        The report also carries what identifies the window to the compose
-        ledger: Mail's own id for it (the one window of its name whose id
-        was not there before it opened; 0 when that is not exactly one)
-        and Mail's process id. Once the window exists, a failure does not
-        leave the script: it is reported as ``failure``, with the window,
-        so the window is recorded as left open rather than lost from
-        view. That covers COMPOSE_WINDOW_NOT_UNIQUE, whose window stays
-        open by design, and any header or read-back that fails. Before a
-        window is found (SEED_NOT_FOUND, NO_COMPOSE_WINDOW) the script
-        still raises."""
-        seed_id_safe = (
-            escape_applescript_string(sanitize_input(seed_id))
-            if seed_id is not None
-            else None
-        )
-        subject_safe = (
-            escape_applescript_string(sanitize_input(subject))
-            if subject is not None
-            else None
-        )
-        creation_block = build_creation_block(
-            seed, seed_id_safe, reply_all, subject_safe,
-        )
-        headers_block = self._draft_headers_block(
-            seed=seed, to=to, cc=cc, bcc=bcc, subject=subject, sender=sender,
-        )
-        snapshot = (
-            f"set beforeIds to (id of every message of {ENDING_MAILBOX[operation]})"
-        )
-        renamed = (
-            as_new_compose_window_block()
-            if seed != "new" and subject is not None
-            else ""
-        )
-        return f"""
-tell application "System Events"
-    tell application process "Mail"
-        set beforeNames to name of windows
-        set mailPid to unix id
-    end tell
-end tell
-tell application "Mail"
-    set beforeWindowIds to id of every window
-    activate
-    {snapshot}
-    {creation_block}
-end tell
-set newName to ""
-set failure to ""
-try
-{as_new_compose_window_block()}
-on error errMsg number errNum
-    if newName is "" then error errMsg number errNum
-    set failure to errMsg
-end try
--- Mail's own id for the window: the one of its name that is new.
-set newWindowId to 0
-repeat 10 times
-    tell application "Mail"
-        set candidateIds to id of every window whose name is newName
-    end tell
-    set newIds to {{}}
-    repeat with cid in candidateIds
-        if (contents of cid) is not in beforeWindowIds then set end of newIds to (contents of cid)
-    end repeat
-    if (count of newIds) is 1 then set newWindowId to item 1 of newIds
-    if (count of newIds) is not 0 then exit repeat
-    delay 0.2
-end repeat
-if failure is "" then
-    try
-        tell application "Mail"
-            {headers_block}
-        end tell
-{renamed}
-        tell application "Mail"
-            set toAddrs to address of to recipients of theMessage
-            if toAddrs is missing value then set toAddrs to {{}}
-            set ccAddrs to address of cc recipients of theMessage
-            if ccAddrs is missing value then set ccAddrs to {{}}
-            set bccAddrs to address of bcc recipients of theMessage
-            if bccAddrs is missing value then set bccAddrs to {{}}
-            set resultData to {{|window|:newName, |window_id|:newWindowId, |mail_pid|:mailPid, |failure|:"", |subject|:(subject of theMessage as text), |to|:toAddrs, |cc|:ccAddrs, |bcc|:bccAddrs, |before_ids|:beforeIds}}
-        end tell
-    on error errMsg
-        set failure to errMsg
-    end try
-end if
-if failure is not "" then
-    if newName is "" and newWindowId is not 0 then
-        try
-            tell application "Mail" to set newName to name of window id newWindowId
-        end try
-    end if
-    set resultData to {{|window|:newName, |window_id|:newWindowId, |mail_pid|:mailPid, |failure|:failure, |subject|:"", |to|:{{}}, |cc|:{{}}, |bcc|:{{}}, |before_ids|:{{}}}}
-end if
-"""
 
     def _open_compose(
         self,
@@ -4551,7 +4365,7 @@ end if
         sender: str | None,
         operation: WindowOperation,
     ) -> ComposeWindow:
-        """Open the compose window ``_build_open_compose_script``
+        """Open the compose window ``build_open_compose_script``
         describes, record it in the compose ledger, and return what the
         script reported; a seed that is gone is
         ``MailMessageNotFoundError``. A failure once the window existed
@@ -4565,7 +4379,7 @@ end if
         recorded as left open (``_adopt_unreported_windows``), so tending
         closes it on its next pass; the error raised says so."""
         snapshot = self._mail_window_snapshot()
-        script = self._build_open_compose_script(
+        script = build_open_compose_script(
             seed=seed, seed_id=seed_id, reply_all=reply_all, to=to, cc=cc,
             bcc=bcc, subject=subject, sender=sender, operation=operation,
         )
