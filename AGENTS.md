@@ -154,7 +154,7 @@ Load these skills when working in their domains:
 
 ## Key Files
 
-- `src/apple_mail_mcp/mail_connector.py` — Core AppleScript client (~1120 lines)
+- `src/apple_mail_mcp/mail_connector.py` — Core AppleScript client, the project's largest module (its line count is deliberately not recorded here, for the same reason as the test counts above)
 - `src/apple_mail_mcp/server.py` — the FastMCP instance, the connector, confirmation, the error envelope and `main`
 - `src/apple_mail_mcp/tools/` — the MCP tools, one module per domain
 - `src/apple_mail_mcp/security.py` — Input validation, audit logging, confirmation flows

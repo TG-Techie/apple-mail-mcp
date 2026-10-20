@@ -132,8 +132,4 @@ Gmail operations are inherently slower than IMAP because:
 
 ## Profiling
 
-No formal benchmarking infrastructure yet (see issue #31). When added:
-- Use 5 iterations per operation
-- Calculate mean, stdev, CV%
-- Set thresholds at 5x documented baseline
-- Detect cold starts (first run > 2x median of remaining)
+The benchmark suite is `tests/benchmarks/`, run with `make benchmark` against real Mail.app and re-baselined with `make benchmark-baseline`; `docs/guides/BENCHMARKING.md` says what it covers and how to read it. It is opt-in and excluded from CI. A regression fails at 5x the committed baseline's median, and a first run more than 2x the median of the rest is flagged as a cold start.
