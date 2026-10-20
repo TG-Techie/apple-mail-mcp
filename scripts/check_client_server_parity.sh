@@ -1,15 +1,17 @@
 #!/bin/bash
-# Verify every public method in mail_connector.py has a corresponding tool in the server
+# Verify every public method of the connector has a corresponding tool in the server
 # (server.py and the modules under tools/).
 set -euo pipefail
 
-CONNECTOR="src/apple_mail_mcp/mail_connector.py"
+# The files the connector class's methods live in.
+shopt -s nullglob
+CONNECTOR_FILES=(src/apple_mail_mcp/mail_connector.py src/apple_mail_mcp/connector_*.py)
 SERVER=(src/apple_mail_mcp/server.py src/apple_mail_mcp/tools/*.py)
 
 echo "Checking client-server parity..."
 
 # Extract public methods from connector (exclude __init__, _private)
-CONNECTOR_METHODS=$(grep -E '^\s+def [a-z]' "$CONNECTOR" | grep -v '^\s+def _' | sed 's/.*def \([a-z_]*\)(.*/\1/' | sort)
+CONNECTOR_METHODS=$(cat "${CONNECTOR_FILES[@]}" | grep -E '^\s+def [a-z]' | grep -v '^\s+def _' | sed 's/.*def \([a-z_]*\)(.*/\1/' | sort)
 
 # Extract the registered tools: the def that follows each registration,
 # through any decorators stacked beneath it.
