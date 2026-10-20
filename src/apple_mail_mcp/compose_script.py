@@ -48,6 +48,18 @@ PASTE_CARET_KEYS: dict[PastePlacement, str] = {
 }
 
 
+# -- addressing one compose window ------------------------------------------
+#
+# docs/research/compose-window-tending.md, Observation 7: System Events
+# turns ``set w to window i`` into a reference BY NAME, and every use of
+# ``w`` then reads, or clicks, the first window of that name, whichever
+# was meant; an element found inside it carries the same by-name window.
+# So every window here is addressed by its index alone, written out in
+# each specifier, and found again by its name and position after anything
+# that may reorder the windows. Mail's own ``id`` names one window within
+# one Mail process, and its ``bounds`` start where System Events'
+# ``position`` puts the window (Observation 3), which ties the two.
+
 CloseMode = Literal["save", "discard"]
 
 

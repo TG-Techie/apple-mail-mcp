@@ -101,6 +101,13 @@ def compose_window_from_report(report: dict[str, Any]) -> ComposeWindow:
     )
 
 
+# What a send Mail accepted finds of the copy it filed in Sent. Exactly
+# one of the two: the copy, found by identity, or why none was. With the
+# files pasted, that makes three endings and no others (``_sent_ending``):
+# the copy carries every file, and the send returns its ids; it lacks
+# one, and the send raises that the message WAS sent; it was not
+# identified, and the send returns no id and a warning. A copy not found
+# has no files to be missing, and an id is never returned unverified.
 @dataclass(frozen=True)
 class SentMessageCopy:
     """The copy a send filed in Sent: the one message in Sent with the
