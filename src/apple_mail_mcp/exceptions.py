@@ -149,24 +149,6 @@ class MailComposeLedgerError(MailError):
     pass
 
 
-class MailPermissionError(MailError):
-    """Permission denied for operation."""
-
-    pass
-
-
-class MailOperationCancelledError(MailError):
-    """User cancelled the operation."""
-
-    pass
-
-
-class MailSafetyError(MailError):
-    """Safety check failed in test mode (wrong account or non-reserved recipient)."""
-
-    pass
-
-
 class MailKeychainError(MailError):
     """Keychain operation failed."""
 
